@@ -7,9 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [2.49.0] - 2026-09-08
 
 ### Changed
+- feat: consume a dedicated forge credential instead of the operator config
 - fix: reset the private root helper chain so no keychain store is attempted
 - fix: provision the private HOME's credential path instead of inheriting it
 - ci(test-gate): gate the daemon home suites on a macOS Bash 3.2 lane
@@ -17,16 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - follow-up: make the operator command surfaces describe the launcher that exists
 - follow-up: fix the daemon launcher's Darwin descriptor identity and prove the loader outcome
 - follow-up: remove the unproven Bash 3.2 expansion and pin the floor in a test
--: make daemon-home startup exact-current and fail closed
 - chore: honor external worktree roots
--: ship an offline attested YAML runtime for public Framework paths
--: align OSS Delivery with external merge authority
--: bootstrap exact external-merge reconciliation
--: cut over forward-only recovery and classifier
 - fix: keep local admission portable across Bash versions
--: emit bounded policy-validated lifecycle journal records
--: project lifecycle journals with exact-parent CAS
 - fix: make delivery daemon mktemp templates portable
+
 
 ## [2.50.0] - 2026-08-21
 

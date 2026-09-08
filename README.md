@@ -1,4 +1,4 @@
-![Version](https://img.shields.io/badge/version-2.48.0-blue)
+![Version](https://img.shields.io/badge/version-2.49.0-blue)
 ![License: ELv2](https://img.shields.io/badge/license-ELv2-green)
 ![Stack](https://img.shields.io/badge/stack-bash%20%2B%20md%20%2B%20yaml%20%2B%20python%20%2B%20node-orange)
 
