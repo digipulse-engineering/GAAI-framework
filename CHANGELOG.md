@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: reset the private root helper chain so no keychain store is attempted
 - fix: provision the private HOME's credential path instead of inheriting it
 - ci(test-gate): gate the daemon home suites on a macOS Bash 3.2 lane
 - follow-up: fix the usage cheat-sheets PR 3179 left self-contradicting

@@ -296,8 +296,14 @@ if [[ -n "$GAAI_OPERATOR_HOME" && -d "$GAAI_OPERATOR_HOME/.config/gh" \
       && ! -e "$XDG_CONFIG_HOME/gh" ]] && command -v gh >/dev/null 2>&1; then
   ln -s "$GAAI_OPERATOR_HOME/.config/gh" "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
 fi
-if [[ ! -e "$HOME/.gitconfig" && -L "$XDG_CONFIG_HOME/gh" ]]; then
-  ( umask 077; printf '[credential]\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig" ) 2>/dev/null || true
+# The private root's git configuration is entry-owned, so it is rewritten on every
+# entry and a stale chain cannot survive. The leading empty helper resets the list
+# accumulated from higher-level files: on this platform git reads an additional
+# built-in system gitconfig that declares the platform keychain helper and that no
+# environment variable can displace, so without the reset every successful fetch also
+# runs a keychain store that cannot succeed under a private HOME.
+if [[ -L "$XDG_CONFIG_HOME/gh" ]]; then
+  ( umask 077; printf '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig" ) 2>/dev/null || true
 fi
 
 # 8. Positive allowlist: every other exported configuration entry is dropped and
