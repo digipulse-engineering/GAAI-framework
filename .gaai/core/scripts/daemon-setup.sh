@@ -279,6 +279,29 @@ XDG_DATA_HOME="$GAAI_PRIVATE_ROOT/xdg-data"
 TMPDIR="$GAAI_PRIVATE_ROOT/tmp"
 export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 
+# 7b. Remote authentication for the private HOME. Replacing HOME above is what
+#     makes the entry trustworthy, and it is also what removes every path Git has
+#     to a credential helper: the operator's `~/.gitconfig` is unreachable, and the
+#     macOS keychain helper cannot reach a login keychain non-interactively
+#     ("could not read Username ... Device not configured"). Without this the very
+#     first lifecycle operation — fetching the target branch — fails, and no start,
+#     verify or canary can succeed against an authenticated remote.
+#
+#     The credential path is therefore PROVISIONED INSIDE the private root rather
+#     than inherited: nothing from the environment redirects a tool's config, which
+#     is the property section 7 protects. Only a symlink is created — no token is
+#     copied, and the operator's own configuration remains the single source. Both
+#     legs are conditional and best-effort: a host without `gh`, or without an
+#     operator GitHub configuration, keeps exactly today's behaviour, and a remote
+#     that needs no credentials is unaffected.
+if [[ -n "$GAAI_OPERATOR_HOME" && -d "$GAAI_OPERATOR_HOME/.config/gh" \
+      && ! -e "$XDG_CONFIG_HOME/gh" ]] && command -v gh >/dev/null 2>&1; then
+  ln -s "$GAAI_OPERATOR_HOME/.config/gh" "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
+fi
+if [[ ! -e "$HOME/.gitconfig" && -L "$XDG_CONFIG_HOME/gh" ]]; then
+  ( umask 077; printf '[credential]\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig" ) 2>/dev/null || true
+fi
+
 # 8. Positive allowlist: every other exported configuration entry is dropped and
 #    the survivors are rebuilt from validated scalar values. A value that is not a
 #    single safe scalar is not "sanitised" — it is refused.
