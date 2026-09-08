@@ -163,6 +163,21 @@ _gaai_safe_owner_mode() {
   return 0
 }
 
+# Stricter than the above, for a file whose CONTENT is the secret rather than the
+# path: unwritable by group and other is not enough, it must also be unreadable by
+# them, and it must be owned by this principal — root ownership is not accepted for
+# a credential this principal is expected to control and rotate.
+_gaai_private_owner_mode() {
+  local _p="$1" _uid="${UID:-0}" _own _mode
+  _own="$(stat -L -c '%u' "$_p" 2>/dev/null || stat -L -f '%u' "$_p" 2>/dev/null || echo "")"
+  _mode="$(stat -L -c '%a' "$_p" 2>/dev/null || stat -L -f '%Lp' "$_p" 2>/dev/null || echo "")"
+  [[ -n "$_own" && -n "$_mode" ]] || return 1
+  [[ "$_own" == "$_uid" ]] || return 1
+  while [[ "${#_mode}" -lt 4 ]]; do _mode="0$_mode"; done
+  [[ "${_mode:2:1}" == "0" && "${_mode:3:1}" == "0" ]] || return 1
+  return 0
+}
+
 # Every component of the literal path, so a hijacked intermediate directory is
 # caught even when the leaf looks correct.
 _gaai_attest_path() {
@@ -292,8 +307,32 @@ export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 #     legs are conditional and best-effort: a host without `gh`, or without an
 #     operator GitHub configuration, keeps exactly today's behaviour, and a remote
 #     that needs no credentials is unaffected.
-if [[ -n "$GAAI_OPERATOR_HOME" && -d "$GAAI_OPERATOR_HOME/.config/gh" \
-      && ! -e "$XDG_CONFIG_HOME/gh" ]] && command -v gh >/dev/null 2>&1; then
+#     Preferred route: a DEDICATED forge credential the operator provisions outside
+#     the private root. It is read once here and nothing is copied to disk; the
+#     operator's own tool configuration is never made reachable, so a credential
+#     scoped to the repositories this daemon actually needs replaces one scoped to
+#     everything the operator can reach. The file must be a regular file, not a
+#     symlink, owned by this principal, with no group or other access. A file that
+#     fails any of those is IGNORED rather than "repaired" — this entry never widens
+#     permissions on an operator's secret.
+#
+#     Any inherited forge credential is dropped first. The environment must never be
+#     able to choose the identity the daemon acts under, and this variable survives
+#     the section 8 strip precisely so the value set HERE reaches the tools.
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST
+_gaai_forge_token_file="${GAAI_OPERATOR_HOME:-}/.gaai/forge-token"
+if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_forge_token_file" \
+      && ! -L "$_gaai_forge_token_file" ]] \
+   && _gaai_private_owner_mode "$_gaai_forge_token_file"; then
+  GH_TOKEN="$(tr -d '[:space:]' < "$_gaai_forge_token_file" 2>/dev/null || printf '')"
+  if [[ -n "$GH_TOKEN" ]]; then export GH_TOKEN; else unset GH_TOKEN; fi
+fi
+unset -v _gaai_forge_token_file
+#     Fallback: the previous behaviour — link the operator's tool configuration — so
+#     a host without a dedicated credential keeps working exactly as it did.
+if [[ -z "${GH_TOKEN:-}" ]] \
+   && [[ -n "$GAAI_OPERATOR_HOME" && -d "$GAAI_OPERATOR_HOME/.config/gh" \
+         && ! -e "$XDG_CONFIG_HOME/gh" ]] && command -v gh >/dev/null 2>&1; then
   ln -s "$GAAI_OPERATOR_HOME/.config/gh" "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
 fi
 # The private root's git configuration is entry-owned, so it is rewritten on every
@@ -302,7 +341,7 @@ fi
 # built-in system gitconfig that declares the platform keychain helper and that no
 # environment variable can displace, so without the reset every successful fetch also
 # runs a keychain store that cannot succeed under a private HOME.
-if [[ -L "$XDG_CONFIG_HOME/gh" ]]; then
+if [[ -n "${GH_TOKEN:-}" || -L "$XDG_CONFIG_HOME/gh" ]]; then
   ( umask 077; printf '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig" ) 2>/dev/null || true
 fi
 
@@ -341,7 +380,7 @@ for _gaai_key in $_GAAI_CONFIG_ALLOW; do
 done
 unset -v _gaai_key _gaai_val _GAAI_EXPORTED_SET
 for _gaai_name in $(compgen -e 2>/dev/null || true); do
-  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL " in
+  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN " in
     *" $_gaai_name "*) ;;
     *) export -n "$_gaai_name" 2>/dev/null || true ;;
   esac
