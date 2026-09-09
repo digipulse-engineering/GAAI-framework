@@ -1801,8 +1801,10 @@ with_staging_lock() {
 
 # ── Backlog reading (via git fetch + scheduler) ──────────────────────────
 fetch_and_read_backlog() {
-  # Fetch latest remote state (does not touch working tree)
-  git -C "$PROJECT_DIR" fetch origin "$TARGET_BRANCH" --quiet 2>/dev/null || true
+  # Fetch latest remote state (does not touch working tree). A failed fetch is
+  # logged with a typed reason by the wrapper; the read below then falls back to
+  # the last fetched ref, exactly as before.
+  _fetch_target_branch || true
 
   # Read backlog from remote ref (always latest committed state)
   local content
@@ -2172,6 +2174,86 @@ _forward_sha256() {
   printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
 }
 
+# The target-branch fetch primitive lives HERE, inside this coordinator's helper
+# set, rather than beside the poll loop that also calls it. Two reasons, both
+# deliberate. It is the operation by which "one fetched target object" — the
+# premise of this whole section — is obtained, so it belongs to the same unit.
+# And the harnesses that test this coordinator extract it as a contiguous range
+# from `_forward_sha256()` to `exceeded_stories()`; a dependency defined outside
+# that range would have to be stubbed in every one of them, and those tests would
+# then no longer exercise the real fetch path at all. Bash resolves calls at
+# runtime, so the earlier `fetch_and_read_backlog` reaches it regardless of order.
+# ── Target-branch fetch (typed failure, never interactive) ────────────────
+#
+# Every fetch of origin/${TARGET_BRANCH} issued by the daemon process itself goes
+# through here. The launcher's privileged entry closes every interactive credential
+# path (GIT_TERMINAL_PROMPT=0, GIT_ASKPASS='', GH_PROMPT_DISABLED=1), so an absent
+# credential now fails at once with "could not read Username ...: terminal prompts
+# disabled" instead of blocking the poll loop on a pane prompt nobody sees. That
+# only helps an operator if the failure is VISIBLE: a `fatal:` swallowed by
+# `2>/dev/null` leaves a cycle that produced nothing and a log that says nothing.
+# This wrapper captures git's stderr, classifies it, and writes ONE typed line per
+# failed fetch. The return value is git's, so every caller keeps its own `|| true`
+# or `|| return 1` semantics; only the diagnostics change.
+#
+# Reasons and their canonical actions:
+#   credential_absent    no usable credential reached git — provision the dedicated
+#                        forge credential the entry consumes (`~/.gaai/forge-token`,
+#                        regular file, 0600) or an operator gh login
+#   credential_rejected  a credential was presented and refused — rotate it
+#   remote_unreachable   DNS/TCP/TLS failure — check the network, not the daemon
+#   ref_absent           origin has no such branch — check the configured target
+#   fetch_failed         anything else — the evidence line carries git's own words
+
+# _classify_fetch_failure <git stderr>  →  one typed reason on stdout
+_classify_fetch_failure() {
+  local err="$1"
+  case "$err" in
+    *"terminal prompts disabled"*|*"could not read Username"*|*"could not read Password"*)
+      printf 'credential_absent' ;;
+    *"Authentication failed"*|*"Invalid username or"*|*"Permission denied"*|*"HTTP 403"*|*"403 Forbidden"*)
+      printf 'credential_rejected' ;;
+    *"Could not resolve host"*|*"unable to access"*|*"Connection refused"*|*"timed out"*|*"Network is unreachable"*|*"Failed to connect"*|*"Could not read from remote repository"*)
+      printf 'remote_unreachable' ;;
+    *"couldn't find remote ref"*|*"Remote branch"*"not found"*|*"invalid refspec"*)
+      printf 'ref_absent' ;;
+    *) printf 'fetch_failed' ;;
+  esac
+}
+
+# _fetch_target_branch [branch]  →  git's exit status; one [FETCH] line on failure
+_FETCH_LAST_REASON=""
+_fetch_target_branch() {
+  local branch="${1:-$TARGET_BRANCH}" err rc=0 reason action evidence
+  err=$(git -C "$PROJECT_DIR" fetch origin "$branch" --quiet 2>&1) || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    _FETCH_LAST_REASON=""
+    return 0
+  fi
+  reason=$(_classify_fetch_failure "$err")
+  _FETCH_LAST_REASON="$reason"
+  case "$reason" in
+    credential_absent)   action=provision_forge_credential ;;
+    credential_rejected) action=rotate_forge_credential ;;
+    remote_unreachable)  action=check_network ;;
+    ref_absent)          action=check_target_branch ;;
+    *)                   action=operator_disposition_required ;;
+  esac
+  # git's own `fatal:` line when there is one, else its first line; printable
+  # characters only and bounded — the log is a plain-text operator surface, not a
+  # place for remote-controlled bytes, and `log` expands escapes.
+  evidence=$(printf '%s\n' "$err" | grep -m1 '^fatal:' 2>/dev/null || true)
+  [[ -n "$evidence" ]] || evidence=$(printf '%s\n' "$err" | head -1)
+  evidence=$(printf '%s' "$evidence" | sed "s/$(printf '\033')\[[0-9;]*[A-Za-z]//g" \
+    | tr -cd '[:print:]' | tr -d '\\' | cut -c1-200)
+  # Colours are defaulted, not assumed. The daemon runs under `set -euo pipefail`,
+  # so a bare unset ${RED} here would abort the process at the exact moment it is
+  # trying to report why a fetch failed — reinstating the silence this line exists
+  # to remove. A diagnostic must never be able to fail louder than what it reports.
+  log "${RED:-}[FETCH] reason=${reason} action=${action} target=origin/${branch} rc=${rc} evidence=${evidence:-none}${NC:-}"
+  return "$rc"
+}
+
 _forward_sid_valid() {
   [[ "${1:-}" =~ ^[A-Za-z][A-Za-z0-9._-]{0,63}$ ]]
 }
@@ -2300,7 +2382,7 @@ _forward_repair_worktree_exact() {
   [[ "$expected_source" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return 1
   wt=$(_forward_resolve_worktree "$sid") || return 1
   [[ -d "$wt" ]] || return 1
-  git -C "$PROJECT_DIR" fetch origin "$TARGET_BRANCH" --quiet || return 1
+  _fetch_target_branch || return 1
   live=$(git -C "$PROJECT_DIR" rev-parse "origin/${TARGET_BRANCH}" 2>/dev/null) \
     || return 1
   [[ "$live" == "$expected_source" ]] || return 1
@@ -2323,7 +2405,7 @@ _forward_repair_worktree_exact() {
     2>/dev/null || cleanup_rc=$?
   rm -f "$repair_log"
   [[ "$cleanup_rc" -eq 0 ]] || return 1
-  git -C "$PROJECT_DIR" fetch origin "$TARGET_BRANCH" --quiet || return 1
+  _fetch_target_branch || return 1
   live=$(git -C "$PROJECT_DIR" rev-parse "origin/${TARGET_BRANCH}" 2>/dev/null) \
     || return 1
   [[ "$live" == "$expected_source" ]] || return 1
@@ -2374,7 +2456,7 @@ _forward_classify() {
   local snapshot source blob facts
   snapshot=$(mktemp "$LOCK_DIR/.forward-snapshot-XXXXXX" 2>/dev/null) || return 1
   chmod 600 "$snapshot" 2>/dev/null || { rm -f "$snapshot"; return 1; }
-  if ! git -C "$PROJECT_DIR" fetch origin "$TARGET_BRANCH" --quiet \
+  if ! _fetch_target_branch \
       || ! source=$(git -C "$PROJECT_DIR" rev-parse "origin/${TARGET_BRANCH}" 2>/dev/null) \
       || ! [[ "$source" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] \
       || ! blob=$(git -C "$PROJECT_DIR" rev-parse "${source}:${BACKLOG_REL}" 2>/dev/null) \
@@ -3571,7 +3653,7 @@ forward_recovery_scan() {
   local index ids sid source blob overall=0 recovery_rc
   index=$(mktemp "$LOCK_DIR/.forward-index-XXXXXX" 2>/dev/null) || return 1
   chmod 600 "$index" 2>/dev/null || { rm -f "$index"; return 1; }
-  if ! git -C "$PROJECT_DIR" fetch origin "$TARGET_BRANCH" --quiet \
+  if ! _fetch_target_branch \
       || ! source=$(git -C "$PROJECT_DIR" rev-parse "origin/${TARGET_BRANCH}" 2>/dev/null) \
       || ! [[ "$source" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] \
       || ! blob=$(git -C "$PROJECT_DIR" rev-parse "${source}:${BACKLOG_REL}" 2>/dev/null) \
@@ -3630,7 +3712,7 @@ _reconcile_story_file_from_staging() {
 
   [[ "$expected_source" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || return 2
   local live_source
-  if ! git -C "$PROJECT_DIR" fetch origin "$TARGET_BRANCH" --quiet 2>/dev/null \
+  if ! _fetch_target_branch \
       || ! live_source=$(git -C "$PROJECT_DIR" rev-parse \
         "origin/${TARGET_BRANCH}" 2>/dev/null) \
       || [[ "$live_source" != "$expected_source" ]]; then
@@ -3769,7 +3851,7 @@ reconcile_done_merged_worktrees() {
   local effective_target="${TARGET_BRANCH:-staging}"
 
   # Fetch origin to keep the merged check current (otherwise at most 1 cycle stale).
-  git -C "$PROJECT_DIR" fetch origin "$effective_target" --quiet 2>/dev/null || true
+  _fetch_target_branch "$effective_target" || true
 
   while IFS= read -r sid; do
     [[ -z "$sid" ]] && continue

@@ -94,9 +94,14 @@ configured_target_source() {
 
 # ── Extract helper function directly for in-process use ────────────────────────
 extract_helper() {
-  # Extract _reconcile_story_file_from_staging via awk (brace-depth tracking)
+  # Extract _reconcile_story_file_from_staging via awk (brace-depth tracking),
+  # together with the target-branch fetch primitive it now depends on. The
+  # dependency is extracted rather than stubbed so this suite keeps exercising the
+  # real fetch path, including the typed failure line, instead of a local fake.
   eval "$(awk '
     /^_reconcile_story_file_from_staging\(\)/{p=1; depth=0}
+    /^_classify_fetch_failure\(\)/{p=1; depth=0}
+    /^_fetch_target_branch\(\)/{p=1; depth=0}
     p {
       print
       for (i=1; i<=length($0); i++) {
@@ -110,6 +115,7 @@ extract_helper() {
 }
 
 # ── Stub functions ─────────────────────────────────────────────────────────────
+_FETCH_LAST_REASON=""
 ESCALATION_REASON=""
 ESCALATION_REMEDIATION=""
 

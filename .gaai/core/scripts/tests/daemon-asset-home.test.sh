@@ -343,6 +343,104 @@ else
 fi
 
 echo ""
+echo "=== Entry authority: no interactive credential path (section 7c) ==="
+# A pane of the private tmux server is a terminal. Without the entry closing every
+# credential-acquisition path, an absent credential makes the daemon's first
+# `git fetch` print `Username for 'https://github.com':` and block forever, with a
+# log that shows nothing past its startup lines. The proof is the probe pattern: the
+# lines between the BEGIN/END markers become a `#!/bin/bash -p` script that dumps
+# its exported environment and then asks git for a credential HERMETICALLY
+# (`git credential fill` against a host that is never contacted, with an askpass
+# program that would leave a marker if it ran). Run under `env -i` with a
+# throwaway HOME, once through the shebang and once per supported interpreter.
+PROMPT_PROBE="$ROOT/entry-prompt-probe.sh"
+{
+  printf '#!/bin/bash -p\nGAAI_ENTRY_NAME="entry-prompt-probe"\n'
+  sed -n '/^# BEGIN GAAI-ENTRY-AUTHORITY/,/^# END GAAI-ENTRY-AUTHORITY/p' "$START"
+  cat <<'PROBE_TAIL'
+"$GAAI_ENV_CMD"
+printf 'protocol=https\nhost=example.invalid\n\n' \
+  | git -c credential.helper= -c core.askPass="$1" credential fill >/dev/null 2>"$2" \
+  || printf 'fill_rc=%s\n' "$?"
+PROBE_TAIL
+} > "$PROMPT_PROBE"
+chmod 0755 "$PROMPT_PROBE"
+ASKPASS_MARKER="$ROOT/askpass-ran.marker"
+printf '#!/bin/sh\necho ran > %s\necho probe-user\n' "$ASKPASS_MARKER" > "$ROOT/askpass-marker.sh"
+chmod 0755 "$ROOT/askpass-marker.sh"
+mkdir -p "$ROOT/probe-tmp" && chmod 0700 "$ROOT/probe-tmp"
+
+# One runner for every column. $1 = label, then the command that executes the probe.
+_prompt_probe_check() {
+  local _lbl="$1"; shift
+  rm -f "$ASKPASS_MARKER" "$ROOT/fill.err"
+  local _out _rc=0
+  _out="$(/usr/bin/env -i PATH=/usr/bin:/bin "HOME=$ROOT/opshome" "TMPDIR=$ROOT/probe-tmp" TERM=dumb \
+           GH_PROMPT_DISABLED=inherited-and-hostile \
+           "$@" "$ROOT/askpass-marker.sh" "$ROOT/fill.err" 2>&1)" || _rc=$?
+  if [[ "$_rc" -ne 0 ]]; then
+    fail "ENTRY-prompt[$_lbl]: the probe itself did not run cleanly (rc=$_rc): $(printf '%s' "$_out" | tail -3 | tr '\n' ' ')"
+    return
+  fi
+  printf '%s\n' "$_out" | grep -qx 'GIT_TERMINAL_PROMPT=0' \
+    && pass "ENTRY-prompt[$_lbl]: GIT_TERMINAL_PROMPT=0 is exported past section 8" \
+    || fail "ENTRY-prompt[$_lbl]: GIT_TERMINAL_PROMPT=0 is not in the exported environment"
+  printf '%s\n' "$_out" | grep -qx 'GIT_ASKPASS=' \
+    && pass "ENTRY-prompt[$_lbl]: GIT_ASKPASS is exported EMPTY (set, not unset) past section 8" \
+    || fail "ENTRY-prompt[$_lbl]: GIT_ASKPASS is not exported as an empty value"
+  printf '%s\n' "$_out" | grep -qx 'GH_PROMPT_DISABLED=1' \
+    && pass "ENTRY-prompt[$_lbl]: GH_PROMPT_DISABLED=1 is exported past section 8" \
+    || fail "ENTRY-prompt[$_lbl]: GH_PROMPT_DISABLED=1 is not in the exported environment"
+  printf '%s\n' "$_out" | grep -q 'GH_PROMPT_DISABLED=inherited-and-hostile' \
+    && fail "ENTRY-prompt[$_lbl]: an INHERITED GH_PROMPT_DISABLED value was admitted" \
+    || pass "ENTRY-prompt[$_lbl]: the inherited GH_PROMPT_DISABLED value was overwritten, not admitted"
+  printf '%s\n' "$_out" | grep -qx 'fill_rc=128' \
+    && grep -q 'terminal prompts disabled' "$ROOT/fill.err" 2>/dev/null \
+    && pass "ENTRY-prompt[$_lbl]: a credential request fails at once with 'terminal prompts disabled' instead of prompting" \
+    || fail "ENTRY-prompt[$_lbl]: the credential request did not fail closed (out: $(printf '%s' "$_out" | grep fill_rc; cat "$ROOT/fill.err" 2>/dev/null | head -1))"
+  [[ ! -e "$ASKPASS_MARKER" ]] \
+    && pass "ENTRY-prompt[$_lbl]: no askpass program ran (core.askPass is unreachable behind the empty GIT_ASKPASS)" \
+    || fail "ENTRY-prompt[$_lbl]: the askpass program EXECUTED — an interactive helper is still reachable"
+}
+
+_prompt_probe_check "shebang" "$PROMPT_PROBE"
+while IFS= read -r _sh; do
+  [[ -n "$_sh" ]] || continue
+  _shname="$(basename "$_sh")($("$_sh" --version 2>/dev/null | head -1 | sed 's/.*version \([0-9.]*\).*/\1/'))"
+  _prompt_probe_check "$_shname" "$_sh" --noprofile --norc -p "$PROMPT_PROBE"
+done <<< "$SHELL_LIST"
+
+# The survivor list is what lets the entry-set values through section 8; it must
+# never be the config allowlist, which would admit ENVIRONMENT values.
+for _n in GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED; do
+  if sed -n '/^_GAAI_CONFIG_ALLOW=/,/'"'"'$/p' "$START" | grep -qw "$_n"; then
+    fail "ENTRY-prompt[allow]: $_n is in _GAAI_CONFIG_ALLOW — an inherited value would be admitted"
+  else
+    pass "ENTRY-prompt[allow]: $_n is not in _GAAI_CONFIG_ALLOW (entry-set survivor only)"
+  fi
+done
+
+# The daemon child re-runs this entry inside the pane, whose environment the private
+# server copies from the parent — including the three values above. Section 4 refuses
+# any inherited GIT_* member, so the pane command must strip them before the child's
+# first instruction. Proven from both sides: with them inherited the entry refuses
+# (the strip is NECESSARY), and stripped through `env -u` it admits (SUFFICIENT).
+_out="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$ROOT/opshome" TERM=dumb \
+         GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= GH_PROMPT_DISABLED=1 "$START" --help 2>&1)"
+printf '%s' "$_out" | grep -q 'hostile_variable:GIT_' \
+  && pass "ENTRY-child-strip: the parent's own exported GIT_* values are refused when a child inherits them (strip necessary)" \
+  || fail "ENTRY-child-strip: inherited GIT_TERMINAL_PROMPT/GIT_ASKPASS were not refused by the entry"
+_out="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$ROOT/opshome" TERM=dumb \
+         GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= GH_PROMPT_DISABLED=1 \
+         /usr/bin/env -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED "$START" --help 2>&1)"
+printf '%s' "$_out" | grep -q 'reason=entry_authority_invalid' \
+  && fail "ENTRY-child-strip: the entry still refused after the env -u strip (strip insufficient): $(printf '%s' "$_out" | head -1)" \
+  || pass "ENTRY-child-strip: after the env -u strip the entry admits the child (strip sufficient)"
+grep -q "exec '\$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED '\$_launcher' --daemon-child" "$START" \
+  && pass "ENTRY-child-strip: the fixed pane command performs exactly that strip through the attested env" \
+  || fail "ENTRY-child-strip: the fixed pane command does not strip the entry-owned GIT_*/GH_ values before the child"
+
+echo ""
 echo "=== Entry authority: unsupported and degraded entries ==="
 OUT="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$ROOT/opshome" TERM=dumb \
         /bin/bash "$START" --help 2>&1)"

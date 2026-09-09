@@ -345,6 +345,29 @@ if [[ -n "${GH_TOKEN:-}" || -L "$XDG_CONFIG_HOME/gh" ]]; then
   ( umask 077; printf '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig" ) 2>/dev/null || true
 fi
 
+# 7c. No interactive credential path, ever. The private HOME above leaves git with
+#     no helper unless 7b provisioned one, and a pane of the private tmux server IS
+#     a terminal: without this, an absent credential makes the very first
+#     `git fetch` print `Username for 'https://github.com':` and wait forever. The
+#     daemon then never completes a poll cycle, `--exit-when-idle` never fires, and
+#     the log shows nothing past its startup lines because the prompt exists only
+#     in the pane. Every credential-acquisition path is closed here instead, so an
+#     absent credential fails IMMEDIATELY with a typed reason the daemon can log:
+#       GIT_TERMINAL_PROMPT=0  git may not prompt on the controlling terminal
+#       GIT_ASKPASS=''         an exported EMPTY value is not "unset": git then
+#                              consults neither core.askPass nor SSH_ASKPASS
+#                              (measured), so no askpass program can be reached
+#       GH_PROMPT_DISABLED=1   gh never opens an interactive prompt
+#     An inherited GIT_TERMINAL_PROMPT or GIT_ASKPASS was already refused in
+#     section 4 as a GIT_* family member; an inherited GH_PROMPT_DISABLED is
+#     overwritten here before anything can read it. The values set HERE are
+#     entry-owned, and they survive the section 8 strip so they reach every
+#     descendant — the daemon child, its git, and gh.
+GIT_TERMINAL_PROMPT=0
+GIT_ASKPASS=""
+GH_PROMPT_DISABLED=1
+export GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED
+
 # 8. Positive allowlist: every other exported configuration entry is dropped and
 #    the survivors are rebuilt from validated scalar values. A value that is not a
 #    single safe scalar is not "sanitised" — it is refused.
@@ -379,8 +402,12 @@ for _gaai_key in $_GAAI_CONFIG_ALLOW; do
   fi
 done
 unset -v _gaai_key _gaai_val _GAAI_EXPORTED_SET
+# The survivors after `_GAAI_CONFIG_ALLOW` are either interpreter/session identity
+# or values this entry SET itself (sections 7, 7b, 7c). Naming one here never admits
+# an environment value: every hostile inherited entry was refused in sections 3-5,
+# and each entry-owned survivor was assigned unconditionally above.
 for _gaai_name in $(compgen -e 2>/dev/null || true); do
-  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN " in
+  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED " in
     *" $_gaai_name "*) ;;
     *) export -n "$_gaai_name" 2>/dev/null || true ;;
   esac
@@ -626,11 +653,14 @@ _pane_field() {
 
 # ── Daemon child mode ─────────────────────────────────────────────────────
 #
-# Entered as `exec <launcher> --daemon-child <attempt_dir>` from the fixed pane
-# command. The launcher is a private, byte-exact materialization of the fetched
-# target's own `daemon-start.sh`, so this code path is never sourced from mutable
-# main-checkout bytes. `exec` preserves the PID, which is why
-# pane_pid == launcher_ack.pid == ready_ack.pid holds all the way to the daemon.
+# Entered as `exec <env> -u <entry-owned names> <launcher> --daemon-child
+# <attempt_dir>` from the fixed pane command. The launcher is a private, byte-exact
+# materialization of the fetched target's own `daemon-start.sh`, so this code path
+# is never sourced from mutable main-checkout bytes. Both `exec`s preserve the PID,
+# which is why pane_pid == launcher_ack.pid == ready_ack.pid holds all the way to
+# the daemon. The `env -u` strip exists because the parent entry exported its
+# section 7c non-interactive git/gh values and this entry's section 4 would refuse
+# them as inherited GIT_* members; the child re-sets them itself.
 
 _child_refuse() {
   local _attempt_dir="$1" _evidence="$2"
@@ -1191,8 +1221,15 @@ launcher=$_launcher" || { _gaai_home_refuse home_lock_failed 1 "pending_enrich_u
   [[ -n "${GAAI_CI_TEST_GATE_MATERIALIZE_SEC:-}" ]] && tmux_env_args+=(-e "GAAI_CI_TEST_GATE_MATERIALIZE_SEC=${GAAI_CI_TEST_GATE_MATERIALIZE_SEC}")
 
   # The pane command is fixed. Operator input never reaches it.
+  #
+  # The child is this same privileged entry, and its section 4 refuses ANY inherited
+  # GIT_* member — including the non-interactive values this process exported in
+  # section 7c, which the private server hands to every pane it spawns (measured).
+  # They are stripped through the attested `env` so the child observes no inherited
+  # member and sets its own entry-owned copies. `env` execs the launcher, so
+  # pane_pid == launcher_ack.pid still holds; nothing else in the pane changes.
   if ! _tmux new-session -d -s "$TMUX_SESSION" ${tmux_env_args[@]+"${tmux_env_args[@]}"} \
-      "exec '$_launcher' --daemon-child '$_attempt_dir'" 2>/dev/null; then
+      "exec '$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED '$_launcher' --daemon-child '$_attempt_dir'" 2>/dev/null; then
     _gaai_home_refuse process_authority_invalid 1 "tmux_role=session_uncreatable" || true
     _release_and_exit 1
   fi
