@@ -921,7 +921,178 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── Resolve project root + auto-detect core/project layout ────────────
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+#
+# The supported production entry executes an ALREADY-BOUND descriptor
+# (`daemon-start.sh` binds fd 9 to the verified home asset and execs it), so `$0`
+# is that descriptor's command-file name — `/dev/fd/9`, or `/proc/self/fd/9`
+# where the platform provides it — and NEVER a filesystem location beside this
+# program's Framework libraries. Deriving the asset root from `$0` there yields
+# `/dev/fd` and no library resolves. The asset root is therefore the home the
+# launcher already admitted and exported, taken only AFTER the inherited launch
+# evidence has been checked below as data.
+#
+# What this gate does not do: it never execs, sources or rereads the main daemon
+# by its home pathname, never provisions or repairs anything, and never relaxes
+# the launch-tuple validation performed at the ready acknowledgement further
+# down — it runs earlier, so that no library from an unproven home can execute
+# before the authority that selected it has been proven.
+_gaai_boot_refuse() {
+  printf 'ERROR: daemon bootstrap invalid — reason=process_authority_invalid action=operator_disposition_required evidence=%s\n' \
+    "$1" >&2
+  exit 1
+}
+
+# Launch records are read as DATA. Never `source`/`eval` here: these bytes come
+# from a home whose authority is exactly what is still being established.
+_gaai_boot_field() {
+  [[ -r "$1" ]] || return 1
+  sed -n "s/^${2}=//p" "$1" 2>/dev/null | head -1
+}
+
+# The launcher's own platform rule for a bound descriptor, applied here to the
+# descriptor this process inherited: through a /proc magic link the node resolves
+# to the open description's file, so inode AND device must match the home asset;
+# through Darwin's fdesc /dev/fd node stat(2) reports the bound file's inode but
+# fdesc's OWN device, so the device is not comparable there by construction.
+_gaai_boot_fd_identity_matches() {
+  local _fd_path="$1" _f_ino="$2" _f_dev="$3" _p_ino="$4" _p_dev="$5"
+  [[ "$_f_ino" == "$_p_ino" ]] || return 1
+  case "$_fd_path" in
+    /proc/*) [[ "$_f_dev" == "$_p_dev" ]] || return 1 ;;
+    *)       [[ "$(uname -s)" == "Darwin" ]] || { [[ "$_f_dev" == "$_p_dev" ]] || return 1; } ;;
+  esac
+  return 0
+}
+
+_gaai_boot_fd=0
+case "$0" in
+  /dev/fd/9|/proc/self/fd/9) _gaai_boot_fd=1 ;;
+  # Any other descriptor spelling is not the launcher's, so no launch authority
+  # can be derived from it.
+  /dev/fd/*|/proc/self/fd/*|/proc/[0-9]*/fd/*) _gaai_boot_refuse "daemon_role=descriptor_unsupported" ;;
+esac
+
+if [[ "$_gaai_boot_fd" -eq 1 ]]; then
+  _gaai_boot_attempt_dir="${GAAI_DAEMON_LAUNCH_ATTEMPT:-}"
+  _gaai_boot_home="${GAAI_DAEMON_HOME:-}"
+  [[ -n "$_gaai_boot_attempt_dir" ]] || _gaai_boot_refuse "launch_role=authority_absent"
+  [[ -d "$_gaai_boot_attempt_dir" ]] || _gaai_boot_refuse "launch_role=attempt_dir_absent"
+  [[ -n "$_gaai_boot_home" ]] || _gaai_boot_refuse "home_role=absent"
+  [[ "$_gaai_boot_home" == /* && "$_gaai_boot_home" != "/" && "$_gaai_boot_home" != *$'\n'* ]] \
+    || _gaai_boot_refuse "home_role=malformed"
+  [[ -d "$_gaai_boot_home" ]] || _gaai_boot_refuse "home_role=absent"
+  # A descriptor that cannot even be stat'd is not evidence of anything. Nothing
+  # here READS it: this program's own bytes are being read from that same open
+  # description, and consuming its offset would truncate the running image.
+  [[ -r "$0" ]] || _gaai_boot_refuse "daemon_role=descriptor_unreadable"
+
+  _gaai_boot_manifest="$_gaai_boot_attempt_dir/manifest"
+  _gaai_boot_ack="$_gaai_boot_attempt_dir/ack.launcher"
+  [[ -r "$_gaai_boot_manifest" ]] || _gaai_boot_refuse "launch_role=manifest_absent"
+  [[ -r "$_gaai_boot_ack" ]] || _gaai_boot_refuse "launch_role=ack_launcher_absent"
+
+  _gaai_boot_m_schema="$(_gaai_boot_field "$_gaai_boot_manifest" schema || echo "")"
+  _gaai_boot_m_attempt="$(_gaai_boot_field "$_gaai_boot_manifest" attempt || echo "")"
+  _gaai_boot_m_home="$(_gaai_boot_field "$_gaai_boot_manifest" home || echo "")"
+  _gaai_boot_m_sha="$(_gaai_boot_field "$_gaai_boot_manifest" target_sha || echo "")"
+  _gaai_boot_m_digest="$(_gaai_boot_field "$_gaai_boot_manifest" daemon_digest || echo "")"
+  _gaai_boot_a_schema="$(_gaai_boot_field "$_gaai_boot_ack" schema || echo "")"
+  _gaai_boot_a_attempt="$(_gaai_boot_field "$_gaai_boot_ack" attempt || echo "")"
+  _gaai_boot_a_pid="$(_gaai_boot_field "$_gaai_boot_ack" pid || echo "")"
+  _gaai_boot_a_inc="$(_gaai_boot_field "$_gaai_boot_ack" incarnation || echo "")"
+  _gaai_boot_a_ino="$(_gaai_boot_field "$_gaai_boot_ack" daemon_ino || echo "")"
+  _gaai_boot_a_digest="$(_gaai_boot_field "$_gaai_boot_ack" daemon_digest || echo "")"
+
+  # The two existing records must agree with each other AND carry the existing
+  # canonical lifecycle schema. Agreement alone is not authority: an unproven tree
+  # supplies both records, so it can make any value agree with itself. The
+  # canonical value cannot be read from that tree either — `lib/daemon-home.sh` is
+  # exactly the library this gate exists to keep from executing — so the constant
+  # is restated here and pinned to `GAAI_HOME_SCHEMA` by a regression assertion in
+  # daemon-asset-home.test.sh. This introduces no new schema and does not weaken
+  # the identical check the ready acknowledgement still performs below.
+  _gaai_boot_schema="gaai-daemon-lifecycle/v1"
+  [[ -n "$_gaai_boot_m_schema" && "$_gaai_boot_m_schema" == "$_gaai_boot_a_schema" ]] \
+    || _gaai_boot_refuse "launch_role=schema_disagreement"
+  [[ "$_gaai_boot_m_schema" == "$_gaai_boot_schema" ]] \
+    || _gaai_boot_refuse "launch_role=manifest_schema_mismatch"
+  [[ -n "$_gaai_boot_m_attempt" && "$_gaai_boot_m_attempt" == "$_gaai_boot_a_attempt" ]] \
+    || _gaai_boot_refuse "launch_role=attempt_disagreement"
+  [[ "$_gaai_boot_attempt_dir" == *"/$_gaai_boot_m_attempt" ]] \
+    || _gaai_boot_refuse "launch_role=attempt_path_mismatch"
+  [[ -n "$_gaai_boot_m_home" && "$_gaai_boot_m_home" == "$_gaai_boot_home" ]] \
+    || _gaai_boot_refuse "home_role=identity_mismatch"
+  [[ -n "$_gaai_boot_m_sha" && "$_gaai_boot_m_sha" == "${GAAI_TARGET_SHA:-}" ]] \
+    || _gaai_boot_refuse "launch_role=target_disagreement"
+  [[ -n "$_gaai_boot_m_digest" && "$_gaai_boot_m_digest" == "$_gaai_boot_a_digest" ]] \
+    || _gaai_boot_refuse "daemon_role=digest_disagreement"
+  # `exec` preserved the PID across the launcher, so this is an identity the
+  # daemon can check rather than infer.
+  [[ -n "$_gaai_boot_a_pid" && "$_gaai_boot_a_pid" == "$$" \
+     && "$_gaai_boot_a_pid" == "${GAAI_DAEMON_LAUNCH_PID:-}" ]] \
+    || _gaai_boot_refuse "launch_role=pid_identity_mismatch"
+  # The incarnation is REQUIRED evidence here, not an optional refinement. The
+  # launcher refuses to bind at all without a provable incarnation, writes it to
+  # the acknowledgement and exports it immediately before its exec, so a
+  # supported launch always carries both. Treating an absent value as agreement
+  # would let a tuple with no process-identity evidence reach the first
+  # repository source, which is exactly what this gate exists to prevent: both
+  # must be present and equal.
+  [[ -n "$_gaai_boot_a_inc" \
+     && "$_gaai_boot_a_inc" == "${GAAI_DAEMON_LAUNCH_INCARNATION:-}" ]] \
+    || _gaai_boot_refuse "launch_role=incarnation_mismatch"
+
+  # The inherited descriptor must be the daemon asset OF THAT ADMITTED HOME. A
+  # matching basename, an existing directory or an environment value is not
+  # admission: the proof is the descriptor's own identity against the home path
+  # the launcher acknowledged binding.
+  _gaai_boot_asset="$_gaai_boot_home/.gaai/core/scripts/delivery-daemon.sh"
+  [[ -L "$_gaai_boot_asset" ]] && _gaai_boot_refuse "daemon_role=symlink"
+  [[ -f "$_gaai_boot_asset" ]] || _gaai_boot_refuse "daemon_role=absent"
+  _gaai_boot_stat_field() {
+    local _fmt="$1" _path="$2" _out
+    case "$_fmt" in
+      '%i') _out="$(stat -L -c '%i' "$_path" 2>/dev/null || stat -L -f '%i' "$_path" 2>/dev/null || echo "")" ;;
+      '%d') _out="$(stat -L -c '%d' "$_path" 2>/dev/null || stat -L -f '%d' "$_path" 2>/dev/null || echo "")" ;;
+      *)    return 1 ;;
+    esac
+    [[ -n "$_out" ]] || return 1
+    printf '%s' "$_out"
+  }
+  _gaai_boot_p_ino="$(_gaai_boot_stat_field '%i' "$_gaai_boot_asset")" \
+    || _gaai_boot_refuse "daemon_role=stat_unavailable"
+  _gaai_boot_p_dev="$(_gaai_boot_stat_field '%d' "$_gaai_boot_asset")" \
+    || _gaai_boot_refuse "daemon_role=stat_unavailable"
+  _gaai_boot_f_ino="$(_gaai_boot_stat_field '%i' "$0")" \
+    || _gaai_boot_refuse "daemon_role=fd_stat_unavailable"
+  _gaai_boot_f_dev="$(_gaai_boot_stat_field '%d' "$0")" \
+    || _gaai_boot_refuse "daemon_role=fd_stat_unavailable"
+  _gaai_boot_fd_identity_matches "$0" \
+    "$_gaai_boot_f_ino" "$_gaai_boot_f_dev" "$_gaai_boot_p_ino" "$_gaai_boot_p_dev" \
+    || _gaai_boot_refuse "daemon_role=fd_identity_mismatch"
+  [[ -n "$_gaai_boot_a_ino" && "$_gaai_boot_a_ino" == "$_gaai_boot_f_ino" ]] \
+    || _gaai_boot_refuse "daemon_role=fd_identity_unacknowledged"
+
+  # Admitted. The home selected for a descriptor launch has NO fallback to the
+  # operator checkout.
+  SCRIPT_DIR="$(cd "$_gaai_boot_home/.gaai/core/scripts" 2>/dev/null && pwd)" \
+    || _gaai_boot_refuse "home_role=scripts_root_unresolvable"
+  unset -f _gaai_boot_stat_field
+  unset -v _gaai_boot_attempt_dir _gaai_boot_home _gaai_boot_manifest _gaai_boot_ack \
+           _gaai_boot_m_schema _gaai_boot_m_attempt _gaai_boot_m_home _gaai_boot_m_sha \
+           _gaai_boot_m_digest _gaai_boot_a_schema _gaai_boot_a_attempt _gaai_boot_a_pid \
+           _gaai_boot_a_inc _gaai_boot_a_ino _gaai_boot_a_digest _gaai_boot_asset \
+           _gaai_boot_p_ino _gaai_boot_p_dev _gaai_boot_f_ino _gaai_boot_f_dev \
+           _gaai_boot_schema
+else
+  # Pathname invocation — the supported diagnostic/test compatibility path, which
+  # carries no lifecycle authority. A pathname entry that CLAIMS a launch is
+  # refused rather than admitted as an alternative lifecycle entry.
+  [[ -z "${GAAI_DAEMON_LAUNCH_ATTEMPT:-}" ]] || _gaai_boot_refuse "daemon_role=descriptor_required"
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+unset -f _gaai_boot_refuse _gaai_boot_field _gaai_boot_fd_identity_matches
+unset -v _gaai_boot_fd
 GAAI_CORE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECT_DIR="$(cd "$GAAI_CORE_DIR/../.." && pwd)"
 # Real repo root — paths that must stay anchored to the operator's main checkout
@@ -4027,7 +4198,15 @@ _reconcile_merged_pr() {
   # weaker check — the empty default is the intended fail-closed failure mode.
   local sid="$1" merged_at="$2" pr_number="${3:-}" pr_created_at="${4:-}"
   local script_dir
-  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  # The generated child sources lib/backlog-yaml.sh from here. In the daemon this
+  # is the admitted asset root (under a descriptor launch `BASH_SOURCE[0]` is
+  # `/dev/fd/9`, whose directory holds no library). The BASH_SOURCE-relative
+  # sibling lookup stays the fallback for the extracted-function runners, which
+  # place `lib/` next to their own runner and define no daemon asset root.
+  script_dir="${SCRIPT_DIR:-}"
+  if [[ -z "$script_dir" || ! -r "$script_dir/lib/backlog-yaml.sh" ]]; then
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  fi
   local reconcile_script
   reconcile_script=$(mktemp "$LOCK_DIR/.pr-watcher-reconcile-XXXXXX" 2>/dev/null) || {
     log "${RED}[PR-WATCHER] reconciliation temporary script creation failed${NC}"
@@ -4963,8 +5142,13 @@ if [[ "${GAAI_PR_WATCHER_DISABLED:-}" == "1" ]]; then
 fi
 
 # ── Load 3-phase dispatch library (E134S02) ──────────────────────────────
+# Resolved from the admitted asset root, exactly like every bootstrap library
+# above. Under the supported descriptor launch `$0` is `/dev/fd/9`, so a
+# `dirname "$0"` here looked for the library in `/dev/fd` — after the ready
+# acknowledgement, which is why an early readiness ack cannot stand in for
+# evidence that the daemon reached its dispatch loop.
 # shellcheck disable=SC1090
-source "$(dirname "$0")/daemon-dispatch.sh"
+source "$SCRIPT_DIR/daemon-dispatch.sh"
 
 # ── Forward recovery scan (one-shot at daemon start) ─────────────────────
 clean_stale_locks
