@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+-: fix real daemon bootstrap after exact-home admission
+
 ## [2.49.0] - 2026-09-08
 
 ### Changed

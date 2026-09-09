@@ -151,6 +151,51 @@ else
 fi
 
 echo ""
+echo "=== Shipped daemon asset: the tracked mode the unchanged admission contract requires ==="
+# Separate from the two privileged-entry assertions above: the daemon carries no
+# privileged shebang and is never entered directly by an operator, but the home
+# admission contract (`_gaai_home_verify_asset`, unchanged) requires Git mode
+# 100755 for it. A working-copy chmod alone cannot satisfy the tracked-mode
+# assertion, and no fixture chmod may stand in for the shipped mode.
+DAEMON_SRC="$SCRIPTS_DIR/delivery-daemon.sh"
+DAEMON_TRACKED="$(git -C "$REPO_ROOT" ls-files -s "${DAEMON_SRC#$REPO_ROOT/}" | awk '{print $1}')"
+if [[ "$DAEMON_TRACKED" == "100755" ]]; then
+  pass "SHIPPED-mode: delivery-daemon.sh is tracked at Git mode 100755"
+else
+  fail "SHIPPED-mode: delivery-daemon.sh is tracked at ${DAEMON_TRACKED:-<untracked>}, so the launcher refuses it with asset_role=mode_mismatch"
+fi
+[[ -x "$DAEMON_SRC" ]] \
+  && pass "SHIPPED-exec: the working copy of delivery-daemon.sh is executable" \
+  || fail "SHIPPED-exec: the working copy of delivery-daemon.sh is not executable"
+
+echo ""
+echo "=== Shipped daemon asset: every Framework asset read is home-rooted, not \$0-rooted ==="
+# The daemon executes a bound descriptor, so `\$0` is a descriptor name. A
+# `dirname \$0` asset lookup therefore resolves under /dev/fd. The bootstrap root,
+# the late dispatch import and the reconciliation child's library read must all
+# come from the admitted asset root instead. (The runtime half of this property is
+# the real-daemon matrix below and the real lifecycle lane in the sibling suite.)
+if grep -nE '^[[:space:]]*(source|\.)[[:space:]]+"\$\(dirname "\$0"\)' "$DAEMON_SRC" >/dev/null; then
+  fail "ROOTS-1: a Framework library is still sourced relative to the descriptor name:"
+  grep -nE '^[[:space:]]*(source|\.)[[:space:]]+"\$\(dirname "\$0"\)' "$DAEMON_SRC" | sed 's/^/        /'
+else
+  pass "ROOTS-1: no Framework library is sourced relative to the descriptor name"
+fi
+if grep -q 'source "\$SCRIPT_DIR/daemon-dispatch.sh"' "$DAEMON_SRC"; then
+  pass "ROOTS-2: the late dispatch import resolves from the admitted asset root"
+else
+  fail "ROOTS-2: the late dispatch import does not resolve from the admitted asset root"
+fi
+# The extracted-function runners (reconcile-*.test.sh, pr-watcher.test.sh) define
+# no daemon asset root and place `lib/` beside their own runner, so the
+# BASH_SOURCE sibling fallback must survive.
+if grep -q 'dirname "\${BASH_SOURCE\[0\]}"' "$DAEMON_SRC"; then
+  pass "ROOTS-3: the reconciliation child keeps its sibling-library fallback for direct runners"
+else
+  fail "ROOTS-3: the sibling-library fallback used by the extracted-function runners is gone"
+fi
+
+echo ""
 echo "=== Entry authority: hostile-input matrix, per supported interpreter ==="
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gaai-asset-XXXXXX")"
@@ -639,6 +684,376 @@ if [[ -n "$ATTEMPT_DIR" ]]; then
   fi
 fi
 gaai_run "$ROOT" "$START" --stop >/dev/null 2>&1
+
+echo ""
+echo "════════════════════════════════════════"
+echo "Part 4 — the REAL distributed daemon on its real entry"
+echo "════════════════════════════════════════"
+#
+# Everything above uses the stub daemon of the shared fixture. This part executes
+# the ACTUAL delivery-daemon.sh bytes on the descriptor entry the launcher uses,
+# under every supported interpreter, against complete Framework trees.
+#
+# The probe harness reproduces exactly two mechanics of the launcher's child step
+# — binding descriptor 9 and a PID-preserving exec of it — so no tmux lifecycle is
+# needed to observe the daemon's own bootstrap decisions. It performs no check of
+# its own: every refusal below is the daemon's.
+
+RROOT="$(mktemp -d "${TMPDIR:-/tmp}/gaai-asset-real-XXXXXX")"
+RROOT="$(cd "$RROOT" && pwd -P)"
+REAL_FAIL_BASE="$FAIL_COUNT"
+PROBE_EVIDENCE="$RROOT/evidence"
+# Probe evidence survives a failure. These rows are the falsifiers for the whole
+# asset-root repair, so a red one must leave its trees, records and raw output on
+# disk; only an all-green matrix cleans up, and only its own mktemp root.
+real_probe_teardown() {
+  if [[ "$FAIL_COUNT" -eq "$REAL_FAIL_BASE" ]]; then
+    rm -rf "$RROOT" 2>/dev/null || true
+    return 0
+  fi
+  echo ""
+  echo "  EVIDENCE PRESERVED — a real-daemon probe row failed."
+  echo "        probe root:      $RROOT"
+  echo "        raw probe output: $PROBE_EVIDENCE"
+}
+trap 'gaai_teardown "$ROOT" "$PROJ"; real_probe_teardown' EXIT
+mkdir -p "$RROOT/opshome" "$PROBE_EVIDENCE"
+
+# Three complete trees of real Framework bytes. `H_OK` is pristine; `H_MARK` and
+# `DECOY` carry libraries instrumented to write a fixture-local marker WHEN
+# SOURCED, so a refusal can be distinguished from a merely incomplete fixture.
+H_OK="$RROOT/home-pristine"
+H_MARK="$RROOT/home-instrumented"
+DECOY="$RROOT/operator-checkout"
+MARK_HOME="$RROOT/marker-home"
+MARK_DECOY="$RROOT/marker-operator"
+REAL_TREES_OK=1
+for _t in "$H_OK" "$H_MARK" "$DECOY"; do
+  mkdir -p "$_t/.gaai/project/contexts/backlog"
+  printf 'items: []\n' > "$_t/.gaai/project/contexts/backlog/active.backlog.yaml"
+  gaai_copy_tracked_core "$REPO_ROOT" "$_t" || REAL_TREES_OK=0
+done
+gaai_poison_lib_tree "$H_MARK" "$MARK_HOME" || REAL_TREES_OK=0
+gaai_poison_lib_tree "$DECOY" "$MARK_DECOY" || REAL_TREES_OK=0
+if [[ "$REAL_TREES_OK" -eq 1 ]] \
+   && cmp -s "$SCRIPTS_DIR/delivery-daemon.sh" "$H_OK/.gaai/core/scripts/delivery-daemon.sh" \
+   && ! grep -q 'Stub daemon' "$H_OK/.gaai/core/scripts/delivery-daemon.sh"; then
+  pass "REAL-0: the probe trees carry the real dependency tree and the real daemon bytes"
+else
+  fail "REAL-0: the probe trees are not a faithful copy of the candidate"
+fi
+
+HARNESS="$RROOT/fd-launch-harness.sh"
+gaai_write_fd_harness "$HARNESS"
+
+# Incarnation shim. The shared harness acknowledges the REAL incarnation and
+# exports it, which is what a supported launch does; these rows need the three
+# ways that evidence can be incomplete instead. The shim is inserted between the
+# harness and the interpreter: `exec` preserves the PID and the inherited
+# descriptors across both hops, so the acknowledgement's pid identity and the
+# bound descriptor stay exactly as the harness established them, and only the
+# incarnation evidence differs. It reads no descriptor and performs no check of
+# its own; exit code 93 is reserved for its own failure so a shim fault can
+# never be counted as a production refusal.
+INC_SHIM="$RROOT/incarnation-shim.sh"
+cat > "$INC_SHIM" <<'SHIM_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+_fd="$1"; shift
+case "${GAAI_PROBE_INC_ACK:-keep}" in
+  absent)
+    sed '/^incarnation=/d' "$GAAI_PROBE_ACK_DIR/ack.launcher" > "$GAAI_PROBE_ACK_DIR/ack.shim" \
+      && mv "$GAAI_PROBE_ACK_DIR/ack.shim" "$GAAI_PROBE_ACK_DIR/ack.launcher" || exit 93 ;;
+esac
+case "${GAAI_PROBE_INC_ENV:-keep}" in
+  absent) unset GAAI_DAEMON_LAUNCH_INCARNATION ;;
+  other)  export GAAI_DAEMON_LAUNCH_INCARNATION="gaai-probe-other-incarnation" ;;
+esac
+exec "${GAAI_PROBE_INC_SHELL:?}" "$_fd" "$@"
+SHIM_EOF
+chmod 0755 "$INC_SHIM"
+P_DAEMON="$H_OK/.gaai/core/scripts/delivery-daemon.sh"
+SCHEMA="$(gaai_home_schema "$H_OK/.gaai/core/scripts")"
+ATTEMPT_ID="probe-$$"
+TARGET_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo 0000000000000000000000000000000000000000)"
+DIGEST="$(shasum -a 256 < "$P_DAEMON" 2>/dev/null | awk '{print $1}')"
+[[ -n "$DIGEST" ]] || DIGEST="$(sha256sum < "$P_DAEMON" 2>/dev/null | awk '{print $1}')"
+[[ -n "$DIGEST" ]] || DIGEST="digest-unavailable"
+[[ -n "$SCHEMA" ]] \
+  && pass "REAL-1: the launch schema literal was read from its single source of truth" \
+  || fail "REAL-1: the launch schema literal could not be read from lib/daemon-home.sh"
+
+# The pre-source gate cannot source lib/daemon-home.sh to learn the canonical
+# schema — that library is precisely what it must keep from executing — and it
+# cannot trust a value the unproven tree supplies, so it restates the constant.
+# This assertion pins the two together, so the restated one cannot silently drift
+# from GAAI_HOME_SCHEMA.
+BOOT_SCHEMA="$(sed -n 's/^  _gaai_boot_schema="\(.*\)"$/\1/p' "$DAEMON_SRC" | head -1)"
+if [[ -n "$BOOT_SCHEMA" && "$BOOT_SCHEMA" == "$SCHEMA" ]]; then
+  pass "REAL-2: the pre-source gate enforces the same canonical schema as GAAI_HOME_SCHEMA"
+else
+  fail "REAL-2: the pre-source gate's schema ('${BOOT_SCHEMA:-<absent>}') has drifted from GAAI_HOME_SCHEMA ('$SCHEMA')"
+fi
+
+# tmux lives outside /usr/bin on many hosts and the daemon's launcher-detection
+# runs before --help. The probe therefore selects that one directory explicitly;
+# it never restores the operator's ambient PATH.
+PROBE_PATH="/usr/bin:/bin"
+_tmux_bin="$(command -v tmux 2>/dev/null || echo "")"
+[[ -n "$_tmux_bin" ]] && PROBE_PATH="$PROBE_PATH:$(dirname "$_tmux_bin")"
+
+# mk_attempt <parent> <manifest_home> -> prints the attempt directory
+mk_attempt() {
+  local _d="$1/$ATTEMPT_ID"
+  mkdir -p "$_d"
+  gaai_write_manifest "$_d" "${PROBE_SCHEMA_MANIFEST:-$SCHEMA}" "$ATTEMPT_ID" "$2" \
+    "$DECOY" "$TARGET_SHA" "$DIGEST"
+  printf '%s' "$_d"
+}
+
+# fd_probe <shell> <launch_attempt> <ack_dir> <env_home> <fd_path> <ack_ino> <target_sha> [args...]
+# An empty value means "unset", which is exactly what the daemon's own `${x:-}`
+# reads see. The ack.launcher record is written by the harness from its real pid
+# and the real descriptor identity unless <ack_ino> forges the inode; an empty
+# <ack_dir> writes none, which is how the "acknowledgement absent" row is built.
+fd_probe() {
+  local _sh="$1" _att="$2" _ack="$3" _home="$4" _fd="$5" _ino="$6" _sha="$7"
+  # The forged-inode row carries a token, not a digit run: a numeric literal long
+  # enough to be a plausible inode is also long enough to read as a commit id.
+  [[ "$_ino" == "%FORGED_INO%" ]] && _ino=$(( 10 ** 9 - 1 ))
+  shift 7
+  # The descriptor is bound to the daemon OF THE ADMITTED HOME, which is what the
+  # launcher does. PROBE_DAEMON_OVERRIDE binds a different file on purpose, to
+  # prove the identity check is by descriptor identity and not by name or content.
+  local _dp="$P_DAEMON"
+  [[ -d "$_home" ]] && _dp="$_home/.gaai/core/scripts/delivery-daemon.sh"
+  [[ -n "${PROBE_DAEMON_OVERRIDE:-}" ]] && _dp="$PROBE_DAEMON_OVERRIDE"
+  /usr/bin/env -i "PATH=$PROBE_PATH" "HOME=$RROOT/opshome" TERM=dumb \
+    "GAAI_PROBE_DAEMON=$_dp" "GAAI_PROBE_SHELL=$_sh" \
+    "GAAI_PROBE_FD_PATH=$_fd" "GAAI_PROBE_ACK_DIR=$_ack" \
+    "GAAI_PROBE_SCHEMA=${PROBE_SCHEMA_ACK:-$SCHEMA}" "GAAI_PROBE_ATTEMPT=$ATTEMPT_ID" \
+    "GAAI_PROBE_DIGEST=$DIGEST" "GAAI_PROBE_ACK_INO=$_ino" \
+    "GAAI_PROBE_INC_SHELL=${PROBE_INC_SHELL:-}" \
+    "GAAI_PROBE_INC_ACK=${PROBE_INC_ACK:-keep}" "GAAI_PROBE_INC_ENV=${PROBE_INC_ENV:-keep}" \
+    "GAAI_DAEMON_LAUNCH_ATTEMPT=$_att" "GAAI_DAEMON_HOME=$_home" \
+    "GAAI_REPO_ROOT=$DECOY" "GAAI_TARGET_SHA=$_sha" \
+    "GAAI_DAEMON_CREDENTIAL_MODE=absent" \
+    "$HARNESS" "$@" 2>&1
+}
+
+clear_markers() { rm -f "$MARK_HOME" "$MARK_DECOY"; }
+
+# label|manifest_home|env_home|fd_path|ack_ino|evidence
+# Every row supplies otherwise COMPLETE, sentinel-bearing assets, so a refusal can
+# only come from the authority check and never from a missing file.
+NEG_ROWS="$(cat <<'ROWS'
+authority-absent|%MARK%|%MARK%|||launch_role=authority_absent
+attempt-dir-absent|%MARK%|%MARK%|||launch_role=attempt_dir_absent
+manifest-absent|%MARK%|%MARK%|||launch_role=manifest_absent
+ack-launcher-absent|%MARK%|%MARK%|||launch_role=ack_launcher_absent
+schema-disagreement|%MARK%|%MARK%|||launch_role=schema_disagreement
+schema-invalid-agreeing|%MARK%|%MARK%|||launch_role=manifest_schema_mismatch
+incarnation-mismatch|%MARK%|%MARK%|||launch_role=incarnation_mismatch
+incarnation-ack-absent|%MARK%|%MARK%|||launch_role=incarnation_mismatch
+incarnation-env-absent|%MARK%|%MARK%|||launch_role=incarnation_mismatch
+incarnation-both-absent|%MARK%|%MARK%|||launch_role=incarnation_mismatch
+home-absent|%MARK%||||home_role=absent
+home-malformed|%MARK%|relative/not/absolute|||home_role=malformed
+home-mismatch|%OK%|%MARK%|||home_role=identity_mismatch
+target-disagreement|%MARK%|%MARK%|||launch_role=target_disagreement
+forged-descriptor-inode|%MARK%|%MARK%||%FORGED_INO%|daemon_role=fd_identity_unacknowledged
+descriptor-not-of-home|%MARK%|%MARK%|||daemon_role=fd_identity_mismatch
+other-descriptor|%MARK%|%MARK%|/dev/fd/8||daemon_role=descriptor_unsupported
+ROWS
+)"
+
+SHELL_LIST="$(gaai_supported_shells)"
+while IFS= read -r _sh; do
+  [[ -n "$_sh" ]] || continue
+  _shname="$(basename "$_sh")($("$_sh" --version 2>/dev/null | head -1 | sed 's/.*version \([0-9.]*\).*/\1/'))"
+  PROBE_DAEMON_OVERRIDE=""
+  PROBE_SCHEMA_MANIFEST=""
+  PROBE_SCHEMA_ACK=""
+  PROBE_INC_SHELL="$_sh"
+  PROBE_INC_ACK=""
+  PROBE_INC_ENV=""
+
+  # ── Positive 1: the pristine distributed bytes bootstrap on the descriptor ──
+  ATT="$(mk_attempt "$RROOT/pos1-$$" "$H_OK")"
+  clear_markers
+  OUT="$(fd_probe "$_sh" "$ATT" "$ATT" "$H_OK" "" "" "$TARGET_SHA" --help)"; RC=$?
+  printf '%s\n' "$OUT" > "$PROBE_EVIDENCE/pos-pristine.$_shname.out"
+  printf '%s\n' "$RC" > "$PROBE_EVIDENCE/pos-pristine.$_shname.rc"
+  if [[ "$RC" -eq 0 ]]; then
+    pass "REALFD-pristine[$_shname]: the real daemon bootstraps from the admitted home on its bound descriptor"
+  else
+    fail "REALFD-pristine[$_shname]: the real daemon failed to bootstrap (rc=$RC): $(printf '%s' "$OUT" | tail -3)"
+  fi
+  if printf '%s' "$OUT" | grep -q '/dev/fd/lib\|/proc/self/fd/lib\|/dev/fd/daemon-dispatch'; then
+    fail "REALFD-pristine[$_shname]: an asset was still resolved under the descriptor directory"
+  else
+    pass "REALFD-pristine[$_shname]: no asset was resolved under the descriptor directory"
+  fi
+
+  # ── Positive 2: the admitted home supplies the libraries, the operator
+  #    checkout does not — proven by which sentinel fired ──
+  ATT="$(mk_attempt "$RROOT/pos2-$$" "$H_MARK")"
+  clear_markers
+  OUT="$(fd_probe "$_sh" "$ATT" "$ATT" "$H_MARK" "" "" "$TARGET_SHA" --help)"; RC=$?
+  printf '%s\n' "$OUT" > "$PROBE_EVIDENCE/pos-home-rooted.$_shname.out"
+  printf '%s\n' "$RC" > "$PROBE_EVIDENCE/pos-home-rooted.$_shname.rc"
+  if [[ "$RC" -eq 0 && -s "$MARK_HOME" ]]; then
+    pass "REALFD-home-rooted[$_shname]: every library executed came from the admitted home"
+  else
+    fail "REALFD-home-rooted[$_shname]: the admitted home's libraries did not execute (rc=$RC marker=$(cat "$MARK_HOME" 2>/dev/null))"
+  fi
+  if [[ ! -s "$MARK_DECOY" ]]; then
+    pass "REALFD-home-rooted[$_shname]: the dirty operator checkout's libraries never executed"
+  else
+    fail "REALFD-home-rooted[$_shname]: an operator-checkout library executed: $(cat "$MARK_DECOY")"
+  fi
+
+  # ── Negatives: invalid authority must refuse BEFORE any library executes ──
+  _neg_bad=0
+  while IFS='|' read -r _label _mhome _ehome _fd _ino _evidence; do
+    [[ -n "$_label" ]] || continue
+    _mhome="$(printf '%s' "$_mhome" | sed "s|%MARK%|$H_MARK|; s|%OK%|$H_OK|")"
+    _ehome="$(printf '%s' "$_ehome" | sed "s|%MARK%|$H_MARK|; s|%OK%|$H_OK|")"
+    _sha="$TARGET_SHA"
+    PROBE_DAEMON_OVERRIDE=""
+    PROBE_SCHEMA_MANIFEST=""
+    PROBE_SCHEMA_ACK=""
+    PROBE_INC_ACK=""
+    PROBE_INC_ENV=""
+    _use_sh="$_sh"
+    # Record shaping — applied BEFORE the records are written. Both values below
+    # are ones the existing protocol does not admit; neither invents a schema.
+    case "$_label" in
+      # The two records disagree.
+      schema-disagreement)
+        PROBE_SCHEMA_ACK="${SCHEMA}-other" ;;
+      # Both records AGREE on a value that is not the canonical lifecycle schema —
+      # the case a pure agreement check would admit, with an otherwise entirely
+      # valid descriptor, home, target and PID identity.
+      schema-invalid-agreeing)
+        PROBE_SCHEMA_MANIFEST="gaai-daemon-lifecycle/v0"
+        PROBE_SCHEMA_ACK="gaai-daemon-lifecycle/v0" ;;
+    esac
+    _att="$(mk_attempt "$RROOT/neg-$_label-$$" "$_mhome")"
+    _ack="$_att"
+    # Authority shaping — applied after the records exist.
+    case "$_label" in
+      # Each of these keeps a complete, sentinel-bearing home tree and removes
+      # exactly one element of the AUTHORITY, so the refusal is attributable.
+      authority-absent)    _att=""; _ack="" ;;
+      attempt-dir-absent)  _att="$RROOT/neg-$_label-$$/absent-$ATTEMPT_ID"; _ack="" ;;
+      manifest-absent)     rm -f "$_att/manifest"; _ack="" ;;
+      ack-launcher-absent) _ack="" ;;
+      # A well-formed 40-hex value that cannot be the target: built from digits so the
+      # source carries no literal that the public-reference check reads as a commit.
+      target-disagreement) _sha="$(printf '%d' 0 1 2 3 4 5 6 7 8 9)"; _sha="${_sha}${_sha}${_sha}${_sha}" ;;
+      # A byte-identical daemon at a DIFFERENT inode, outside the admitted home.
+      descriptor-not-of-home) PROBE_DAEMON_OVERRIDE="$P_DAEMON" ;;
+      # Process-identity evidence, incomplete in each of the three ways it can be
+      # incomplete, plus the mismatch control. Everything else in each row is a
+      # valid tuple: the same real descriptor, home, target, digest and pid.
+      incarnation-mismatch)    _use_sh="$INC_SHIM"; PROBE_INC_ACK=keep;   PROBE_INC_ENV=other ;;
+      incarnation-ack-absent)  _use_sh="$INC_SHIM"; PROBE_INC_ACK=absent; PROBE_INC_ENV=keep ;;
+      incarnation-env-absent)  _use_sh="$INC_SHIM"; PROBE_INC_ACK=keep;   PROBE_INC_ENV=absent ;;
+      incarnation-both-absent) _use_sh="$INC_SHIM"; PROBE_INC_ACK=absent; PROBE_INC_ENV=absent ;;
+    esac
+    clear_markers
+    OUT="$(fd_probe "$_use_sh" "$_att" "$_ack" "$_ehome" "$_fd" "$_ino" "$_sha" --help)"; RC=$?
+    printf '%s\n' "$OUT" > "$PROBE_EVIDENCE/neg-$_label.$_shname.out"
+    printf '%s\n' "$RC" > "$PROBE_EVIDENCE/neg-$_label.$_shname.rc"
+    if [[ "$RC" -eq 0 ]]; then
+      fail "REALFD-neg[$_shname/$_label]: invalid authority was ADMITTED"; _neg_bad=1
+    fi
+    # A harness or loader failure is a different fact from a production refusal
+    # and may never be counted as one: the reserved codes are excluded, and the
+    # daemon's OWN refusal line must be present, which it can only emit after the
+    # interpreter actually read and ran the daemon bytes from that descriptor.
+    case "$RC" in
+      90|91|92|93)
+        fail "REALFD-neg[$_shname/$_label]: the harness failed (rc=$RC) — no production refusal was observed"
+        _neg_bad=1 ;;
+    esac
+    if ! printf '%s' "$OUT" | grep -q 'ERROR: daemon bootstrap invalid'; then
+      fail "REALFD-neg[$_shname/$_label]: the refusal did not come from the executing daemon: $(printf '%s' "$OUT" | tail -2)"
+      _neg_bad=1
+    fi
+    if ! printf '%s' "$OUT" | grep -q "evidence=$_evidence"; then
+      fail "REALFD-neg[$_shname/$_label]: expected evidence=$_evidence, got: $(printf '%s' "$OUT" | tail -2)"
+      _neg_bad=1
+    fi
+    if [[ -s "$MARK_HOME" || -s "$MARK_DECOY" ]]; then
+      fail "REALFD-neg[$_shname/$_label]: a library EXECUTED before the refusal: $(cat "$MARK_HOME" "$MARK_DECOY" 2>/dev/null)"
+      _neg_bad=1
+    fi
+  done <<< "$NEG_ROWS"
+  [[ "$_neg_bad" -eq 0 ]] \
+    && pass "REALFD-neg[$_shname]: every invalid authority returned its typed refusal with no library executed" \
+    || true
+
+  # ── Shim control: the same insertion point, with COMPLETE incarnation evidence,
+  #    must still be admitted. Without this, the four rows above could be passing
+  #    because the shim itself broke the launch rather than because the daemon
+  #    refused incomplete process identity. ──
+  PROBE_INC_ACK=keep
+  PROBE_INC_ENV=keep
+  ATT="$(mk_attempt "$RROOT/inc-control-$$" "$H_MARK")"
+  clear_markers
+  OUT="$(fd_probe "$INC_SHIM" "$ATT" "$ATT" "$H_MARK" "" "" "$TARGET_SHA" --help)"; RC=$?
+  printf '%s\n' "$OUT" > "$PROBE_EVIDENCE/inc-control.$_shname.out"
+  printf '%s\n' "$RC" > "$PROBE_EVIDENCE/inc-control.$_shname.rc"
+  if [[ "$RC" -eq 0 && -s "$MARK_HOME" ]]; then
+    pass "REALFD-inc-control[$_shname]: a complete incarnation through the same shim is admitted and sources the home libraries"
+  else
+    fail "REALFD-inc-control[$_shname]: the shim itself blocked a valid launch (rc=$RC) — the incarnation rows above prove nothing"
+  fi
+  PROBE_INC_ACK=""
+  PROBE_INC_ENV=""
+
+  # ── The supported pathname diagnostic stays usable, and stays non-authoritative ──
+  clear_markers
+  OUT="$(/usr/bin/env -i "PATH=$PROBE_PATH" "HOME=$RROOT/opshome" TERM=dumb \
+          "$_sh" "$H_MARK/.gaai/core/scripts/delivery-daemon.sh" --help 2>&1)"; RC=$?
+  printf '%s\n' "$OUT" > "$PROBE_EVIDENCE/pathname-diagnostic.$_shname.out"
+  printf '%s\n' "$RC" > "$PROBE_EVIDENCE/pathname-diagnostic.$_shname.rc"
+  if [[ "$RC" -eq 0 && -s "$MARK_HOME" ]]; then
+    pass "REALPATH-diag[$_shname]: the direct pathname diagnostic still resolves its sibling libraries"
+  else
+    fail "REALPATH-diag[$_shname]: the pathname diagnostic path regressed (rc=$RC)"
+  fi
+  # Positive control for the mechanism itself: the row above proves the marker is
+  # writable and observable in this fixture, so an empty marker in a negative row
+  # is evidence of refusal rather than of an inert instrument.
+  [[ -s "$MARK_HOME" ]] \
+    && pass "REALFD-control[$_shname]: the sentinel mechanism is observable in this fixture" \
+    || fail "REALFD-control[$_shname]: the sentinel mechanism is inert — negative rows prove nothing"
+
+  clear_markers
+  ATT="$(mk_attempt "$RROOT/pathclaim-$$" "$H_MARK")"
+  OUT="$(/usr/bin/env -i "PATH=$PROBE_PATH" "HOME=$RROOT/opshome" TERM=dumb \
+          "GAAI_DAEMON_LAUNCH_ATTEMPT=$ATT" "GAAI_DAEMON_HOME=$H_MARK" \
+          "GAAI_TARGET_SHA=$TARGET_SHA" "GAAI_DAEMON_CREDENTIAL_MODE=absent" \
+          "$_sh" "$H_MARK/.gaai/core/scripts/delivery-daemon.sh" --help 2>&1)"; RC=$?
+  printf '%s\n' "$OUT" > "$PROBE_EVIDENCE/pathname-launch-claim.$_shname.out"
+  printf '%s\n' "$RC" > "$PROBE_EVIDENCE/pathname-launch-claim.$_shname.rc"
+  if [[ "$RC" -ne 0 ]] && printf '%s' "$OUT" | grep -q 'evidence=daemon_role=descriptor_required'; then
+    pass "REALPATH-claim[$_shname]: a pathname entry claiming a launch is refused, not made an alternative lifecycle entry"
+  else
+    fail "REALPATH-claim[$_shname]: a pathname entry carrying launch authority was admitted (rc=$RC)"
+  fi
+  [[ ! -s "$MARK_HOME" ]] \
+    && pass "REALPATH-claim[$_shname]: no library executed under the refused pathname claim" \
+    || fail "REALPATH-claim[$_shname]: a library executed under the refused pathname claim"
+done <<< "$SHELL_LIST"
+
+if ! gaai_bash32_available; then
+  echo "  NOTE: no Bash 3.2 interpreter on this host — the 3.2 column of the real-daemon"
+  echo "        matrix above is UNPROVEN here and must be executed on the macOS lane."
+fi
 
 echo ""
 echo "════════════════════════════════════════"
