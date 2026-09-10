@@ -2272,7 +2272,7 @@ _forward_evidence() {
     *) _forward_evidence_fatal; return 1 ;;
   esac
   case "$reason" in
-    already_current|caller_untrusted|context_invalid|effect_inhibited|empty_run_state|integrity_unverified|invalid_record|merge_terminal_owned|none|not_actionable|pending_run|policy_stall|projection_failed|remote_changed|required_plan_absent|resumable|runner_live|source_unavailable|terminal_projection|worktree_unrecoverable) ;;
+    already_current|caller_untrusted|context_invalid|effect_inhibited|empty_run_state|integrity_unverified|invalid_record|merge_terminal_owned|none|not_actionable|pending_run|policy_stall|projection_failed|remote_changed|required_plan_absent|resumable|runner_live|source_unavailable|terminal_projection|unowned_claim|worktree_unrecoverable) ;;
     *) _forward_evidence_fatal; return 1 ;;
   esac
   [[ "$attempt" == none || "$attempt" =~ ^[0-9a-f]{64}$ ]] \
@@ -2286,9 +2286,15 @@ _forward_evidence() {
     *) _forward_evidence_fatal; return 1 ;;
   esac
   [[ "$fields" != *"="* ]] || { _forward_evidence_fatal; return 1; }
-  printf '[FORWARD-RECOVERY] story=%s writer=recovery.scan outcome=%s reason=%s attempt=%s source_digest=%s record_digest=%s fields=%s\n' \
+  local record
+  record=$(printf '[FORWARD-RECOVERY] story=%s writer=recovery.scan outcome=%s reason=%s attempt=%s source_digest=%s record_digest=%s fields=%s' \
     "$sid" "$outcome" "$reason" "$attempt" "$source_digest" "$record_digest" \
-    "$fields" >&2 || { _forward_evidence_fatal; return 1; }
+    "$fields") || { _forward_evidence_fatal; return 1; }
+  printf '%s\n' "$record" >&2 || { _forward_evidence_fatal; return 1; }
+  # The record above also reaches the operator's daemon log, not only the
+  # process error stream — a refusal or skip must be diagnosable from the one
+  # surface an operator actually monitors.
+  log "$record" || { _forward_evidence_fatal; return 1; }
 }
 
 # Context intentions stay value-bound for exact settlement. Observability is a
@@ -2881,6 +2887,34 @@ PY
   else
     printf 'dead\t%s\n' "$pid"
   fi
+}
+
+# True only when every daemon-ownership signal for sid is absent: no lock
+# file, no heartbeat, no retained recovery context, and no worktree directory
+# at the daemon's own worktree root. The caller supplies the fifth signal (no
+# pending journal run-state) itself — it is implied by reaching the
+# integrity-unverified recovery-scan branch at all, since a pending run takes
+# a different path before this check would run. Any signal this function
+# cannot read decisively (a malformed lock file, an unresolvable path) is
+# treated as present — ambiguity never authorizes a skip.
+_forward_claim_unowned() {
+  local sid="$1" lock_row lock_state context wt
+  _forward_sid_valid "$sid" || return 1
+  lock_row=$(_forward_lock_state "$sid") || true
+  lock_state="${lock_row%%$'\t'*}"
+  [[ "$lock_state" == absent ]] || return 1
+  [[ ! -e "$LOCK_DIR/${sid}.heartbeat" && ! -L "$LOCK_DIR/${sid}.heartbeat" ]] \
+    || return 1
+  # _forward_context_path's own parent-directory creation is a pre-existing,
+  # unconditional side effect of the crash-window check earlier in this same
+  # _forward_recovery_one invocation (reached whenever manifest_rc is 2, the
+  # only way execution reaches this function at all) — reusing it here for
+  # the canonical path adds no new observable effect.
+  context=$(_forward_context_path "$sid") || return 1
+  [[ ! -e "$context" && ! -L "$context" ]] || return 1
+  wt=$(_forward_resolve_worktree "$sid") || return 1
+  [[ ! -e "$wt" && ! -L "$wt" ]] || return 1
+  return 0
 }
 
 _forward_retire_dead_lock() {
@@ -3554,7 +3588,23 @@ _forward_recovery_one() {
       _forward_evidence "$sid" noop not_actionable none "$_FORWARD_SOURCE_DIGEST" \
         "$_FORWARD_RECORD_DIGEST" none || return 4
       rm -f "$_FORWARD_SNAPSHOT"; return 0 ;;
-    block_integrity:integrity_unverified|block_invalid_record:*)
+    block_integrity:integrity_unverified)
+      # Unverifiable integrity is real evidence of an interrupted run only for
+      # a Story this daemon claimed. A Story claimed and delivered outside the
+      # daemon carries none of the signals a daemon-owned claim would leave
+      # behind; the absence of a worktree at the daemon's own root is then the
+      # expected state, not damage, and must not hold every other ready Story
+      # hostage. Any single signal still present keeps the
+      # existing fail-closed refusal exactly as before (AC3).
+      if _forward_claim_unowned "$sid"; then
+        _forward_evidence "$sid" noop unowned_claim none \
+          "$_FORWARD_SOURCE_DIGEST" "$_FORWARD_RECORD_DIGEST" none || return 4
+        rm -f "$_FORWARD_SNAPSHOT"; return 0
+      fi
+      _forward_evidence "$sid" blocked integrity_unverified none \
+        "$_FORWARD_SOURCE_DIGEST" "$_FORWARD_RECORD_DIGEST" none || return 4
+      rm -f "$_FORWARD_SNAPSHOT"; return 1 ;;
+    block_invalid_record:*)
       _forward_evidence "$sid" blocked integrity_unverified none \
         "$_FORWARD_SOURCE_DIGEST" "$_FORWARD_RECORD_DIGEST" none || return 4
       rm -f "$_FORWARD_SNAPSHOT"; return 1 ;;

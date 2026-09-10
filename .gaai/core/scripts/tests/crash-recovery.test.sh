@@ -3641,6 +3641,187 @@ done
 expect "the symlink faults never changed the link target's mode" \
   test "$(d10_mode_of "$(d10_link_target)")" = "600"
 
+printf '\nUnowned claims: the scan skips a Story it does not own instead of blocking on it\n'
+
+(
+  AC_TMP="$TMP/e1057s06"; mkdir -p "$AC_TMP"
+  LOCK_DIR="$AC_TMP/locks"; mkdir -p "$LOCK_DIR"; chmod 700 "$LOCK_DIR"
+  GAAI_WORKTREES_BASE="$AC_TMP/worktrees"; mkdir -p "$GAAI_WORKTREES_BASE"
+  TARGET_BRANCH=staging
+  BACKLOG_REL=".gaai/project/contexts/backlog/active.backlog.yaml"
+  PROJECT_DIR="$AC_TMP/repo"; REPO_ROOT="$PROJECT_DIR"
+  BACKLOG_FILE="$PROJECT_DIR/$BACKLOG_REL"; BACKLOG="$BACKLOG_FILE"
+  _journal_inspect_pending_lifecycle() { return 2; }
+  # Many earlier blocks in this file globally redefine real forward_* helpers
+  # against their own fixtures and never restore them (_forward_classify,
+  # _forward_context_path, _forward_resolve_worktree, _forward_bind_context,
+  # and more). Re-extracting and re-sourcing the pristine span here, inside
+  # this subshell only, discards every accumulated mock at once rather than
+  # chasing each one individually.
+  AC_HARNESS="$AC_TMP/coordinator.sh"
+  awk '/^_forward_sha256\(\)/{on=1} /^exceeded_stories\(\)/{on=0} on{print}' "$DAEMON" > "$AC_HARNESS"
+  awk '/^_reconcile_story_file_from_staging\(\)/{on=1} /^# ── PR merge watcher/{on=0} on{print}' "$DAEMON" >> "$AC_HARNESS"
+  awk '/^_attempt_secret_create\(\)/{on=1} /^# ── Launch 3phase/{on=0} on{print}' "$DAEMON" >> "$AC_HARNESS"
+  # shellcheck source=/dev/null
+  source "$AC_HARNESS"
+
+  git init --bare "$AC_TMP/origin.git" >/dev/null
+  git init "$PROJECT_DIR" >/dev/null
+  git -C "$PROJECT_DIR" config user.email test@example.invalid
+  git -C "$PROJECT_DIR" config user.name test
+  git -C "$PROJECT_DIR" remote add origin "$AC_TMP/origin.git"
+  mkdir -p "$(dirname "$BACKLOG_FILE")"
+  ac_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  write_ac_backlog() {
+    {
+      printf 'items:\n'
+      for row in "$@"; do
+        IFS=: read -r rid rstatus rphase <<< "$row"
+        printf -- '- id: %s\n' "$rid"
+        printf '  status: %s\n' "$rstatus"
+        printf '  phase_status: %s\n' "$rphase"
+        [[ "$rstatus" == in_progress ]] && printf '  started_at: "%s"\n' "$ac_started"
+      done
+    } > "$BACKLOG_FILE"
+    git -C "$PROJECT_DIR" add "$BACKLOG_REL"
+    git -C "$PROJECT_DIR" commit -qm state >/dev/null
+    git -C "$PROJECT_DIR" push -qf origin HEAD:staging >/dev/null
+  }
+
+  R="$AC_TMP/results"; mkdir -p "$R"
+
+  # --- AC1: a wholly unowned in-progress Story no longer blocks the scan ---
+  write_ac_backlog "EUNOWN:in_progress:not_started"
+  ac1_rc=0
+  forward_recovery_scan || ac1_rc=$?
+  printf '%s' "$ac1_rc" > "$R/ac1_rc"
+
+  # --- AC5: a genuinely daemon-owned, unverifiable claim still blocks the scan ---
+  mkdir -p "$GAAI_WORKTREES_BASE/EOWNED-workspace"
+  printf '999999\n' > "$LOCK_DIR/EOWNED.lock"; chmod 600 "$LOCK_DIR/EOWNED.lock"
+  write_ac_backlog "EOWNED:in_progress:not_started"
+  ac5_rc=0
+  forward_recovery_scan || ac5_rc=$?
+  printf '%s' "$ac5_rc" > "$R/ac5_rc"
+  rm -f "$LOCK_DIR/EOWNED.lock"
+  rm -rf "$GAAI_WORKTREES_BASE/EOWNED-workspace"
+
+  # --- AC2: the unowned skip leaves no per-Story observable trace ---
+  # Isolated from AC1/AC5/AC4's shared LOCK_DIR/GAAI_WORKTREES_BASE so this
+  # assertion is hermetic and order-independent (AC6), and scoped to the
+  # per-Story artifacts AC2 actually governs. The recovery scan's pre-existing
+  # crash-window check (delivery-daemon.sh, unconditional whenever a pending
+  # journal run-state is absent) already creates the SHARED
+  # ".recovery-contexts" parent directory for any in-progress Story reaching
+  # that point, regardless of ownership and unrelated to this Story's change
+  # (confirmed unchanged against origin/staging) — so the parent directory's
+  # own existence is not itself evidence of an effect this Story introduced.
+  # What AC2 promises, and what is asserted here, is that the unowned skip
+  # creates no PER-STORY artifact and no backlog mutation.
+  AC2_TMP="$AC_TMP/ac2"; mkdir -p "$AC2_TMP"
+  LOCK_DIR="$AC2_TMP/locks"; mkdir -p "$LOCK_DIR"; chmod 700 "$LOCK_DIR"
+  GAAI_WORKTREES_BASE="$AC2_TMP/worktrees"; mkdir -p "$GAAI_WORKTREES_BASE"
+  write_ac_backlog "EUNOWN:in_progress:not_started"
+  before_backlog=$(git -C "$PROJECT_DIR" rev-parse origin/staging:"$BACKLOG_REL")
+  ac2_rc=0
+  _forward_recovery_one EUNOWN || ac2_rc=$?
+  after_backlog=$(git -C "$PROJECT_DIR" rev-parse origin/staging:"$BACKLOG_REL")
+  ac2_ok=true
+  [[ "$ac2_rc" == 0 ]] || ac2_ok=false
+  [[ "$before_backlog" == "$after_backlog" ]] || ac2_ok=false
+  [[ ! -e "$LOCK_DIR/EUNOWN.lock" ]] || ac2_ok=false
+  [[ ! -e "$LOCK_DIR/EUNOWN.heartbeat" ]] || ac2_ok=false
+  [[ ! -e "$LOCK_DIR/.recovery-contexts/recovery.scan.EUNOWN.json" ]] || ac2_ok=false
+  [[ ! -e "$GAAI_WORKTREES_BASE/EUNOWN-workspace" ]] || ac2_ok=false
+  [[ ! -e "$LOCK_DIR/.retry-counts" ]] || ac2_ok=false
+  if [[ "$ac2_ok" == true ]]; then
+    printf 'pass' > "$R/ac2"
+  else
+    printf 'fail' > "$R/ac2"
+  fi
+  LOCK_DIR="$AC_TMP/locks"
+  GAAI_WORKTREES_BASE="$AC_TMP/worktrees"
+
+  # --- AC4: both the skip and a real block leave a Story-naming record on the
+  # operator daemon log surface, not only the process error stream ---
+  LOG_FILE="$AC_TMP/daemon.log"; : > "$LOG_FILE"
+  log() { printf '%s\n' "$*" >> "$LOG_FILE"; }
+  ac4_skip_rc=0
+  _forward_recovery_one EUNOWN >/dev/null 2>"$AC_TMP/ac4-skip.stderr" || ac4_skip_rc=$?
+  if [[ "$ac4_skip_rc" == 0 ]] \
+      && grep -q 'story=EUNOWN .*outcome=noop reason=unowned_claim' "$LOG_FILE" \
+      && grep -q 'story=EUNOWN .*outcome=noop reason=unowned_claim' "$AC_TMP/ac4-skip.stderr"; then
+    printf 'pass' > "$R/ac4_skip"
+  else
+    printf 'fail' > "$R/ac4_skip"
+  fi
+
+  mkdir -p "$GAAI_WORKTREES_BASE/EOWNED-workspace"
+  printf '999999\n' > "$LOCK_DIR/EOWNED.lock"; chmod 600 "$LOCK_DIR/EOWNED.lock"
+  write_ac_backlog "EOWNED:in_progress:not_started"
+  : > "$LOG_FILE"
+  ac4_block_rc=0
+  _forward_recovery_one EOWNED >/dev/null 2>"$AC_TMP/ac4-block.stderr" || ac4_block_rc=$?
+  if [[ "$ac4_block_rc" == 1 ]] \
+      && grep -q 'story=EOWNED .*outcome=blocked reason=integrity_unverified' "$LOG_FILE"; then
+    printf 'pass' > "$R/ac4_block"
+  else
+    printf 'fail' > "$R/ac4_block"
+  fi
+  rm -f "$LOCK_DIR/EOWNED.lock"
+  rm -rf "$GAAI_WORKTREES_BASE/EOWNED-workspace"
+
+  # --- AC3: each ownership signal present in isolation keeps the claim owned ---
+  write_ac_backlog "ESIG:in_progress:not_started"
+  probe() { local rc=0; _forward_claim_unowned ESIG || rc=$?; printf '%s' "$rc"; }
+
+  probe > "$R/ac3_baseline"
+
+  printf '999999\n' > "$LOCK_DIR/ESIG.lock"; chmod 600 "$LOCK_DIR/ESIG.lock"
+  probe > "$R/ac3_lock"
+  rm -f "$LOCK_DIR/ESIG.lock"
+
+  touch "$LOCK_DIR/ESIG.heartbeat"
+  probe > "$R/ac3_heartbeat"
+  rm -f "$LOCK_DIR/ESIG.heartbeat"
+
+  ac_ctx=$(_forward_context_path ESIG)
+  : > "$ac_ctx"
+  probe > "$R/ac3_context"
+  rm -f "$ac_ctx"
+
+  mkdir -p "$GAAI_WORKTREES_BASE/ESIG-workspace"
+  probe > "$R/ac3_worktree"
+  rm -rf "$GAAI_WORKTREES_BASE/ESIG-workspace"
+
+  probe > "$R/ac3_cleared"
+)
+
+R="$TMP/e1057s06/results"
+expect "unowned claim: a wholly unowned in-progress Story lets the scan succeed" \
+  test "$(cat "$R/ac1_rc" 2>/dev/null)" = 0
+expect "unowned claim: a genuinely owned, unverifiable claim still blocks the scan" \
+  test "$(cat "$R/ac5_rc" 2>/dev/null)" = 1
+expect "unowned claim: the skip mutates nothing — backlog, locks and worktrees untouched" \
+  test "$(cat "$R/ac2" 2>/dev/null)" = pass
+expect "unowned claim: the skip is diagnosable from the operator daemon log" \
+  test "$(cat "$R/ac4_skip" 2>/dev/null)" = pass
+expect "unowned claim: a genuine refusal also names the Story on the operator daemon log" \
+  test "$(cat "$R/ac4_block" 2>/dev/null)" = pass
+expect "unowned claim: zero ownership signals is unowned" \
+  test "$(cat "$R/ac3_baseline" 2>/dev/null)" = 0
+expect "unowned claim: a lock file alone keeps the claim owned" \
+  test "$(cat "$R/ac3_lock" 2>/dev/null)" = 1
+expect "unowned claim: a heartbeat alone keeps the claim owned" \
+  test "$(cat "$R/ac3_heartbeat" 2>/dev/null)" = 1
+expect "unowned claim: a retained recovery context alone keeps the claim owned" \
+  test "$(cat "$R/ac3_context" 2>/dev/null)" = 1
+expect "unowned claim: a worktree at the daemon's own root alone keeps the claim owned" \
+  test "$(cat "$R/ac3_worktree" 2>/dev/null)" = 1
+expect "unowned claim: signals cleared, the claim is unowned again" \
+  test "$(cat "$R/ac3_cleared" 2>/dev/null)" = 0
+
 printf '\nResults: %d passed, %d failed\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
   printf 'Failed assertions:\n%s' "$FAILURES"
