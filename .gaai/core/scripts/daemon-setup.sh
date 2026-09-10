@@ -338,10 +338,13 @@ if [[ -z "${GH_TOKEN:-}" ]] \
   ln -s "$GAAI_OPERATOR_HOME/.config/gh" "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
 fi
 #     The delivery agent CLI's account state is the same class of problem and takes
-#     the same shape. Its secret lives in the platform keychain, which a private HOME
-#     does not hide; what a private HOME does hide is the account binding the CLI
-#     keeps in the home root, and without that binding the CLI reports itself logged
-#     out and every delivery phase fails before it starts. Only a symlink is created
+#     the same shape: a private HOME hides the account binding the CLI keeps in the
+#     home root, and without it the CLI reports itself logged out. Linking it is
+#     necessary but, where the CLI holds its secret in the platform keychain, not
+#     sufficient — section 7b's opening note applies to that keychain too, so such a
+#     CLI stays unauthenticated here until it is given a file-backed credential, and
+#     an executor whose credential IS file-backed is the supported route meanwhile.
+#     Only a symlink is created
 #     — nothing is copied, and the operator's file stays the single source. The same
 #     conditions apply as above: a regular file, not a symlink, owned by this
 #     principal, with no group or other access, and a host missing either the CLI or
@@ -357,6 +360,71 @@ if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_agent_account_file" \
   ln -s "$_gaai_agent_account_file" "$HOME/.claude.json" 2>/dev/null || true
 fi
 unset -v _gaai_agent_account_file
+#     An executor CLI that keeps a file-backed credential needs only that file to be
+#     reachable, which is the whole difference from the keychain case above. Link the
+#     credential alone rather than the tool's directory: the daemon then authenticates
+#     as the operator without its session state, history or caches being written back
+#     into the operator's own. The conditions are the ones used throughout section 7b,
+#     and a host without the credential keeps exactly today's behaviour.
+_gaai_executor_auth_file="${GAAI_OPERATOR_HOME:-}/.codex/auth.json"
+if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_executor_auth_file" \
+      && ! -L "$_gaai_executor_auth_file" && ! -d "$HOME/.codex/auth.json" ]] \
+   && _gaai_private_owner_mode "$_gaai_executor_auth_file" \
+   && command -v codex >/dev/null 2>&1; then
+  ( umask 077; mkdir -p "$HOME/.codex" ) 2>/dev/null || true
+  if [[ -d "$HOME/.codex" ]]; then
+    rm -f "$HOME/.codex/auth.json" 2>/dev/null || true
+    ln -s "$_gaai_executor_auth_file" "$HOME/.codex/auth.json" 2>/dev/null || true
+  fi
+fi
+unset -v _gaai_executor_auth_file
+#     Executor credentials the platform holds in a keychain rather than a file. macOS
+#     resolves the login keychain from HOME, so the private root hides it outright and
+#     an executor that keeps its secret there cannot authenticate at all: on that
+#     platform the daemon is unusable the moment it is installed, which is not an
+#     acceptable default for a framework meant to be started by anyone. Link the
+#     operator's keychain directory so the executor finds it where the platform looks.
+#
+#     This does not widen what a delivery agent can reach. Such an agent already runs
+#     under the operator's own account with permission prompts disabled: it can read
+#     whatever the operator can read, and can set HOME for itself. What the private
+#     root buys is that no inherited configuration silently redirects the ENTRY's own
+#     tools, and that property is untouched here.
+#
+#     The keychain directory keeps the platform's own default mode, which is not the
+#     no-group-and-other layout the file predicate demands, so the requirement here is
+#     ownership plus the absence of group or other WRITE. An existing destination is
+#     never replaced.
+_gaai_keychain_dir="${GAAI_OPERATOR_HOME:-}/Library/Keychains"
+if [[ -n "${GAAI_OPERATOR_HOME:-}" && -d "$_gaai_keychain_dir" \
+      && ! -L "$_gaai_keychain_dir" && ! -e "$HOME/Library/Keychains" ]]; then
+  _gaai_kc_own="$(stat -L -f '%u' "$_gaai_keychain_dir" 2>/dev/null \
+    || stat -L -c '%u' "$_gaai_keychain_dir" 2>/dev/null || printf '')"
+  _gaai_kc_mode="$(stat -L -f '%Lp' "$_gaai_keychain_dir" 2>/dev/null \
+    || stat -L -c '%a' "$_gaai_keychain_dir" 2>/dev/null || printf '')"
+  while [[ -n "$_gaai_kc_mode" && "${#_gaai_kc_mode}" -lt 4 ]]; do
+    _gaai_kc_mode="0$_gaai_kc_mode"
+  done
+  if [[ -n "$_gaai_kc_own" && "$_gaai_kc_own" == "${UID:-0}" \
+        && "$_gaai_kc_mode" =~ ^[0-7]{4}$ ]] \
+     && (( (8#$_gaai_kc_mode & 8#0022) == 0 )); then
+    ( umask 077; mkdir -p "$HOME/Library" ) 2>/dev/null || true
+    [[ -d "$HOME/Library" ]] \
+      && ln -s "$_gaai_keychain_dir" "$HOME/Library/Keychains" 2>/dev/null || true
+  fi
+fi
+unset -v _gaai_keychain_dir _gaai_kc_own _gaai_kc_mode
+#     An install that keeps the same executor's credential in a file instead needs only
+#     that file, on the conditions used throughout this section.
+_gaai_agent_cred_file="${GAAI_OPERATOR_HOME:-}/.claude/.credentials.json"
+if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_agent_cred_file" \
+      && ! -L "$_gaai_agent_cred_file" && ! -e "$HOME/.claude/.credentials.json" ]] \
+   && _gaai_private_owner_mode "$_gaai_agent_cred_file"; then
+  ( umask 077; mkdir -p "$HOME/.claude" ) 2>/dev/null || true
+  [[ -d "$HOME/.claude" ]] \
+    && ln -s "$_gaai_agent_cred_file" "$HOME/.claude/.credentials.json" 2>/dev/null || true
+fi
+unset -v _gaai_agent_cred_file
 # The private root's git configuration is entry-owned, so it is rewritten on every
 # entry and a stale chain cannot survive. The leading empty helper resets the list
 # accumulated from higher-level files: on this platform git reads an additional

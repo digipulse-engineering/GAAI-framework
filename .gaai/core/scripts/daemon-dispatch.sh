@@ -3101,13 +3101,31 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
     _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_LOOP_BREAKER" "$duration_ms"
     return 1
   fi
+  # A non-zero exit describes the PROCESS, not the work. An agent can write a
+  # complete, well-formed plan and then be stopped at the moment it was about to say
+  # so — by a turn ceiling, a transport error, a provider hiccup. Deciding on the exit
+  # code alone discards that artefact unread, and reports the run to harness
+  # autodetect, which can park the executor for every Story over a failure that did
+  # not happen.
+  #
+  # The ladder below already answers the only question that matters: is there a plan,
+  # and is it well-formed. Fall through to it when an artefact is present. A run whose
+  # artefact does not validate still fails there, still records, and still parks — the
+  # checks are unchanged, only the order in which the exit code is allowed to decide.
+  #
+  # The loop breaker above keeps its own hard failure: an agent killed for repeating
+  # identical tool errors has not produced evidence this ladder can trust.
   if [[ "$claude_exit" -ne 0 ]]; then
-    echo "[ERROR] ${story_id} handle_plan_phase: claude -p exited $claude_exit"
-    if declare -f gaai_harness_autodetect >/dev/null 2>&1; then
-      gaai_harness_autodetect "${_plan_harness:-${GAAI_DAEMON_EXECUTOR:-claude}}" "$log_path" || true
+    if [[ -s "$plan_path" || -s "$(dirname "$plan_path")/${story_id}.plan.md" ]]; then
+      echo "[WARN] ${story_id} handle_plan_phase: claude -p exited ${claude_exit} with a plan artefact present — validating the artefact instead of failing on the exit code"
+    else
+      echo "[ERROR] ${story_id} handle_plan_phase: claude -p exited $claude_exit"
+      if declare -f gaai_harness_autodetect >/dev/null 2>&1; then
+        gaai_harness_autodetect "${_plan_harness:-${GAAI_DAEMON_EXECUTOR:-claude}}" "$log_path" || true
+      fi
+      _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_FAILED" "$duration_ms"
+      return 1
     fi
-    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_FAILED" "$duration_ms"
-    return 1
   fi
 
   # ── Filename-variation tolerance (LLM compliance defense) ────────────────

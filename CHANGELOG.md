@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: link a file-backed executor credential into the private HOME
+- fix: show the monitor the worktree root the lifecycle proved
+- fix: let the plan artefact decide the plan phase, not the exit code
 - fix: link the operator's agent account state into the private HOME
 - fix: re-bind the launch target after the daemon's own claim
 - fix: let the recovery scan skip a Story it does not own
