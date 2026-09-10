@@ -4507,6 +4507,39 @@ if $STATUS_MODE; then
   exit 0
 fi
 
+# ── Re-bind the launch target after this daemon's own claim ──────────────
+# The per-cycle home check requires the home to sit exactly on the commit proved
+# at launch. A claim commits in the home and pushes, so the daemon's own backlog
+# projection advances HEAD past that commit and every later cycle is refused as a
+# stale head: the daemon claims one Story per launch and then goes inert.
+#
+# Re-binding is admissible only where the advance is provably this daemon's own
+# work — the home is clean, its HEAD is exactly the freshly fetched target tip,
+# the bound commit is an ancestor of it, and every commit in between is a backlog
+# projection this daemon writes. A foreign advance satisfies none of those and
+# still fails closed, which is the property the exact-current model exists for.
+_rebind_target_after_self_claim() {
+  local home="${GAAI_DAEMON_HOME:-}" bound="${GAAI_TARGET_SHA:-}"
+  local head remote subject
+  [[ -n "$home" && -n "$bound" ]] || return 1
+  git -C "$home" diff --quiet 2>/dev/null || return 1
+  git -C "$home" diff --cached --quiet 2>/dev/null || return 1
+  git -C "$home" fetch origin "$TARGET_BRANCH" --quiet 2>/dev/null || return 1
+  head=$(git -C "$home" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null) \
+    || return 1
+  remote=$(git -C "$home" rev-parse --verify --quiet \
+    "origin/${TARGET_BRANCH}^{commit}" 2>/dev/null) || return 1
+  [[ "$head" == "$remote" ]] || return 1
+  [[ "$head" != "$bound" ]] || return 0
+  git -C "$home" merge-base --is-ancestor "$bound" "$head" 2>/dev/null || return 1
+  while IFS= read -r subject; do
+    [[ "$subject" == chore\(*\):*\[daemon\] ]] || return 1
+  done < <(git -C "$home" log --format='%s' "${bound}..${head}" 2>/dev/null)
+  GAAI_TARGET_SHA="$head"
+  export GAAI_TARGET_SHA
+  log "[HOME-REBIND] target advanced by this daemon's own projection — rebound to ${head:0:12}"
+}
+
 # ── Pre-launch: mark in_progress on staging ──────────────────────────────
 # This is the cross-device coordination point. After git pull, we re-verify
 # the story is still ready (another device may have claimed it). If push
@@ -4570,6 +4603,7 @@ PLEOF
   case $rc in
     0)
       log "${GREEN}$story_id marked in_progress on $TARGET_BRANCH${NC}"
+      _rebind_target_after_self_claim || true
       ;;
     2)
       log "${YELLOW}$story_id already claimed by another device. Skipping.${NC}"
