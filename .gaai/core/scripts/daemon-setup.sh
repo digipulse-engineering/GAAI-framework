@@ -337,6 +337,26 @@ if [[ -z "${GH_TOKEN:-}" ]] \
          && ! -e "$XDG_CONFIG_HOME/gh" ]] && command -v gh >/dev/null 2>&1; then
   ln -s "$GAAI_OPERATOR_HOME/.config/gh" "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
 fi
+#     The delivery agent CLI's account state is the same class of problem and takes
+#     the same shape. Its secret lives in the platform keychain, which a private HOME
+#     does not hide; what a private HOME does hide is the account binding the CLI
+#     keeps in the home root, and without that binding the CLI reports itself logged
+#     out and every delivery phase fails before it starts. Only a symlink is created
+#     — nothing is copied, and the operator's file stays the single source. The same
+#     conditions apply as above: a regular file, not a symlink, owned by this
+#     principal, with no group or other access, and a host missing either the CLI or
+#     the file keeps exactly today's behaviour. The destination sits inside the
+#     entry-owned private root, so a stale stub an earlier run left there is replaced
+#     rather than left to mask the link.
+_gaai_agent_account_file="${GAAI_OPERATOR_HOME:-}/.claude.json"
+if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_agent_account_file" \
+      && ! -L "$_gaai_agent_account_file" && ! -d "$HOME/.claude.json" ]] \
+   && _gaai_private_owner_mode "$_gaai_agent_account_file" \
+   && command -v claude >/dev/null 2>&1; then
+  rm -f "$HOME/.claude.json" 2>/dev/null || true
+  ln -s "$_gaai_agent_account_file" "$HOME/.claude.json" 2>/dev/null || true
+fi
+unset -v _gaai_agent_account_file
 # The private root's git configuration is entry-owned, so it is rewritten on every
 # entry and a stale chain cannot survive. The leading empty helper resets the list
 # accumulated from higher-level files: on this platform git reads an additional
