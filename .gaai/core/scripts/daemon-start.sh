@@ -696,13 +696,16 @@ do_daemon_child() {
   local _manifest="$_attempt_dir/manifest"
   [[ -r "$_manifest" ]] || _child_refuse "$_attempt_dir" "manifest_absent"
 
-  local _schema _attempt _home _daemon_digest _cred_mode _release _repo_root _target_sha
+  local _schema _attempt _home _daemon_digest _cred_mode _release _repo_root _target_sha _forge_mode _forge_secret
   _schema="$(_owner_field "$_manifest" schema)"
   _attempt="$(_owner_field "$_manifest" attempt)"
   _home="$(_owner_field "$_manifest" home)"
   _daemon_digest="$(_owner_field "$_manifest" daemon_digest)"
   _cred_mode="$(_owner_field "$_manifest" credential_mode)"
   _release="$(_owner_field "$_manifest" release_digest)"
+  _forge_mode="$(_owner_field "$_manifest" forge_mode)"
+  _forge_secret="$(_owner_field "$_manifest" forge_secret)"
+  case "$_forge_mode" in present|absent) ;; *) _child_refuse "$_attempt_dir" "forge_role=mode_invalid" ;; esac
   _repo_root="$(_owner_field "$_manifest" repo_root)"
   _target_sha="$(_owner_field "$_manifest" target_sha)"
   [[ "$_schema" == "$GAAI_HOME_SCHEMA" ]] || _child_refuse "$_attempt_dir" "manifest_schema_mismatch"
@@ -793,6 +796,46 @@ do_daemon_child() {
 
   # 3. Open the release barrier BEFORE acknowledging, so the controller's write can
   #    never be lost between the ack and the wait.
+  # The forge identity is validated and BOUND here, and consumed only after the
+  # release record is matched below. Binding before the barrier is what lets the
+  # file be unlinked while its bytes stay reachable through this descriptor alone.
+  local _forge_bound=0 _forge_expected_word="" _forge_ino="" _forge_dev=""
+  if [[ "$_forge_mode" == "present" ]]; then
+    [[ -n "$_forge_secret" ]] || _child_refuse "$_attempt_dir" "forge_role=path_absent"
+    [[ -L "$_forge_secret" ]] && _child_refuse "$_attempt_dir" "forge_role=symlink"
+    [[ -f "$_forge_secret" ]] || _child_refuse "$_attempt_dir" "forge_role=absent"
+    local _g_ino _g_dev _g_mode
+    _g_ino="$(_gaai_home_stat_field '%i' "$_forge_secret")" || _child_refuse "$_attempt_dir" "forge_role=stat_unavailable"
+    _g_dev="$(_gaai_home_stat_field '%d' "$_forge_secret")" || _child_refuse "$_attempt_dir" "forge_role=stat_unavailable"
+    _g_mode="$(_gaai_home_stat_field '%a' "$_forge_secret")" || _child_refuse "$_attempt_dir" "forge_role=stat_unavailable"
+    [[ "$_g_mode" == "600" ]] || _child_refuse "$_attempt_dir" "forge_role=mode_open"
+    local _glines _gfirst
+    _glines="$(wc -l < "$_forge_secret" 2>/dev/null | tr -d ' ')"
+    [[ "$_glines" == "1" ]] || _child_refuse "$_attempt_dir" "forge_role=grammar_line_count"
+    _gfirst="$(head -1 "$_forge_secret" 2>/dev/null || echo "")"
+    case "$_gfirst" in
+      "export GH_TOKEN="?*) ;;
+      *) _child_refuse "$_attempt_dir" "forge_role=grammar_assignment" ;;
+    esac
+    case "$_gfirst" in
+      *$'\x01'*|*$'\x02'*|*$'\x1b'*|*$'\r'*) _child_refuse "$_attempt_dir" "forge_role=grammar_control_character" ;;
+    esac
+    _forge_expected_word="${_gfirst#export GH_TOKEN=}"
+    [[ -n "$_forge_expected_word" ]] || _child_refuse "$_attempt_dir" "forge_role=grammar_empty_word"
+    exec 5< "$_forge_secret" || _child_refuse "$_attempt_dir" "forge_role=unopenable"
+    local _gfd_path="/dev/fd/5"
+    [[ -r "/proc/self/fd/5" ]] && _gfd_path="/proc/self/fd/5"
+    local _gf_ino _gf_dev
+    _gf_ino="$(_gaai_home_stat_field '%i' "$_gfd_path")" || _child_refuse "$_attempt_dir" "forge_role=fd_stat_unavailable"
+    _gf_dev="$(_gaai_home_stat_field '%d' "$_gfd_path")" || _child_refuse "$_attempt_dir" "forge_role=fd_stat_unavailable"
+    _child_fd_identity_matches "$_gfd_path" "$_gf_ino" "$_gf_dev" "$_g_ino" "$_g_dev" \
+      || _child_refuse "$_attempt_dir" "forge_role=fd_identity_mismatch"
+    rm -f "$_forge_secret" 2>/dev/null || _child_refuse "$_attempt_dir" "forge_role=unlink_failed"
+    _gaai_home_fsync "$(dirname "$_forge_secret")"
+    [[ -e "$_forge_secret" ]] && _child_refuse "$_attempt_dir" "forge_role=still_linked"
+    _forge_ino="$_gf_ino"; _forge_dev="$_gf_dev"; _forge_bound=1
+  fi
+
   exec 7< "$_attempt_dir/release.fifo" || _child_refuse "$_attempt_dir" "release_role=fifo_unopenable"
 
   # 4. Acknowledge the exact identities. Only now may the controller record `bound`.
@@ -802,6 +845,7 @@ attempt=$_attempt
 pid=$_pid
 incarnation=$_inc
 credential_mode=$_cred_mode
+forge_mode=$_forge_mode
 daemon_ino=$_f_ino
 daemon_dev=$_f_dev
 daemon_digest=$_f_digest
@@ -813,7 +857,14 @@ secret_dev=$_secret_dev" \
   local _record=""
   IFS= read -r -t 300 _record <&7 || _child_refuse "$_attempt_dir" "release_role=read_failed_or_eof"
   exec 7<&-
-  [[ "$_record" == "release attempt=$_attempt digest=$_release" ]] \
+  # RECOMPUTED from the manifest fields and matched against the controller's record,
+  # never against the manifest's own release_digest: a writer that alters the admitted
+  # home, the forge mode or any other bound field produces a value the record cannot
+  # match. The record arrives over a FIFO this controller alone writes.
+  local _recomputed
+  _recomputed="$(_gaai_home_digest_string "${_schema}|${_attempt}|${_daemon_digest}|${_cred_mode}|${_forge_mode}|${_home}")" \
+    || _child_refuse "$_attempt_dir" "release_role=digest_unavailable"
+  [[ "$_record" == "release attempt=$_attempt digest=$_recomputed" ]] \
     || _child_refuse "$_attempt_dir" "release_role=record_mismatch"
 
   # 6. Source the bound secret descriptor — its first and only read, at offset zero.
@@ -833,6 +884,30 @@ secret_dev=$_secret_dev" \
     fi
     export GAAI_IMPL_AUTH_TOKEN
     exec 8<&-
+  fi
+
+  # 6b. The forge identity, consumed only now — past the descriptor identity proof and
+  #     past the controller's release record. Its first and only read, at offset zero.
+  if [[ "$_forge_bound" -eq 1 ]]; then
+    local _gfd_path="/dev/fd/5"
+    [[ -r "/proc/self/fd/5" ]] && _gfd_path="/proc/self/fd/5"
+    . "$_gfd_path" || _child_refuse "$_attempt_dir" "forge_role=source_failed"
+    [[ -n "${GH_TOKEN:-}" ]] || _child_refuse "$_attempt_dir" "forge_role=source_noop"
+    if [[ "$(printf '%q' "$GH_TOKEN")" != "$_forge_expected_word" ]]; then
+      unset -v GH_TOKEN
+      _child_refuse "$_attempt_dir" "forge_role=encoder_round_trip_mismatch"
+    fi
+    export GH_TOKEN
+    exec 5<&-
+    # The private root's git configuration names the forge helper. A failure here is
+    # NOT survivable: the identity would be exported while git kept resolving whatever
+    # helper the platform's own configuration names, so two identities would be in
+    # play at once. It is written exclusively and renamed, so no pre-existing path is
+    # followed and no partial file is ever observable.
+    local _gcfg="$HOME/.gitconfig" _gtmp="$HOME/.gitconfig.$$"
+    ( set -C; umask 077; printf '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$_gtmp" ) 2>/dev/null \
+      || _child_refuse "$_attempt_dir" "forge_role=gitconfig_uncreatable"
+    mv -f "$_gtmp" "$_gcfg" 2>/dev/null || _child_refuse "$_attempt_dir" "forge_role=gitconfig_uninstallable"
   fi
 
   # 7. Hand the exact identities to the daemon and execute the ALREADY-BOUND
@@ -1089,11 +1164,31 @@ do_start() {
   local _cred_mode="absent"
   [[ -n "${GAAI_IMPL_AUTH_TOKEN:-}" ]] && _cred_mode="present"
 
+  # Forge identity mode. Section 7b already resolved the operator's dedicated forge
+  # credential — under the OPERATOR's home, which only this controller has. The child
+  # re-runs that section under the private home and finds nothing there by
+  # construction, so the identity has to travel this attempt's own bound channel.
+  #
+  # A launch that cannot establish an identity is refused HERE, before an attempt
+  # directory, a launcher copy, a session or a daemon exists: the daemon must never
+  # reach its first remote operation without the identity its launch admitted, and a
+  # refusal that leaves no process behind is the only kind this boundary can make.
+  # Absent is a legitimate, canonical mode: a target that needs no credential, or an
+  # operator who provisioned none, keeps exactly today's behaviour — no forge path,
+  # no file, no descriptor, no assignment, and the variable unset in every descendant.
+  # A missing credential is surfaced by the typed fetch failure, not by refusing to
+  # start, so a host that never needed one is never blocked by this boundary.
+  local _forge_mode="absent"
+  [[ -n "${GH_TOKEN:-}" ]] && _forge_mode="present"
+
   local _attempt _attempt_dir
   _attempt="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   _attempt_dir="$LAUNCH_ROOT/$_attempt"
   local _release_digest
-  _release_digest="$(_gaai_home_digest_string "${GAAI_HOME_SCHEMA}|${_attempt}|${_daemon_digest}|${_cred_mode}")"
+  # The admitted home and the forge mode join the digest: a writer of the attempt
+  # directory that rewrites either produces a value this controller's release record
+  # cannot match, and the child recomputes rather than trusting the file.
+  _release_digest="$(_gaai_home_digest_string "${GAAI_HOME_SCHEMA}|${_attempt}|${_daemon_digest}|${_cred_mode}|${_forge_mode}|${GAAI_DAEMON_HOME}")"
 
   # `pending` is durable BEFORE any launch directory, credential file or launcher
   # exists, so a controller crash here can never leave an unexplained artefact.
@@ -1151,6 +1246,15 @@ credential_mode=$_cred_mode" || { _gaai_home_refuse home_lock_failed 1 "pending_
       || { _gaai_home_refuse process_authority_invalid 1 "secret_role=uncreatable" || true; _release_and_exit 1; }
     chmod 0600 "$_secret_path" 2>/dev/null || true
   fi
+  local _forge_path=""
+  if [[ "$_forge_mode" == "present" ]]; then
+    _forge_path="$_attempt_dir/forge.env"
+    # Same contract as the implementation-provider secret above: O_EXCL through
+    # noclobber, 0600 through umask, inside the 0700 directory just created empty.
+    ( set -C; umask 077; printf 'export GH_TOKEN=%q\n' "$GH_TOKEN" > "$_forge_path" ) 2>/dev/null \
+      || { _gaai_home_refuse process_authority_invalid 1 "forge_role=uncreatable" || true; _release_and_exit 1; }
+    chmod 0600 "$_forge_path" 2>/dev/null || true
+  fi
 
   printf '%s\n' "schema=$GAAI_HOME_SCHEMA
 attempt=$_attempt
@@ -1161,6 +1265,8 @@ daemon_digest=$_daemon_digest
 launcher_digest=$_launcher_digest
 credential_mode=$_cred_mode
 secret=$_secret_path
+forge_mode=$_forge_mode
+forge_secret=$_forge_path
 release_digest=$_release_digest" > "$_attempt_dir/manifest"
   : > "$_attempt_dir/args"
   local _a
@@ -1257,6 +1363,7 @@ launcher=$_launcher" || { _gaai_home_refuse home_lock_failed 1 "pending_enrich_u
   _ack_pid="$(_owner_field "$_ack" pid)"
   _ack_inc="$(_owner_field "$_ack" incarnation)"
   _ack_mode="$(_owner_field "$_ack" credential_mode)"
+  local _ack_forge; _ack_forge="$(_owner_field "$_ack" forge_mode)"
   _ack_digest="$(_owner_field "$_ack" daemon_digest)"
   if [[ "$_ack_pid" != "$_pane_pid" ]]; then
     _gaai_home_refuse process_authority_invalid 1 "ack_role=pane_pid_mismatch" || true
@@ -1265,6 +1372,10 @@ launcher=$_launcher" || { _gaai_home_refuse home_lock_failed 1 "pending_enrich_u
   # Present-to-absent downgrade and absent-to-present fabrication both fail closed.
   if [[ "$_ack_mode" != "$_cred_mode" ]]; then
     _gaai_home_refuse process_authority_invalid 1 "ack_role=credential_mode_mismatch" || true
+    _release_and_exit 1
+  fi
+  if [[ "$_ack_forge" != "$_forge_mode" ]]; then
+    _gaai_home_refuse process_authority_invalid 1 "ack_role=forge_mode_mismatch" || true
     _release_and_exit 1
   fi
   if [[ "$_ack_digest" != "$_daemon_digest" ]]; then
