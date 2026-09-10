@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+-: carry the admitted forge identity to the daemon over the attempt's bound channel
 - fix: close every interactive git/gh prompt path under the daemon and type the fetch failure
 -: fix real daemon bootstrap after exact-home admission
 
