@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: re-bind the launch target after the daemon's own claim
 - fix: let the recovery scan skip a Story it does not own
 -: carry the admitted forge identity to the daemon over the attempt's bound channel
 - fix: close every interactive git/gh prompt path under the daemon and type the fetch failure
