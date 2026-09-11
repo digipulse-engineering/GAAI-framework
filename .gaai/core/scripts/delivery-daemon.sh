@@ -5119,6 +5119,16 @@ WRAPPER_EOF
   [[ -n "${GAAI_REPO_ROOT:-}" ]] && tmux_env_args+=(-e "GAAI_REPO_ROOT=${GAAI_REPO_ROOT}")
   [[ -n "${GAAI_DAEMON_HOME:-}" ]] && tmux_env_args+=(-e "GAAI_DAEMON_HOME=${GAAI_DAEMON_HOME}")
   [[ -n "${GAAI_WORKTREES_BASE:-}" ]] && tmux_env_args+=(-e "GAAI_WORKTREES_BASE=${GAAI_WORKTREES_BASE}")
+  # The wrapper waits on the shared staging lock to make each phase transition
+  # durable. Its ceiling is meant to be operator-sized, because the critical
+  # sections it contends with are not all short: a local admission run holds the
+  # same lock for as long as its corpus takes, which is minutes rather than
+  # seconds. Without this the setting is unreachable — the launcher's positive
+  # allowlist drops it and nothing forwards it here, so the wrapper always runs
+  # the built-in default and reports a lock it could have waited for as a
+  # scheduler failure.
+  [[ -n "${GAAI_STAGING_LOCK_TIMEOUT_SEC:-}" ]] \
+    && tmux_env_args+=(-e "GAAI_STAGING_LOCK_TIMEOUT_SEC=${GAAI_STAGING_LOCK_TIMEOUT_SEC}")
 
   # ── Cross-cycle qa-report env setup ────────────────────────────────
   local _cc_3p_wt_path
