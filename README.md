@@ -193,7 +193,12 @@ a defect — start it from a clean environment, e.g.
 >
 > **Note:** The Delivery Daemon explicitly supports two local headless executors — Claude Code CLI (default) and Codex CLI. An unknown or unavailable executor stops before governed work begins with an actionable error. Discovery and governance work with any AI tool — this requirement applies only to autonomous delivery.
 >
-> **Tested on:** macOS (Apple Silicon). Linux and WSL (Windows) are expected to work but not yet validated — issues and feedback welcome.
+> **Tested on:** macOS (Apple Silicon), enforced on every candidate — the daemon home
+> suites run on a hosted macOS runner under `/bin/bash`, which on that platform is the
+> Bash 3.2 floor the daemon entry point targets. Linux (Ubuntu) is exercised by the
+> hosted corpus on the same candidates. WSL is **not** claimed — no WSL run exists.
+> Native Windows (Git Bash / MSYS2 / Cygwin) is unsupported: the daemon refuses to
+> start there. Issues and feedback welcome.
 
 ---
 
