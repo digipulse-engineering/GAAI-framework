@@ -5333,10 +5333,27 @@ source "$SCRIPT_DIR/daemon-dispatch.sh"
 clean_stale_locks
 _startup_recovery_rc=0
 forward_recovery_scan || _startup_recovery_rc=$?
-if [[ "$_startup_recovery_rc" -ne 0 ]]; then
-  [[ "$_startup_recovery_rc" -eq 4 ]] && _daemon_evidence_fatal=true
-  log "${RED}[FORWARD-RECOVERY] startup scan blocked — daemon will not enter dispatch loop${NC}"
+# The periodic scan already draws the line this one did not: an unusable evidence
+# sink is fatal, because nothing the daemon then does could be recorded; every other
+# refusal is per-Story and costs that Story its cycle, not the fleet its daemon.
+#
+# Startup treated all of them alike, so a single row the scan could not settle kept
+# the daemon out of its dispatch loop entirely — with every other ready Story held
+# behind it. The dispatch loop already holds an unsettleable Story on its own, by the
+# same classification, so entering the loop does not act on anything the scan
+# refused; it only stops one row from standing in for all of them.
+#
+# This matters beyond availability. An operator facing a daemon that will not start
+# reaches for the worktree that appears to be blocking it, and a delivery worktree is
+# where an interrupted phase keeps its work. The halt is what makes deleting that work
+# look like the remedy.
+if [[ "$_startup_recovery_rc" -eq 4 ]]; then
+  _daemon_evidence_fatal=true
+  log "${RED}[FORWARD-RECOVERY] startup evidence sink unavailable — stopping daemon${NC}"
   exit 1
+fi
+if [[ "$_startup_recovery_rc" -ne 0 ]]; then
+  log "${YELLOW}[FORWARD-RECOVERY] startup scan blocked — entering the dispatch loop; each Story it could not settle stays held on its own classification${NC}"
 fi
 
 # ── Main loop ─────────────────────────────────────────────────────────────

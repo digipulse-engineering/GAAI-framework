@@ -26,6 +26,13 @@ set -euo pipefail
 SECONDARY_ROUTE="${SECONDARY_ROUTE:-false}"
 GAAI_STORY_TIER="${GAAI_STORY_TIER:-}"
 NOTES_PATH="${GAAI_WORKSPACE_PATH}/.gaai/project/contexts/artefacts/notes/${GAAI_STORY_ID}.notes.md"
+# The bound on the working-memory file. The rule below used to state two of these
+# five times apart — a cap, and a larger size at which the file becomes a
+# compact-trigger in its own right. Only the second describes a harm; the first
+# just made the agent rewrite a file that was doing its job. Keep the stated harm
+# threshold as the bound, and let an operator size it to their stories.
+NOTES_MAX_CHARS="${GAAI_NOTES_MAX_CHARS:-10000}"
+[[ "$NOTES_MAX_CHARS" =~ ^[1-9][0-9]{2,6}$ ]] || NOTES_MAX_CHARS=10000
 
 # ── notes.md context-recovery discipline applies whenever the route is
 #    secondary OR the story is Tier 2+, independent of route. The
@@ -91,9 +98,15 @@ post-compact, forcing re-reads that triggered the next compact.
 - (b) After every 5 tool_use calls (count them — this is enforced)
 - (c) Before any \`Edit\` or \`Write\` to source code
 
-**Size cap** : keep NOTES file ≤2K characters. Rewrite (full overwrite) when
-sections grow stale ; do NOT let it grow unbounded. A 10K NOTES file is
-itself a compact-trigger.
+**Size cap** : keep the NOTES file under ${NOTES_MAX_CHARS} characters. Rewrite
+(full overwrite) when sections grow stale ; do NOT let it grow unbounded. Past
+that size the file becomes a compact-trigger in its own right, which is the harm
+this bound exists to avoid.
+
+Do NOT compact below it as a goal. Every turn spent shrinking a file that is
+already within bounds is a turn not spent on the work, and whatever you drop is
+state your next attempt will not inherit. Write freely up to the bound; compact
+only when you reach it.
 
 A session ending with <3 NOTES Writes per compact_boundary is a rule
 violation.
