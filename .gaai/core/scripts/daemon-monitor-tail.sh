@@ -11,7 +11,19 @@ DAEMON_HOME="${2:-}"
 PROJECT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
 BACKLOG="${DAEMON_HOME:-$PROJECT_DIR}/.gaai/project/contexts/backlog/active.backlog.yaml"
 LOCK_DIR="${PROJECT_DIR}/.gaai/project/contexts/backlog/.delivery-locks"
-WORKTREE_BASE="${GAAI_WORKTREES_BASE:-$(cd "$PROJECT_DIR/.." && pwd)/.gaai-worktrees/$(basename "$PROJECT_DIR")}"
+# The daemon home sits directly under the worktree root, so the argument above names
+# that root without any environment plumbing — and plumbing is exactly what cannot be
+# relied on here: a pane created on an already-running tmux server inherits the
+# SERVER's environment, not the invoking shell's, so exporting the root before this
+# pane is created does not reach it. Deriving the root from the project directory
+# instead answers for the default layout, which on any other layout is a path no
+# delivery has ever written to; every per-phase log then resolves to nothing and a
+# Story running normally is displayed as having no log at all.
+if [[ -n "$DAEMON_HOME" && "$(basename "$DAEMON_HOME")" == "__daemon-home" ]]; then
+  WORKTREE_BASE="$(dirname "$DAEMON_HOME")"
+else
+  WORKTREE_BASE="${GAAI_WORKTREES_BASE:-$(cd "$PROJECT_DIR/.." && pwd)/.gaai-worktrees/$(basename "$PROJECT_DIR")}"
+fi
 
 HAS_JQ=false
 command -v jq &>/dev/null && HAS_JQ=true
