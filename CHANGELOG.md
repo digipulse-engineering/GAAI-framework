@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: let the operator's turn ceiling govern the implementation phase
 - fix: derive the monitor's worktree root from the home it is given
 - fix: reuse a valid plan artefact instead of re-running the agent
 - fix: let the operator's turn cap govern the plan phase
