@@ -1253,6 +1253,14 @@ GAAI_TIMEOUT_RC=137
 # non-zero (error_max_turns), and the wrapper died at phase_status=implemented
 # in an unbounded relaunch loop. Raise the default and make it overridable.
 GAAI_QA_MAX_TURNS="${GAAI_QA_MAX_TURNS:-100}"
+# The plan phase kept a hardcoded cap and reached the same end for the same reason:
+# on a Story whose plan genuinely needs more, the agent exhausted its turns before
+# writing the plan, exited error_max_turns, and the wrapper died at
+# phase_status=not_started only to be retried into an identical ceiling. Give it the
+# same treatment. The default is the safety net the operator already configures and
+# the monitor already reports as being in effect, so no separate number is introduced
+# here and the reported configuration becomes true of this phase too.
+GAAI_PLAN_MAX_TURNS="${GAAI_PLAN_MAX_TURNS:-${MAX_TURNS:-200}}"
 
 # Resolve the available timeout binary. Linux ships `timeout`, macOS coreutils
 # ships `gtimeout`. Empty string when neither is present — callers must then
@@ -3079,7 +3087,7 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
     _run_claude_with_loop_breaker \
       "$story_id" "plan" "$log_path" "$prompt_file" "$worktree_path" \
       --model "$_plan_model" \
-      --max-turns 60 \
+      --max-turns "$GAAI_PLAN_MAX_TURNS" \
       --output-format stream-json \
       --verbose \
       --dangerously-skip-permissions \

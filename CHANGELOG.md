@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: let the operator's turn cap govern the plan phase
+- fix: make the wrapper's staging-lock ceiling reachable
 - fix: link a file-backed executor credential into the private HOME
 - fix: show the monitor the worktree root the lifecycle proved
 - fix: let the plan artefact decide the plan phase, not the exit code
