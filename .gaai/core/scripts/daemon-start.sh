@@ -1602,16 +1602,12 @@ do_monitor() {
   if [[ -z "$_monitor_home" && -d "${GAAI_WORKTREES_BASE}/__daemon-home/.gaai/project/contexts/backlog" ]]; then
     _monitor_home="${GAAI_WORKTREES_BASE}/__daemon-home"
   fi
-  # The proven home also names the worktree root the live lifecycle actually used.
-  # The tail pane otherwise derives that root again from the project directory, which
-  # gives a different answer on any layout that is not the default one; it then looks
-  # for every per-phase log under a path no delivery has ever written to, and a Story
-  # that is running normally is displayed as having no log at all. Prefer the proven
-  # root here, exactly as the home above prefers the proven home over a derivation.
-  if [[ -n "$_monitor_home" && "$(basename "$_monitor_home")" == "__daemon-home" ]]; then
-    GAAI_WORKTREES_BASE="$(dirname "$_monitor_home")"
-    export GAAI_WORKTREES_BASE
-  fi
+  # The proven home also names the worktree root the live lifecycle actually used, and
+  # the tail pane needs that root to resolve per-phase logs. It is NOT passed through
+  # the environment: a pane created on an already-running tmux server inherits the
+  # server's environment rather than this shell's, so an export here would not reach
+  # it. The home is already an argument to that pane, and the pane derives the root
+  # from it directly.
   tmux -f /dev/null -S "$_msock" split-window -t "=${_msess}:0" -v -p 60 \
     "'$MONITOR_TAIL' '$LOG_DIR' '$_monitor_home'" 2>/dev/null || true
   tmux -f /dev/null -S "$_msock" set-option -t "=$_msess" mouse on >/dev/null 2>&1 || true
