@@ -68,7 +68,17 @@ export function _resetSpawnFn() { _spawnFn = _childSpawn; }
 const GLOBAL_TIMEOUT_MS    = 14_400_000; // 4 hours
 const HEARTBEAT_TIMEOUT_MS =  1_800_000; // 30 minutes
 const SIGKILL_GRACE_MS     =      5_000; // 5 seconds
-const MAX_TURNS            =        150;
+// The turn ceiling is the operator's, not this file's. The daemon documents
+// GAAI_MAX_TURNS as the primary safety net and already resolves it; this phase was
+// the one place that ignored it and applied a constant instead, so a Story whose
+// implementation genuinely needs more work stopped mid-edit at a number the
+// operator could not see or change. A malformed or absent setting falls back to the
+// previous constant rather than removing the ceiling.
+const MAX_TURNS = (() => {
+  const raw = process.env.GAAI_IMPL_MAX_TURNS || process.env.MAX_TURNS || '';
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : 150;
+})();
 
 // An expiring observation window is NOT proof the run ended. The child emits its
 // terminal receipt as a stream-json `{"type":"result"}` event; until that receipt

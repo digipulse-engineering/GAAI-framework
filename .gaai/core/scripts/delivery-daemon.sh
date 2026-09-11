@@ -5268,7 +5268,10 @@ CONCURRENT="$MAX_CONCURRENT"
 MODEL="$DISPLAY_MODEL"
 LAUNCHER="$LAUNCHER"
 SKIP_PERMS="$SKIP_PERMISSIONS"
-MAX_TURNS="$MAX_TURNS"
+# Exported, not merely assigned: the implementation phase runs in a child process of
+# this wrapper, and a plain assignment would leave it applying its own constant while
+# the operator's configured ceiling sat one process away.
+export MAX_TURNS="$MAX_TURNS"
 HEARTBEAT="$HEARTBEAT_STALE"
 TIMEOUT="$DELIVERY_TIMEOUT"
 DRY_RUN="$DRY_RUN"
