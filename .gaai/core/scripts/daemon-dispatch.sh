@@ -3233,6 +3233,84 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
   return 0
 }
 
+# Commit whatever an implementation attempt produced before it gave up.
+#
+# A truncated attempt leaves real work in the worktree, and the daemon keeps that
+# worktree deliberately — every removal site is guarded on a clean tree. But a
+# worktree carrying uncommitted content classifies as unverifiable, so the work
+# that was preserved is exactly what stops the Story being claimed again. The
+# preserved attempt blocks the retry it exists to feed, and the only way out that
+# looks available to an operator is deleting the work.
+#
+# Committing settles both halves and weakens no gate. The tree becomes clean, so
+# the integrity classification passes on its existing terms; and the work becomes
+# a commit — an object this daemon can bind by digest, which a working tree is
+# not. Every other authority here is digest-bound; this brings the one exception
+# into line rather than making an exception of it.
+#
+# The GAAI-Truncated trailer marks the commit for the life of the branch so a
+# reader is never left guessing which commits were finished. It is a label, not
+# a gate: nothing refuses on it, and the PR body reports it. Hooks run normally.
+#
+# The caller must never assume this succeeded. Returns 0 only when the worktree
+# is settled — already clean, absent, or clean because this committed it — and 1
+# whenever work may still be uncommitted: a hook-refused or identity-refused
+# commit, a detached HEAD, or a tree whose state cannot be read at all.
+#
+# An unreadable tree is the important one. `git status` prints nothing when it
+# fails — a corrupt index and a pruned registration both look exactly like a
+# clean tree to a caller that only reads stdout — so the exit status decides,
+# never the output. The same discipline is already applied by the forward path's
+# own state verdict, which types an unreadable tree as unknown rather than clean.
+_impl_commit_truncated() {
+  local story_id="$1" worktree_path="$2" reason="${3:-unspecified}" porcelain
+  [[ -n "$story_id" && -n "$worktree_path" && -d "$worktree_path" ]] || return 0
+  if ! porcelain=$(git -C "$worktree_path" status --porcelain 2>/dev/null); then
+    echo "[IMPL-TRUNCATED] ${story_id} : worktree state is unreadable — leaving it exactly as it is"
+    return 1
+  fi
+  [[ -n "$porcelain" ]] || return 0
+  git -C "$worktree_path" rev-parse --verify -q HEAD >/dev/null 2>&1 || {
+    echo "[IMPL-TRUNCATED] ${story_id} : no commit to build on — partial work left in the worktree"
+    return 1; }
+  # A detached HEAD is a phase's own scaffolding, not a story branch: the test
+  # gate detaches to build its baseline and re-attaches afterwards. A commit made
+  # there would hang off no branch, so it is refused rather than hidden.
+  git -C "$worktree_path" symbolic-ref -q HEAD >/dev/null 2>&1 || {
+    echo "[IMPL-TRUNCATED] ${story_id} : worktree HEAD is detached — partial work left in the worktree"
+    return 1; }
+  # Same restore the commit phase performs: the backlog and the skills indexes are
+  # the daemon's own coordination surfaces, and an attempt's local edits to them
+  # must not reach the branch — truncated or finished.
+  _restore_delivery_governance "$worktree_path"
+  if ! git -C "$worktree_path" add -A >/dev/null 2>&1; then
+    echo "[IMPL-TRUNCATED] ${story_id} : could not stage partial work — leaving it in the worktree"
+    return 1
+  fi
+  git -C "$worktree_path" commit --quiet -m "chore(${story_id}): preserve an interrupted attempt
+
+A delivery phase stopped without reporting. This commit keeps what it had already
+written, so the worktree stops classifying as unverifiable and the work is held as
+an object rather than as a working tree.
+
+It was made to preserve work, not by a phase that completed, and it carries no
+verdict about what it contains.
+
+GAAI-Truncated: true
+GAAI-Truncated-Reason: ${reason}" >/dev/null 2>&1 || true
+  # The commit is judged by its effect, not its exit code: a hook that refuses,
+  # a missing identity and a partially-applied commit all leave work behind, and
+  # only the tree state distinguishes them. An unreadable tree counts as work
+  # left behind, for the same reason it does above.
+  if ! porcelain=$(git -C "$worktree_path" status --porcelain 2>/dev/null) \
+      || [[ -n "$porcelain" ]]; then
+    echo "[IMPL-TRUNCATED] ${story_id} : commit refused — partial work left in the worktree"
+    return 1
+  fi
+  echo "[IMPL-TRUNCATED] ${story_id} : partial work committed (reason=${reason})"
+  return 0
+}
+
 handle_impl_phase() {
   local story_id="$1" trace_id="$2"
   local ts
@@ -3487,6 +3565,7 @@ handle_impl_phase() {
 
     if [[ "$codex_exit" -eq 124 ]]; then
       echo "[ERROR] ${story_id} handle_impl_phase: loop breaker triggered (codex killed after consecutive identical tool errors)"
+      _impl_commit_truncated "$story_id" "$worktree_path" "loop_breaker" || true
       _emit_routing_record "$story_id" "$trace_id" "impl" "error" "IMPL_LOOP_BREAKER"
       return 1
     fi
@@ -3495,11 +3574,13 @@ handle_impl_phase() {
       if declare -f gaai_harness_autodetect >/dev/null 2>&1; then
         gaai_harness_autodetect "${_impl_harness:-codex}" "$log_path" || true
       fi
+      _impl_commit_truncated "$story_id" "$worktree_path" "executor_exit" || true
       _emit_routing_record "$story_id" "$trace_id" "impl" "error" "IMPL_PHASE_FAILED"
       return 1
     fi
     if [[ ! -s "$impl_report_path" ]]; then
       echo "[ERROR] ${story_id} handle_impl_phase: impl-report.md missing or empty at $impl_report_path"
+      _impl_commit_truncated "$story_id" "$worktree_path" "no_report" || true
       _emit_routing_record "$story_id" "$trace_id" "impl" "error" "NO_ARTEFACT"
       return 1
     fi
@@ -3511,6 +3592,10 @@ handle_impl_phase() {
     if declare -f gaai_provenance_verify_seal >/dev/null 2>&1 \
        && ! gaai_provenance_verify_seal "$story_id"; then
       echo "[ERROR] ${story_id} handle_impl_phase: the provenance record changed while the agent held control [class=IMPL_PROVENANCE_TAMPERED]"
+      # Deliberately not preserved. Every other failure here commits what the
+      # attempt wrote, because the work is the agent's and worth keeping. This
+      # one says the provenance covering that work changed underneath it, so the
+      # tree is exactly what must not be turned into a commit.
       _emit_routing_record "$story_id" "$trace_id" "impl" "error" "IMPL_PROVENANCE_TAMPERED"
       return 1
     fi
@@ -3616,6 +3701,10 @@ if d is not None:
     if declare -f gaai_provenance_verify_seal >/dev/null 2>&1 \
        && ! gaai_provenance_verify_seal "$story_id"; then
       echo "[ERROR] ${story_id} handle_impl_phase: the provenance record changed while the agent held control [class=IMPL_PROVENANCE_TAMPERED]"
+      # Deliberately not preserved. Every other failure here commits what the
+      # attempt wrote, because the work is the agent's and worth keeping. This
+      # one says the provenance covering that work changed underneath it, so the
+      # tree is exactly what must not be turned into a commit.
       _emit_routing_record "$story_id" "$trace_id" "impl" "error" "IMPL_PROVENANCE_TAMPERED"
       return 1
     fi
@@ -3668,8 +3757,10 @@ if d is not None:
       if declare -f gaai_harness_autodetect >/dev/null 2>&1; then
         gaai_harness_autodetect "${_impl_harness:-claude}" "$log_path" || true
       fi
+      _impl_commit_truncated "$story_id" "$worktree_path" "executor_exit" || true
     else
       echo "[ERROR] ${story_id} handle_impl_phase: impl-report.md missing or empty at $impl_report_path"
+      _impl_commit_truncated "$story_id" "$worktree_path" "no_report" || true
     fi
     return 1
   fi
@@ -5316,6 +5407,25 @@ ${related_decs_line}"
 
 ## QA Verdict
 ${qa_snippet}"
+
+  # Say so when the branch carries commits the daemon made to preserve an
+  # interrupted attempt. This states only what is verifiable from the trailer —
+  # who made the commit and why — and makes no claim about what it contains:
+  # depending on which phase was interrupted, such a commit may hold a fragment
+  # or the whole deliverable, and the reviewer is the one who decides which.
+  local _truncated_count
+  _truncated_count=$(git -C "$worktree_path" log \
+    --format='%(trailers:key=GAAI-Truncated,valueonly)' \
+    "origin/${TARGET_BRANCH:-staging}..HEAD" 2>/dev/null | grep -c '^true$' || true)
+  if [[ "${_truncated_count:-0}" =~ ^[0-9]+$ && "${_truncated_count:-0}" -gt 0 ]]; then
+    pr_body="${pr_body}
+
+## Preserved interrupted attempts
+${_truncated_count} commit(s) on this branch were made by the daemon to preserve work from a
+phase that stopped without reporting, rather than by a phase that completed. They
+carry a \`GAAI-Truncated: true\` trailer naming the reason. Read them as preserved
+work, not as a reviewed result."
+  fi
 
   # ── Idempotency Guard 1: HEAD already an ancestor of origin/staging ───────
   # Fast-path: catches true-merge / fast-forward / re-push of an already-pushed

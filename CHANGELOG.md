@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: preserve an interrupted implementation attempt as a commit
 - fix: quarantine an unsettleable Story at startup instead of halting
 - fix: bound the working-memory file at the size that actually harms
 - fix: let the operator's turn ceiling govern the implementation phase
