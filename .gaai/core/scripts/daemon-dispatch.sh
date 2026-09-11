@@ -3073,6 +3073,21 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
   fi
 
   local claude_exit
+  # A retry that still holds a valid plan does not need the agent again. This phase
+  # can fail after the agent has already finished — a contended shared lock at the
+  # durable write is enough — and re-running it then pays for the whole plan a second
+  # time and walks back into the same turn ceiling. That is how one transient
+  # contention becomes a loop of expensive, identical attempts.
+  #
+  # The artefact is this phase's output. When it is present and well formed in this
+  # worktree, reuse it and go straight to the validation ladder, which re-checks it
+  # exactly as it would a freshly written one — filename tolerance, heading and the
+  # provenance seal all still apply, so nothing is trusted here that a fresh run
+  # would not also have to prove.
+  if [[ -s "$plan_path" ]] && grep -q '^## ' "$plan_path" 2>/dev/null; then
+    echo "[WARN] ${story_id} handle_plan_phase: a well-formed plan artefact is already present in this worktree — reusing it rather than re-running the agent"
+    claude_exit=0
+  else
   GAAI_STORY_ID="$story_id" \
   GAAI_WORKTREE_PATH="$worktree_path" \
   GAAI_STORY_PATH="$story_path" \
@@ -3093,6 +3108,7 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
       --dangerously-skip-permissions \
       ${_plan_mcp_args[@]+"${_plan_mcp_args[@]}"}
   claude_exit=$?
+  fi
 
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
     t_end_ms=$(( ${EPOCHREALTIME/[.,]/} / 1000 ))
