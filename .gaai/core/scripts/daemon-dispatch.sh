@@ -318,6 +318,139 @@ _lifecycle_with_staging_lock() {
   return "$rc"
 }
 
+# PLAN production has a narrower authority boundary than lifecycle persistence:
+# one Story may have only one admitted producer transaction at a time.  Keep its
+# descriptor distinct from lifecycle FD 198 so the transaction can persist its
+# result while retaining PLAN ownership.
+_plan_production_acquire() {
+  local story_id="$1" lock_path="${LOCK_DIR:?}/.plan-production.${1}.lock"
+  local marker_path="${lock_path}.owner" token="" rc=0
+  [[ "$story_id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  mkdir -p "${LOCK_DIR:?}" 2>/dev/null || return 1
+  python3 - "${LOCK_DIR:?}" <<'PY' || return 1
+import os
+import stat
+import sys
+
+try:
+    current = os.lstat(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+if (not stat.S_ISDIR(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or current.st_mode & 0o022):
+    raise SystemExit(1)
+PY
+  _lifecycle_prepare_flock_path "$lock_path" || return 1
+  exec 197< "$lock_path" || return 1
+  _lifecycle_flock_fd_matches_path "$lock_path" 197 || {
+    exec 197>&-
+    return 1
+  }
+  python3 - 197 <<'PY' || rc=$?
+import fcntl
+import sys
+
+try:
+    fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(2)
+except (OSError, ValueError):
+    raise SystemExit(1)
+PY
+  if [[ "$rc" -ne 0 ]]; then
+    exec 197>&-
+    return "$rc"
+  fi
+  _lifecycle_flock_fd_matches_path "$lock_path" 197 || {
+    exec 197>&-
+    return 1
+  }
+  token=$(python3 - "$marker_path" <<'PY'
+import os
+import secrets
+import stat
+import sys
+
+path = sys.argv[1]
+token = secrets.token_hex(32)
+tmp = f"{path}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+flags |= getattr(os, "O_NOFOLLOW", 0)
+try:
+    fd = os.open(tmp, flags, 0o600)
+    os.write(fd, (token + "\n").encode("ascii"))
+    os.fsync(fd)
+    os.close(fd)
+    os.replace(tmp, path)
+    current = os.lstat(path)
+    if (not stat.S_ISREG(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or current.st_mode & 0o077):
+        raise OSError("unsafe owner marker")
+except OSError:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise SystemExit(1)
+print(token)
+PY
+  ) || {
+    exec 197>&-
+    return 1
+  }
+  [[ "$token" =~ ^[0-9a-f]{64}$ ]] || {
+    exec 197>&-
+    return 1
+  }
+  _GAAI_PLAN_LOCK_PATH="$lock_path"
+  _GAAI_PLAN_OWNER_PATH="$marker_path"
+  _GAAI_PLAN_OWNER_TOKEN="$token"
+  return 0
+}
+
+_plan_production_owner_matches() {
+  local recorded=""
+  [[ -n "${_GAAI_PLAN_LOCK_PATH:-}" && -n "${_GAAI_PLAN_OWNER_PATH:-}" \
+      && -n "${_GAAI_PLAN_OWNER_TOKEN:-}" ]] || return 1
+  _lifecycle_flock_fd_matches_path "$_GAAI_PLAN_LOCK_PATH" 197 || return 1
+  recorded=$(python3 - "$_GAAI_PLAN_OWNER_PATH" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    current = os.lstat(sys.argv[1])
+    with open(sys.argv[1], "r", encoding="ascii") as handle:
+        value = handle.read().strip()
+except OSError:
+    raise SystemExit(1)
+if (not stat.S_ISREG(current.st_mode)
+        or current.st_uid != os.geteuid()
+        or current.st_mode & 0o077):
+    raise SystemExit(1)
+print(value)
+PY
+  ) || return 1
+  [[ "$recorded" == "$_GAAI_PLAN_OWNER_TOKEN" ]]
+}
+
+_plan_production_release() {
+  local rc=0 recorded=""
+  if [[ -n "${_GAAI_PLAN_OWNER_PATH:-}" ]]; then
+    recorded=$(cat "$_GAAI_PLAN_OWNER_PATH" 2>/dev/null || true)
+    if [[ "$recorded" == "${_GAAI_PLAN_OWNER_TOKEN:-}" ]]; then
+      rm -f "$_GAAI_PLAN_OWNER_PATH" 2>/dev/null || rc=1
+    else
+      rc=1
+    fi
+  fi
+  exec 197>&-
+  unset _GAAI_PLAN_LOCK_PATH _GAAI_PLAN_OWNER_PATH _GAAI_PLAN_OWNER_TOKEN
+  return "$rc"
+}
+
 _lifecycle_assert_base_held_assets() {
   local remote_sha="$1" asset_root project_root rel local_path local_blob remote_blob
   asset_root=$(cd "${_GAAI_DISPATCH_LIB_DIR}/../../../.." 2>/dev/null && pwd -P) || return 1
@@ -2097,14 +2230,23 @@ PYEOF
 
 # ── Plan-phase routing record (adds --pipeline, real model, real duration) ──
 # Arguments: story_id trace_id provider fallback_reason duration_ms
+#            [captured_model captured_harness selection_mode]
 _emit_plan_routing_record() {
   local story_id="$1" trace_id="$2" provider="$3" fallback_reason="$4" duration_ms="$5"
+  local captured_tuple=false captured_model="${6-}" captured_harness="${7-}" selection_mode="${8-}"
   local impl_tag model_val
+  [[ "${6+x}" == x ]] && captured_tuple=true
   impl_tag=$(get_impl_model_tag "$story_id")
-  model_val="${CLAUDE_MODEL_PRIMARY:-claude-sonnet-5}"
-  if [[ "${GAAI_DAEMON_EXECUTOR:-claude}" == "codex" ]]; then
+  if [[ "$captured_tuple" == true ]]; then
+    model_val="$captured_model"
+  else
+    model_val="${CLAUDE_MODEL_PRIMARY:-claude-sonnet-5}"
+  fi
+  if [[ "${captured_harness:-${GAAI_DAEMON_EXECUTOR:-claude}}" == "codex" ]]; then
     [[ "$provider" == "primary" ]] && provider="codex"
-    model_val="${GAAI_CODEX_MODEL:-codex-default}"
+    if [[ "$captured_tuple" != true ]]; then
+      model_val="${GAAI_CODEX_MODEL:-codex-default}"
+    fi
   fi
 
   local log_path_args=()
@@ -2124,6 +2266,82 @@ _emit_plan_routing_record() {
     --pipeline        "3phase" \
     ${log_path_args[@]+"${log_path_args[@]}"} \
     2>/dev/null || _emit_routing_record_fallback "$trace_id" "$story_id" "plan" "$provider" "$model_val" "$duration_ms" "$fallback_reason" "$impl_tag" "3phase" "" ""
+  if [[ -n "$selection_mode" ]]; then
+    echo "[ROUTING] ${story_id} phase=plan producer=${model_val} harness=${captured_harness} mode=${selection_mode} duration_ms=${duration_ms} result=${provider}"
+  fi
+}
+
+_plan_resolve_ledger_path() {
+  local result_name="$1" story_id="$2" module_path output
+  module_path="${PROJECT_DIR:?}/.gaai/core/scripts/lib/delivery-provenance.mjs"
+  output=$(node --input-type=module - "$module_path" "$story_id" <<'NODE'
+import { pathToFileURL } from 'node:url';
+const modulePath = process.argv[2];
+const storyId = process.argv[3];
+const { resolveLedgerPath } = await import(pathToFileURL(modulePath).href);
+const resolvedPath = resolveLedgerPath(storyId);
+if (typeof resolvedPath !== 'string'
+    || resolvedPath.length === 0
+    || /[\r\n]/u.test(resolvedPath)) {
+  process.exit(1);
+}
+process.stdout.write(resolvedPath);
+NODE
+  ) || return 1
+  [[ -n "$output" && "$output" != *$'\n'* ]] || return 1
+  printf -v "$result_name" '%s' "$output"
+}
+
+_plan_provenance_seal_path() {
+  local result_name="$1" ledger_path="$2" seal
+  if [[ -s "$ledger_path" ]]; then
+    seal=$(_gaai_digest "$ledger_path") || return 1
+    [[ "$seal" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  else
+    seal="ABSENT"
+  fi
+  printf -v "$result_name" '%s' "$seal"
+}
+
+_plan_provenance_path_matches_seal() {
+  local ledger_path="$1" expected="$2" current
+  if [[ -s "$ledger_path" ]]; then
+    current=$(_gaai_digest "$ledger_path") || return 1
+    [[ "$current" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+  else
+    current="ABSENT"
+  fi
+  [[ "$current" == "$expected" ]]
+}
+
+_plan_record_contribution_direct() {
+  local ledger_path="$1" story_id="$2" model_id="$3" concrete_model="$4"
+  local harness="$5" attempt="$6" effort="$7" waived="$8" trace="$9"
+  shift 9
+  local duration_ms="$1" note="$2" module_path
+  module_path="${PROJECT_DIR:?}/.gaai/core/scripts/lib/delivery-provenance.mjs"
+  node --input-type=module - "$module_path" "$ledger_path" "$story_id" "$model_id" \
+    "$concrete_model" "$harness" "$attempt" "$effort" "$waived" "$trace" \
+    "$duration_ms" "$note" <<'NODE'
+import { pathToFileURL } from 'node:url';
+const [modulePath, ledgerPath, storyId, modelId, concreteModel, harness,
+  attempt, effort, capabilityWaived, fallbackTrace, durationMs, note] = process.argv.slice(2);
+const { recordContribution } = await import(pathToFileURL(modulePath).href);
+recordContribution(ledgerPath, {
+  storyId,
+  artifact: 'PLAN',
+  modelId,
+  concreteModel,
+  harness,
+  role: 'PLAN_PRODUCER',
+  attempt,
+  effort,
+  capabilityWaived,
+  durationMs,
+  fallbackTrace,
+  note,
+});
+NODE
 }
 
 # ── QA-phase routing record (adds --pipeline, real model, real duration, verdict) ──
@@ -2739,6 +2957,24 @@ _plan_story_worktree_owned() {
 }
 
 handle_plan_phase() {
+  local story_id="$1" rc=0 lock_rc=0
+  _plan_production_acquire "$story_id" || lock_rc=$?
+  if [[ "$lock_rc" -eq 2 ]]; then
+    echo "[WARN] ${story_id} phase=plan reason=PLAN_PRODUCTION_BUSY" >&2
+    return 1
+  elif [[ "$lock_rc" -ne 0 ]]; then
+    echo "[ERROR] ${story_id} phase=plan reason=PLAN_PRODUCTION_OWNERSHIP_LOST" >&2
+    return 1
+  fi
+  _handle_plan_phase_owned "$@" || rc=$?
+  if ! _plan_production_release; then
+    echo "[ERROR] ${story_id} phase=plan reason=PLAN_PRODUCTION_OWNERSHIP_LOST" >&2
+    return 1
+  fi
+  return "$rc"
+}
+
+_handle_plan_phase_owned() {
   local story_id="$1" trace_id="$2"
   local expected_source="${3:-${GAAI_EXPECTED_TARGET_SOURCE:-}}"
   local expected_blob="${4:-${GAAI_EXPECTED_TARGET_BLOB:-}}"
@@ -3041,17 +3277,34 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
   # roles do the opposite and fail closed (see handle_qa_phase).
   local _plan_model="${GAAI_PLAN_MODEL:-}"
   local _plan_model_id="" _plan_harness="" _plan_effort_args="" _plan_codex_model=""
+  local _plan_selection_mode="" _plan_effort="" _plan_waived="" _plan_route_trace=""
+  local _plan_attempt="${GAAI_PROVENANCE_ATTEMPT:-${STORY_TRACE_ID:-$trace_id}}"
+  local _plan_ledger_path="" _plan_ledger_seal=""
   # When this phase will be handed an MCP server config, the routed harness has
   # to be able to carry it — otherwise routing would quietly cost the agent its
   # tools. Expressed as a required feature, resolved from the registry.
   local _route_req=()
   if [[ ${#_plan_mcp_args[@]} -gt 0 ]]; then _route_req=(--require-feature mcp); fi
-  if [[ -z "$_plan_model" ]] && declare -f gaai_route_select >/dev/null 2>&1; then
+  if [[ -n "$_plan_model" ]]; then
+    _plan_selection_mode="operator_pin"
+    _plan_harness="${GAAI_DAEMON_EXECUTOR:-claude}"
+    if [[ "$_plan_harness" != "claude" ]]; then
+      echo "[ERROR] ${story_id} phase=plan operator pin is unsupported by harness=${_plan_harness}" >&2
+      _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_FAILED" "0" "" "$_plan_harness" "$_plan_selection_mode"
+      rm -f "$prompt_file" 2>/dev/null || true
+      return 1
+    fi
+    _plan_model_id="external:${_plan_model}"
+  elif declare -f gaai_route_select >/dev/null 2>&1; then
     if gaai_route_select PLAN_PRODUCER "$story_id" ${_route_req[@]+"${_route_req[@]}"}; then
       _plan_model="$GAAI_ROUTE_MODEL"
       _plan_model_id="$GAAI_ROUTE_MODEL_ID"
       _plan_harness="$GAAI_ROUTE_HARNESS"
       _plan_effort_args="$GAAI_ROUTE_EFFORT_ARGS"
+      _plan_effort="$GAAI_ROUTE_EFFORT"
+      _plan_waived="$GAAI_ROUTE_WAIVED"
+      _plan_route_trace="$GAAI_ROUTE_TRACE"
+      _plan_selection_mode="router"
       [[ "$_plan_harness" == "codex" ]] && _plan_codex_model="$GAAI_ROUTE_MODEL"
       gaai_route_export_effort
       echo "[ROUTING] ${story_id} plan role=PLAN_PRODUCER model=${_plan_model_id} (${_plan_model}) harness=${_plan_harness} effort=${GAAI_ROUTE_EFFORT}"
@@ -3059,10 +3312,61 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
       echo "[WARN] ${story_id} plan: PLAN_PRODUCER not routed (${GAAI_ROUTE_STATUS:-unknown}: ${GAAI_ROUTE_REASON:-}) — falling back to the legacy default model"
     fi
   fi
-  _plan_model="${_plan_model:-sonnet}"
+  if [[ -z "$_plan_selection_mode" ]]; then
+    _plan_selection_mode="legacy_fallback"
+    _plan_harness="${GAAI_DAEMON_EXECUTOR:-claude}"
+    case "$_plan_harness" in
+      claude) _plan_model="${CLAUDE_MODEL_PRIMARY:-claude-sonnet-5}" ;;
+      codex)
+        _plan_model="${GAAI_CODEX_MODEL:-}"
+        if [[ -z "$_plan_model" ]]; then
+          echo "[ERROR] ${story_id} phase=plan legacy Codex fallback requires GAAI_CODEX_MODEL" >&2
+          _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_FAILED" "0" "" "$_plan_harness" "$_plan_selection_mode"
+          rm -f "$prompt_file" 2>/dev/null || true
+          return 1
+        fi
+        _plan_codex_model="$_plan_model"
+        ;;
+      *)
+        echo "[ERROR] ${story_id} phase=plan unsupported harness=${_plan_harness}" >&2
+        _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_FAILED" "0" "" "$_plan_harness" "$_plan_selection_mode"
+        rm -f "$prompt_file" 2>/dev/null || true
+        return 1
+        ;;
+    esac
+    _plan_model_id="external:${_plan_model}"
+  fi
 
-  # Seal the authority record into daemon memory before the agent gets control.
-  declare -f gaai_provenance_seal >/dev/null 2>&1 && gaai_provenance_seal "$story_id"
+  if ! _plan_resolve_ledger_path _plan_ledger_path "$story_id" \
+      || ! _plan_provenance_seal_path _plan_ledger_seal "$_plan_ledger_path"; then
+    echo "[ERROR] ${story_id} phase=plan reason=PROVENANCE_WRITE_FAILED" >&2
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PROVENANCE_WRITE_FAILED" "0" \
+      "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
+    rm -f "$prompt_file" 2>/dev/null || true
+    return 1
+  fi
+
+  # Prior-cycle bytes are already in the prompt.  Neither accepted filename may
+  # survive into producer control, even when the next plan is byte-identical.
+  local _plan_dir _alt_plan
+  _plan_dir=$(dirname "$plan_path")
+  _alt_plan="${_plan_dir}/${story_id}.plan.md"
+  if ! rm -f -- "$plan_path" "$_alt_plan" 2>/dev/null \
+      || [[ -e "$plan_path" || -L "$plan_path" || -e "$_alt_plan" || -L "$_alt_plan" ]]; then
+    echo "[ERROR] ${story_id} phase=plan reason=PLAN_OUTPUT_PREP_FAILED" >&2
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_OUTPUT_PREP_FAILED" "0" \
+      "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
+    rm -f "$prompt_file" 2>/dev/null || true
+    return 1
+  fi
+
+  if ! _plan_production_owner_matches; then
+    echo "[ERROR] ${story_id} phase=plan reason=PLAN_PRODUCTION_OWNERSHIP_LOST" >&2
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PRODUCTION_OWNERSHIP_LOST" "0" \
+      "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
+    rm -f "$prompt_file" 2>/dev/null || true
+    return 1
+  fi
 
   # ── Spawn claude -p (AC1) ─────────────────────────────────────────────────
   # Duration measurement (AC4) — bash 5+ EPOCHREALTIME (microseconds); fallback date +%s
@@ -3073,42 +3377,31 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
   fi
 
   local claude_exit
-  # A retry that still holds a valid plan does not need the agent again. This phase
-  # can fail after the agent has already finished — a contended shared lock at the
-  # durable write is enough — and re-running it then pays for the whole plan a second
-  # time and walks back into the same turn ceiling. That is how one transient
-  # contention becomes a loop of expensive, identical attempts.
-  #
-  # The artefact is this phase's output. When it is present and well formed in this
-  # worktree, reuse it and go straight to the validation ladder, which re-checks it
-  # exactly as it would a freshly written one — filename tolerance, heading and the
-  # provenance seal all still apply, so nothing is trusted here that a fresh run
-  # would not also have to prove.
-  if [[ -s "$plan_path" ]] && grep -q '^## ' "$plan_path" 2>/dev/null; then
-    echo "[WARN] ${story_id} handle_plan_phase: a well-formed plan artefact is already present in this worktree — reusing it rather than re-running the agent"
-    claude_exit=0
-  else
-  GAAI_STORY_ID="$story_id" \
-  GAAI_WORKTREE_PATH="$worktree_path" \
-  GAAI_STORY_PATH="$story_path" \
-  GAAI_PLAN_PATH="$plan_path" \
-  GAAI_EPIC_PATH="$epic_path" \
-  GAAI_DELIVERY_LOG_FILE="$log_path" \
-  GAAI_WORKSPACE_ID="${GAAI_WORKSPACE_ID:-}" \
-  GAAI_ORG_ID="${GAAI_ORG_ID:-}" \
-  GAAI_PHASE_HARNESS="$_plan_harness" \
-  GAAI_PHASE_EFFORT_ARGS="$_plan_effort_args" \
-  GAAI_CODEX_MODEL="${_plan_codex_model:-${GAAI_CODEX_MODEL:-}}" \
-    _run_claude_with_loop_breaker \
-      "$story_id" "plan" "$log_path" "$prompt_file" "$worktree_path" \
-      --model "$_plan_model" \
-      --max-turns "$GAAI_PLAN_MAX_TURNS" \
-      --output-format stream-json \
-      --verbose \
-      --dangerously-skip-permissions \
-      ${_plan_mcp_args[@]+"${_plan_mcp_args[@]}"}
+  (
+    # The producer gets no copy of the authority descriptor. The parent keeps
+    # FD 197 locked throughout this subshell and the later lifecycle write.
+    exec 197>&-
+    GAAI_STORY_ID="$story_id" \
+    GAAI_WORKTREE_PATH="$worktree_path" \
+    GAAI_STORY_PATH="$story_path" \
+    GAAI_PLAN_PATH="$plan_path" \
+    GAAI_EPIC_PATH="$epic_path" \
+    GAAI_DELIVERY_LOG_FILE="$log_path" \
+    GAAI_WORKSPACE_ID="${GAAI_WORKSPACE_ID:-}" \
+    GAAI_ORG_ID="${GAAI_ORG_ID:-}" \
+    GAAI_PHASE_HARNESS="$_plan_harness" \
+    GAAI_PHASE_EFFORT_ARGS="$_plan_effort_args" \
+    GAAI_CODEX_MODEL="${_plan_codex_model:-}" \
+      _run_claude_with_loop_breaker \
+        "$story_id" "plan" "$log_path" "$prompt_file" "$worktree_path" \
+        --model "$_plan_model" \
+        --max-turns "$GAAI_PLAN_MAX_TURNS" \
+        --output-format stream-json \
+        --verbose \
+        --dangerously-skip-permissions \
+        ${_plan_mcp_args[@]+"${_plan_mcp_args[@]}"}
+  )
   claude_exit=$?
-  fi
 
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
     t_end_ms=$(( ${EPOCHREALTIME/[.,]/} / 1000 ))
@@ -3122,7 +3415,7 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
   # ── Validate output (AC4 guard) ───────────────────────────────────────────
   if [[ "$claude_exit" -eq 124 ]]; then
     echo "[ERROR] ${story_id} handle_plan_phase: loop breaker triggered (claude killed after consecutive identical tool errors)"
-    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_LOOP_BREAKER" "$duration_ms"
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_LOOP_BREAKER" "$duration_ms" "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
     return 1
   fi
   # A non-zero exit describes the PROCESS, not the work. An agent can write a
@@ -3147,7 +3440,7 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
       if declare -f gaai_harness_autodetect >/dev/null 2>&1; then
         gaai_harness_autodetect "${_plan_harness:-${GAAI_DAEMON_EXECUTOR:-claude}}" "$log_path" || true
       fi
-      _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_FAILED" "$duration_ms"
+      _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PHASE_FAILED" "$duration_ms" "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
       return 1
     fi
   fi
@@ -3167,28 +3460,34 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
       echo "[WARN] ${story_id} handle_plan_phase: plan written to ${_alt_plan} instead of canonical ${plan_path} — auto-renaming"
       mv "$_alt_plan" "$plan_path" 2>/dev/null || {
         echo "[ERROR] ${story_id} handle_plan_phase: rename ${_alt_plan} → ${plan_path} failed"
-        _emit_plan_routing_record "$story_id" "$trace_id" "error" "NO_ARTEFACT" "$duration_ms"
+        _emit_plan_routing_record "$story_id" "$trace_id" "error" "NO_ARTEFACT" "$duration_ms" "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
         return 1
       }
     else
       echo "[ERROR] ${story_id} handle_plan_phase: plan file missing or empty at $plan_path"
-      _emit_plan_routing_record "$story_id" "$trace_id" "error" "NO_ARTEFACT" "$duration_ms"
+      _emit_plan_routing_record "$story_id" "$trace_id" "error" "NO_ARTEFACT" "$duration_ms" "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
       return 1
     fi
   fi
 
   if ! grep -q '^## ' "$plan_path"; then
     echo "[ERROR] ${story_id} handle_plan_phase: plan file has no '## ' heading"
-    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PARSE_ERROR" "$duration_ms"
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PARSE_ERROR" "$duration_ms" "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
     return 1
   fi
 
   # Verify before the daemon's own writes, which legitimately change the file.
-  if declare -f gaai_provenance_verify_seal >/dev/null 2>&1 \
-     && ! gaai_provenance_verify_seal "$story_id"; then
+  if ! _plan_provenance_path_matches_seal "$_plan_ledger_path" "$_plan_ledger_seal"; then
     echo "[ERROR] ${story_id} handle_plan_phase: the provenance record changed while the agent held control [class=PLAN_PROVENANCE_TAMPERED]"
     echo "[ERROR] ${story_id} the record certifies which model may judge this story; an agent that can edit it can seat itself as its own judge"
-    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PROVENANCE_TAMPERED" "$duration_ms"
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PROVENANCE_TAMPERED" "$duration_ms" "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
+    return 1
+  fi
+
+  if ! _plan_production_owner_matches; then
+    echo "[ERROR] ${story_id} phase=plan reason=PLAN_PRODUCTION_OWNERSHIP_LOST" >&2
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PLAN_PRODUCTION_OWNERSHIP_LOST" "$duration_ms" \
+      "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
     return 1
   fi
 
@@ -3196,28 +3495,30 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
   # Recorded only now, with the artefact on disk. A model that was selected and
   # then died produced nothing, and retiring it from later evaluation roles for
   # free would shrink the eligible pool for no reason.
-  if [[ -n "$_plan_model_id" ]] && declare -f gaai_provenance_record >/dev/null 2>&1; then
-    gaai_provenance_record "$story_id" PLAN "$_plan_model_id" PLAN_PRODUCER "" "$duration_ms" || true
-  elif [[ -n "${GAAI_PLAN_MODEL:-}" ]] && declare -f gaai_routing_enabled >/dev/null 2>&1 && gaai_routing_enabled; then
-    # A pinned producer is still the plan's author, and a future PLAN_REVIEWER
-    # exclusion can only see authors that were written down.
-    _gaai_routing_state_env
-    node "$(_gaai_router_bin)" record --story "$story_id" --artifact PLAN \
-      --concrete-model "$GAAI_PLAN_MODEL" --role PLAN_PRODUCER --note "operator pin" >/dev/null 2>&1 || true
-  fi
-  if declare -f gaai_harness_success >/dev/null 2>&1; then
-    gaai_harness_success "${_plan_harness:-${GAAI_DAEMON_EXECUTOR:-claude}}"
+  if ! _plan_record_contribution_direct "$_plan_ledger_path" "$story_id" \
+      "$_plan_model_id" "$_plan_model" "$_plan_harness" "$_plan_attempt" \
+      "$_plan_effort" "$_plan_waived" "$_plan_route_trace" \
+      "$duration_ms" "$_plan_selection_mode" >/dev/null 2>&1; then
+    echo "[ERROR] ${story_id} phase=plan reason=PROVENANCE_WRITE_FAILED" >&2
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "PROVENANCE_WRITE_FAILED" "$duration_ms" \
+      "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
+    return 1
   fi
 
   # ── Advance phase_status: not_started → planned (AC4) ────────────────────
   if ! _journal_persist_lifecycle "$story_id" dispatch.plan phase_status planned; then
     echo "[ERROR] ${story_id} handle_plan_phase: durable phase_status=planned failed"
-    _emit_plan_routing_record "$story_id" "$trace_id" "error" "SCHEDULER_FAILURE" "$duration_ms"
+    _emit_plan_routing_record "$story_id" "$trace_id" "error" "SCHEDULER_FAILURE" "$duration_ms" "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
     return 1
   fi
 
+  if declare -f gaai_harness_success >/dev/null 2>&1; then
+    gaai_harness_success "$_plan_harness"
+  fi
+
   # ── Emit success routing record (AC4) ────────────────────────────────────
-  _emit_plan_routing_record "$story_id" "$trace_id" "primary" "null" "$duration_ms"
+  _emit_plan_routing_record "$story_id" "$trace_id" "primary" "null" "$duration_ms" \
+    "$_plan_model" "$_plan_harness" "$_plan_selection_mode"
 
   # ── Post-PLAN env cleanup: unconditional when phase=plan ─────────────────
   if [[ "${GAAI_QA_INJECT_PHASE:-}" == "plan" ]]; then
