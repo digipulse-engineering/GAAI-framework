@@ -1,0 +1,23 @@
+#!/bin/bash
+# pre-commit dispatcher — executes hooks from core/ then project/
+# Install: .gaai/project/scripts/install-hooks.sh
+#
+# Blocking: a non-zero script aborts the commit (`|| exit $?`), matching
+# pre-push. Informational hooks belong in post-commit.d instead.
+#
+# git passes no stdin and no arguments to pre-commit, so there is nothing to
+# capture or replay — each script inspects the index itself (git diff --cached).
+
+ROOT="$(git rev-parse --show-toplevel)"
+CORE_DIR="$ROOT/.gaai/core/hooks/pre-commit.d"
+PROJECT_DIR="$ROOT/.gaai/project/hooks/pre-commit.d"
+
+for dir in "$CORE_DIR" "$PROJECT_DIR"; do
+    [ -d "$dir" ] || continue
+    for script in "$dir"/*; do
+        [ -x "$script" ] || continue
+        "$script" "$@" || exit $?
+    done
+done
+
+exit 0

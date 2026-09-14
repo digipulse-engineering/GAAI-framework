@@ -244,6 +244,136 @@ else
   fail "T4c: expected rc=1 for both calls, got rc1=${_rc_t4_1} rc2=${_rc_t4_2}"
 fi
 
+# ── gh stub for the (a2) merged-PR clause ────────────────────────────────────
+# Answers BOTH call shapes on purpose, so T5 is a true regression test rather
+# than a test that only passes because the implementation changed:
+#   --json state       (the pre-fix call) → reports MERGED, which is what made
+#                       the old name-only match delete unrelated work
+#   --json headRefOid  (the current call) → reports $GH_STUB_MERGED_OIDS, one
+#                       per line, matching `gh ... --jq '.[].headRefOid'`
+# GH_STUB_FAIL=1 emulates absent/unauthenticated/failing gh.
+gh() {
+  [[ "${GH_STUB_FAIL:-0}" == "1" ]] && return 1
+  local a want_oid=0
+  for a in "$@"; do
+    [[ "$a" == *headRefOid* ]] && want_oid=1
+  done
+  if [[ "$want_oid" == "1" ]]; then
+    [[ -n "${GH_STUB_MERGED_OIDS:-}" ]] && printf '%s\n' "$GH_STUB_MERGED_OIDS"
+    return 0
+  fi
+  printf '[{"state":"MERGED"}]\n'
+  return 0
+}
+
+# ── T5: REGRESSION — a merged PR on a REUSED branch name must NOT affirm ─────
+# story/<sid> is reused across delivery cycles and GitHub retains headRefName on
+# merged PRs forever, so cycle N's merged PR kept affirming "landed" for cycle
+# N+1's unrelated, unpushed tip — and the caller then hard-deleted it.
+echo ""
+echo "T5: stale merged PR on a reused branch name (tip has moved on) → preserved"
+T5="${FIXTURE_BASE}/t5"
+setup_fixture "$T5"
+make_unpushed_branch "$T5" "T5"
+
+PROJECT_DIR="${T5}_main"
+LOCK_DIR="${T5}_main/.gaai-locks"
+mkdir -p "$LOCK_DIR"
+TARGET_BRANCH="staging"
+
+# The tip that a previous cycle's PR merged.
+_t5_old_tip=$(git -C "${T5}_main" rev-parse story/T5)
+# The branch is reused and advances: current tip is now a different object.
+make_unpushed_branch "$T5" "T5"
+_t5_new_tip=$(git -C "${T5}_main" rev-parse story/T5)
+
+GH_STUB_MERGED_OIDS="$_t5_old_tip"
+# Subshell isolation: same reason as T1 — the guard's lazy backlog-yaml.sh
+# source flips `set -e` for whatever shell runs it.
+( _worktree_branch_delete_or_preserve "T5" "story/T5" "test-stale-merged-pr" ) >/dev/null 2>&1
+_rc_t5=$?
+unset GH_STUB_MERGED_OIDS
+
+if [[ "$_t5_old_tip" != "$_t5_new_tip" ]]; then
+  pass "T5a: fixture is valid — reused branch tip actually moved"
+else
+  fail "T5a: fixture invalid — tip did not move, T5 proves nothing"
+fi
+
+if [[ "$_rc_t5" -eq 1 ]]; then
+  pass "T5b: stale merged PR did NOT affirm landed (rc=1, preserved)"
+else
+  fail "T5b: expected rc=1 (preserved), got ${_rc_t5} — unrelated work would be deleted"
+fi
+
+if git -C "${T5}_main" rev-parse --verify -q "$_t5_new_tip" >/dev/null 2>&1 \
+    && git -C "${T5}_main" branch -a --contains "$_t5_new_tip" 2>/dev/null | grep -q 'preserved'; then
+  pass "T5c: the current tip survives on a preserved branch"
+else
+  fail "T5c: current tip is not reachable from any preserved branch"
+fi
+
+# ── T6: a merged PR that merged THIS EXACT TIP still affirms ────────────────
+# The fix must not break the legitimate case, or every landed branch leaks.
+echo ""
+echo "T6: merged PR whose headRefOid IS the current tip → hard-deleted"
+T6="${FIXTURE_BASE}/t6"
+setup_fixture "$T6"
+make_unpushed_branch "$T6" "T6"
+
+PROJECT_DIR="${T6}_main"
+LOCK_DIR="${T6}_main/.gaai-locks"
+mkdir -p "$LOCK_DIR"
+TARGET_BRANCH="staging"
+
+_t6_tip=$(git -C "${T6}_main" rev-parse story/T6)
+GH_STUB_MERGED_OIDS="deadbeef00000000000000000000000000000000
+${_t6_tip}"
+# Subshell isolation: same reason as T1 — the guard's lazy backlog-yaml.sh
+# source flips `set -e` for whatever shell runs it.
+( _worktree_branch_delete_or_preserve "T6" "story/T6" "test-exact-merged-pr" ) >/dev/null 2>&1
+_rc_t6=$?
+unset GH_STUB_MERGED_OIDS
+
+if [[ "$_rc_t6" -eq 0 ]]; then
+  pass "T6a: exact-tip merged PR affirms landed (rc=0), even among other PRs"
+else
+  fail "T6a: expected rc=0 (deleted), got ${_rc_t6} — landed branches would leak"
+fi
+
+if ! git -C "${T6}_main" rev-parse --verify -q "story/T6" >/dev/null 2>&1; then
+  pass "T6b: branch story/T6 hard-deleted"
+else
+  fail "T6b: story/T6 still present after a verified landing"
+fi
+
+# ── T7: unavailable gh must fail closed to preserve ─────────────────────────
+echo ""
+echo "T7: absent/unauthenticated/failing gh → preserved (fail closed)"
+T7="${FIXTURE_BASE}/t7"
+setup_fixture "$T7"
+make_unpushed_branch "$T7" "T7"
+
+PROJECT_DIR="${T7}_main"
+LOCK_DIR="${T7}_main/.gaai-locks"
+mkdir -p "$LOCK_DIR"
+TARGET_BRANCH="staging"
+
+GH_STUB_FAIL=1
+# Subshell isolation: same reason as T1 — the guard's lazy backlog-yaml.sh
+# source flips `set -e` for whatever shell runs it.
+( _worktree_branch_delete_or_preserve "T7" "story/T7" "test-gh-unavailable" ) >/dev/null 2>&1
+_rc_t7=$?
+unset GH_STUB_FAIL
+
+if [[ "$_rc_t7" -eq 1 ]]; then
+  pass "T7: failing gh does not affirm (rc=1, preserved)"
+else
+  fail "T7: expected rc=1 (preserved), got ${_rc_t7} — provider failure must never affirm"
+fi
+
+unset -f gh
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "=== worktree-branch-guard test suite ==="
