@@ -225,9 +225,16 @@ grep -q 'QA_PIN_UNVERIFIABLE' "$DISPATCH" \
   && pass "an unverifiable pin (substrate absent) fails the phase rather than proceeding" \
   || fail "a pin proceeds unchecked when the routing substrate is absent"
 
-grep -q 'artifact PLAN .*operator pin\|--artifact PLAN \\' "$DISPATCH" \
-  && pass "a pinned PLAN records its author (a future reviewer can only exclude recorded authors)" \
-  || fail "a pinned PLAN leaves no provenance row"
+if awk '
+  /^[[:space:]]*#/ { next }
+  index($0, "_plan_resolve_ledger_path _plan_ledger_path \"$story_id\"") { resolved=1 }
+  index($0, "_plan_record_contribution_direct \"$_plan_ledger_path\" \"$story_id\"") { recorded=1 }
+  END { exit !(resolved && recorded) }
+' "$DISPATCH"; then
+  pass "PLAN contribution resolves one authoritative ledger and records the captured tuple directly"
+else
+  fail "PLAN contribution is not bound to the resolver-authoritative ledger path"
+fi
 
 grep -q 'QA_PIN_NOT_INDEPENDENT' "$DISPATCH" \
   && pass "the daemon fails the phase on a non-independent pin rather than warning" \
@@ -406,10 +413,40 @@ grep -q 'PROVENANCE_TAMPERED' "$DISPATCH" \
   && pass "the daemon fails the phase on a tampered record rather than continuing" \
   || fail "the daemon does not act on a tampered record"
 
-SEAL_POINTS=$(grep -c 'gaai_provenance_seal "\$story_id"' "$DISPATCH")
-[[ "$SEAL_POINTS" -ge 3 ]] \
-  && pass "every phase boundary seals, not just QA (${SEAL_POINTS} points)" \
-  || fail "only ${SEAL_POINTS} phase boundaries seal — the IMPL vector stays open"
+if awk '
+  /^[[:space:]]*#/ { next }
+  index($0, "_plan_provenance_seal_path _plan_ledger_seal \"$_plan_ledger_path\"") { sealed=1 }
+  index($0, "_plan_provenance_path_matches_seal \"$_plan_ledger_path\" \"$_plan_ledger_seal\"") { verified=1 }
+  END { exit !(sealed && verified) }
+' "$DISPATCH"; then
+  pass "PLAN seals and verifies the resolver-authoritative ledger path"
+else
+  fail "PLAN does not jointly seal and verify its resolver-authoritative ledger path"
+fi
+
+SEAL_COUNTS=$(awk '
+  function starts_function(line) {
+    return line ~ /^[A-Za-z_][A-Za-z0-9_]*\(\) \{/
+  }
+  starts_function($0) {
+    if ($0 ~ /^handle_impl_phase\(\) \{/) current="impl"
+    else if ($0 ~ /^handle_qa_phase\(\) \{/) current="qa"
+    else current="other"
+  }
+  /^[[:space:]]*#/ { next }
+  index($0, "gaai_provenance_seal \"$story_id\"") {
+    total++
+    if (current == "impl") impl++
+    if (current == "qa") qa++
+  }
+  END { printf "%d %d %d\n", total, impl, qa }
+' "$DISPATCH")
+read -r SEAL_POINTS IMPL_SEAL_POINTS QA_SEAL_POINTS <<< "$SEAL_COUNTS"
+if [[ "$SEAL_POINTS" -eq 2 && "$IMPL_SEAL_POINTS" -eq 1 && "$QA_SEAL_POINTS" -eq 1 ]]; then
+  pass "generic provenance seals remain executable only in IMPL and QA"
+else
+  fail "generic seal placement drifted (total=${SEAL_POINTS}, impl=${IMPL_SEAL_POINTS}, qa=${QA_SEAL_POINTS})"
+fi
 
 echo "── verdict aggregation ──"
 gaai_qa_aggregate QA_CODE=PASS QA_REQUIREMENTS=PASS QA_PLAN=PASS \

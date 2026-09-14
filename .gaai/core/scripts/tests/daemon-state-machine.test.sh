@@ -178,6 +178,7 @@ fi
 # persistence substrate. The dedicated caller-cutover integration suite
 # exercises the real boundary; this state-machine suite uses deterministic
 # doubles and verifies their dispatch placement.
+REAL_JOURNAL_PERSIST_DEF=$(declare -f _journal_persist_lifecycle)
 JOURNAL_CALL_LOG="/tmp/gaai-daemon-state-machine.journal.$$.log"
 : > "$JOURNAL_CALL_LOG"
 _journal_persist_lifecycle() {
@@ -844,14 +845,14 @@ else
 fi
 
 # ── T10: routing record has pipeline:3phase + model field ──────
-echo "T10: routing.jsonl has pipeline:3phase + model from CLAUDE_MODEL_PRIMARY"
+echo "T10: routing.jsonl has pipeline:3phase + exact routed producer model"
 if grep -q '"pipeline":"3phase"' "$ROUTING_LOG" 2>/dev/null; then
   pass "T10a: routing.jsonl has pipeline:3phase"
 else
   fail "T10a: routing.jsonl missing pipeline:3phase — content: $(head -2 "$ROUTING_LOG" 2>/dev/null)"
 fi
-if grep -q '"model":"claude-sonnet-4-6"' "$ROUTING_LOG" 2>/dev/null; then
-  pass "T10b: routing.jsonl has model:claude-sonnet-4-6 (from CLAUDE_MODEL_PRIMARY)"
+if grep -q '"model":"claude-opus-5"' "$ROUTING_LOG" 2>/dev/null; then
+  pass "T10b: routing.jsonl has the concrete model selected for PLAN_PRODUCER"
 else
   fail "T10b: routing.jsonl missing model field — content: $(head -2 "$ROUTING_LOG" 2>/dev/null)"
 fi
@@ -993,12 +994,811 @@ else
   fail "T14c: parse-output model cause was not reached cleanly"
 fi
 
+# ── Owned, fresh PLAN production ──────────────────────────────
+echo "PLAN-AUTH: PLAN production ownership, freshness and frozen identity"
+# Git may report a physical temporary-directory path rather than its symlinked
+# spelling. Use that same identity so the real handler's exact registration
+# check tests PLAN behavior rather than a host-specific path alias.
+git -C "$PLAN_PROJECT_DIR" worktree remove -f "$PLAN_WORKTREE" >/dev/null 2>&1 || rm -rf "$PLAN_WORKTREE"
+PLAN_WORKTREES_BASE=$(cd "$PLAN_WORKTREES_BASE" && pwd -P)
+PLAN_WORKTREE="$PLAN_WORKTREES_BASE/${PLAN_STORY_ID}-workspace"
+PLAN_PATH="$PLAN_WORKTREE/.gaai/project/contexts/artefacts/plans/${PLAN_STORY_ID}.execution-plan.md"
+export GAAI_WORKTREES_BASE="$PLAN_WORKTREES_BASE" GAAI_WORKTREE_PATH="$PLAN_WORKTREE"
+PLAN_PROVENANCE_PATH="$PLAN_FIXTURE_DIR/private-path-marker/authoritative-plan-provenance.json"
+export GAAI_PROVENANCE_PATH="$PLAN_PROVENANCE_PATH"
+export GAAI_TEST_PLAN_LOCK_PATH="$LOCK_DIR/.plan-production.${PLAN_STORY_ID}.lock"
+export GAAI_WORKSPACE_ID="private-workspace-marker"
+export GAAI_ORG_ID="private-org-marker"
+export GAAI_OPERATOR_ID="private-operator-marker"
+export ANTHROPIC_AUTH_TOKEN="private-credential-marker"
+PLAN_PROVENANCE_MODULE="$PLAN_PROJECT_DIR/.gaai/core/scripts/lib/delivery-provenance.mjs"
+PLAN_PROVENANCE_MODULE_ORIGINAL="$PLAN_FIXTURE_DIR/delivery-provenance.original.mjs"
+export PLAN_PROVENANCE_MODULE
+cp "$PLAN_PROVENANCE_MODULE" "$PLAN_PROVENANCE_MODULE_ORIGINAL"
+rm -f "$LOCK_DIR/provenance/${PLAN_STORY_ID}.provenance.json"
+
+reset_plan_attempt() {
+  "$SCHEDULER" --set-phase-status "$PLAN_STORY_ID" not_started "$FIXTURE" 2>/dev/null || true
+  : > "$GAAI_TEST_PLAN_MODEL_CALL_LOG"
+  : > "$ROUTING_LOG"
+  rm -f "$PLAN_PROVENANCE_PATH"
+  rm -f "${GAAI_PROVENANCE_DIR:-$LOCK_DIR/provenance}/${PLAN_STORY_ID}.provenance.json"
+  cp "$PLAN_PROVENANCE_MODULE_ORIGINAL" "$PLAN_PROVENANCE_MODULE"
+  git -C "$PLAN_PROJECT_DIR" worktree remove -f "$PLAN_WORKTREE" >/dev/null 2>&1 || rm -rf "$PLAN_WORKTREE"
+  git -C "$PLAN_PROJECT_DIR" worktree add "$PLAN_WORKTREE" "story/${PLAN_STORY_ID}" >/dev/null 2>&1
+}
+
+make_capturing_claude_shim() {
+  cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_CLAUDE'
+#!/usr/bin/env bash
+printf 'claude|%s|fd197=' "$*" >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+if python3 - "${GAAI_TEST_PLAN_LOCK_PATH:?}" 197 <<'PY' 2>/dev/null
+import os, sys
+path_stat = os.stat(sys.argv[1])
+fd_stat = os.fstat(int(sys.argv[2]))
+raise SystemExit(0 if (path_stat.st_dev, path_stat.st_ino) == (fd_stat.st_dev, fd_stat.st_ino) else 1)
+PY
+then printf 'lock-open\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+else printf 'lock-closed\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+fi
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+exit "${GAAI_TEST_PLAN_EXIT:-0}"
+SHIM_PLAN_AUTH_CLAUDE
+  chmod +x "$SHIM_DIR/claude"
+}
+
+make_capturing_codex_shim() {
+  cat > "$SHIM_DIR/codex" << 'SHIM_PLAN_AUTH_CODEX'
+#!/usr/bin/env bash
+printf 'codex|%s|fd197=' "$*" >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+if python3 - "${GAAI_TEST_PLAN_LOCK_PATH:?}" 197 <<'PY' 2>/dev/null
+import os, sys
+path_stat = os.stat(sys.argv[1])
+fd_stat = os.fstat(int(sys.argv[2]))
+raise SystemExit(0 if (path_stat.st_dev, path_stat.st_ino) == (fd_stat.st_dev, fd_stat.st_ino) else 1)
+PY
+then printf 'lock-open\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+else printf 'lock-closed\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+fi
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+exit 0
+SHIM_PLAN_AUTH_CODEX
+  chmod +x "$SHIM_DIR/codex"
+}
+
+# A valid canonical and alternate artefact from an earlier transaction are
+# context only. They cannot skip or satisfy the current producer call.
+reset_plan_attempt
+make_capturing_claude_shim
+unset GAAI_PLAN_MODEL
+export GAAI_MODEL_ROUTING=0 GAAI_DAEMON_EXECUTOR=claude CLAUDE_MODEL_PRIMARY=claude-fallback-exact
+chmod 755 "$LOCK_DIR"
+mkdir -p "$(dirname "$PLAN_PATH")"
+printf '%s\n' '## private-plan-marker stale canonical' > "$PLAN_PATH"
+printf '%s\n' '## private-plan-marker stale alternate' > "$(dirname "$PLAN_PATH")/${PLAN_STORY_ID}.plan.md"
+if handle_plan_phase "$PLAN_STORY_ID" "trace-fresh-output" >"$PLAN_FIXTURE_DIR/fresh.out" 2>&1 \
+    && [[ "$(grep -c '^claude|' "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" -eq 1 ]] \
+    && grep -q '^## Current invocation plan$' "$PLAN_PATH" \
+    && [[ ! -e "$(dirname "$PLAN_PATH")/${PLAN_STORY_ID}.plan.md" ]]; then
+  pass "PLAN-AUTH-AC2a: stale canonical/alternate output is excluded and one fresh producer runs"
+else
+  fail "PLAN-AUTH-AC2a: stale PLAN output remained eligible or producer count changed: $(tail -3 "$PLAN_FIXTURE_DIR/fresh.out" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -q -- '--model claude-fallback-exact' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q 'fd197=lock-closed' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q '"concrete_model": "claude-fallback-exact"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"model":"claude-fallback-exact"' "$ROUTING_LOG"; then
+  pass "PLAN-AUTH-H2a: explicit Claude fallback identity drives argv, ledger and routing; producer lacks FD 197"
+else
+  fail "PLAN-AUTH-H2a: explicit Claude fallback identity or FD isolation drifted (call=$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG" 2>/dev/null | tr '\n' ' '); ledger=$(grep 'concrete_model' "$PLAN_PROVENANCE_PATH" 2>/dev/null | tr '\n' ' '); routing=$(head -1 "$ROUTING_LOG" 2>/dev/null))"
+fi
+PLAN_LOCK_PARENT_MODE=$(python3 - "$LOCK_DIR" <<'PY'
+import os
+import stat
+import sys
+
+print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), 'o'))
+PY
+)
+if [[ "$PLAN_LOCK_PARENT_MODE" == 755 ]]; then
+  pass "PLAN-AUTH-AC1c: an owner-held, non-writable 0755 lock parent admits real PLAN production"
+else
+  fail "PLAN-AUTH-AC1c: the 0755 lock-parent proof did not retain its fixture mode"
+fi
+unset PLAN_LOCK_PARENT_MODE
+if [[ "$GAAI_PROVENANCE_PATH" != "${GAAI_PROVENANCE_DIR:-}"* ]] \
+    && [[ ! -e "${GAAI_PROVENANCE_DIR:-/nonexistent}/${PLAN_STORY_ID}.provenance.json" ]] \
+    && node "$PLAN_PROJECT_DIR/.gaai/core/scripts/lib/delivery-router.mjs" \
+      contributors --story "$PLAN_STORY_ID" --artifact PLAN 2>/dev/null \
+      | grep -q 'external:claude-fallback-exact'; then
+  pass "PLAN-AUTH-H3a: resolveLedgerPath precedence binds seal, write and real consultation to GAAI_PROVENANCE_PATH"
+else
+  fail "PLAN-AUTH-H3a: PLAN provenance escaped the resolver-authoritative path"
+fi
+
+# PATH is authoritative over the distinct worktree-bound DIR for capture,
+# direct sealing, tamper detection and the real router's later consultation.
+reset_plan_attempt
+make_capturing_claude_shim
+gaai_routing_bind_worktree "$PLAN_WORKTREE"
+PLAN_PATH_DIR_PROOF="$PLAN_FIXTURE_DIR/path-dir-proof.log"
+export PLAN_PATH_DIR_PROOF
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_PATH_TAMPER'
+#!/usr/bin/env bash
+printf 'path=%s\ndir=%s\n' "${GAAI_PROVENANCE_PATH:?}" "${GAAI_PROVENANCE_DIR:?}" > "${PLAN_PATH_DIR_PROOF:?}"
+mkdir -p "$(dirname "${GAAI_PROVENANCE_PATH:?}")"
+printf '%s\n' '{"producer":"private-plan-marker"}' > "${GAAI_PROVENANCE_PATH:?}"
+printf '%s\n' 'path-tamper' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+exit 0
+SHIM_PLAN_AUTH_PATH_TAMPER
+chmod +x "$SHIM_DIR/claude"
+if [[ "$GAAI_PROVENANCE_PATH" != "$GAAI_PROVENANCE_DIR/${PLAN_STORY_ID}.provenance.json" ]] \
+    && ! handle_plan_phase "$PLAN_STORY_ID" "trace-path-tamper" \
+      >"$PLAN_FIXTURE_DIR/path-tamper.out" 2>&1 \
+    && grep -q 'PLAN_PROVENANCE_TAMPERED' "$PLAN_FIXTURE_DIR/path-tamper.out" \
+    && grep -Fq "path=$GAAI_PROVENANCE_PATH" "$PLAN_PATH_DIR_PROOF" \
+    && grep -Fq "dir=$GAAI_PROVENANCE_DIR" "$PLAN_PATH_DIR_PROOF" \
+    && [[ "$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" == path-tamper ]] \
+    && [[ ! -e "$GAAI_PROVENANCE_DIR/${PLAN_STORY_ID}.provenance.json" ]] \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]] \
+    && ! grep -Eq '"provider":"(primary|codex)"' "$ROUTING_LOG"; then
+  pass "PLAN-AUTH-H3b: distinct PATH is captured, sealed and tamper-checked while DIR remains unused"
+else
+  fail "PLAN-AUTH-H3b: PATH/DIR authority or producer-time tamper detection drifted"
+fi
+rm -f "$PLAN_PROVENANCE_PATH"
+unset PLAN_PATH_DIR_PROOF
+
+# Stale bytes are excluded even when the current producer creates no output.
+# Preserve the historical distinction: a non-zero producer exit still reaches
+# harness-failure handling, while a zero exit reaches the no-artefact guard.
+for _plan_no_output_exit in 0 7; do
+  reset_plan_attempt
+  PLAN_NO_OUTPUT_HARNESS_LOG="$PLAN_FIXTURE_DIR/no-output-${_plan_no_output_exit}.harness.log"
+  export PLAN_NO_OUTPUT_HARNESS_LOG GAAI_TEST_NO_OUTPUT_EXIT="$_plan_no_output_exit"
+  mkdir -p "$(dirname "$PLAN_PATH")"
+  printf '%s\n' '## private-plan-marker stale canonical' > "$PLAN_PATH"
+  printf '%s\n' '## private-plan-marker stale alternate' > "$(dirname "$PLAN_PATH")/${PLAN_STORY_ID}.plan.md"
+  cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_NO_OUTPUT'
+#!/usr/bin/env bash
+printf 'no-output-%s\n' "${GAAI_TEST_NO_OUTPUT_EXIT:?}" >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+exit "${GAAI_TEST_NO_OUTPUT_EXIT:?}"
+SHIM_PLAN_AUTH_NO_OUTPUT
+  chmod +x "$SHIM_DIR/claude"
+  if ! ( gaai_harness_autodetect() { printf 'failure|%s\n' "$1" >> "$PLAN_NO_OUTPUT_HARNESS_LOG"; }; \
+         gaai_harness_success() { printf 'success|%s\n' "$1" >> "$PLAN_NO_OUTPUT_HARNESS_LOG"; }; \
+         handle_plan_phase "$PLAN_STORY_ID" "trace-no-output-${_plan_no_output_exit}" ) \
+        >"$PLAN_FIXTURE_DIR/no-output-${_plan_no_output_exit}.out" 2>&1 \
+      && [[ "$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" == "no-output-${_plan_no_output_exit}" ]] \
+      && [[ ! -e "$PLAN_PATH" && ! -e "$(dirname "$PLAN_PATH")/${PLAN_STORY_ID}.plan.md" ]] \
+      && [[ ! -e "$PLAN_PROVENANCE_PATH" && "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]] \
+      && ! grep -q '^success|' "$PLAN_NO_OUTPUT_HARNESS_LOG" 2>/dev/null \
+      && ! grep -Eq '"provider":"(primary|codex)"' "$ROUTING_LOG"; then
+    if [[ "$_plan_no_output_exit" -eq 0 ]] \
+        || grep -q '^failure|claude$' "$PLAN_NO_OUTPUT_HARNESS_LOG"; then
+      pass "PLAN-AUTH-AC2f-${_plan_no_output_exit}: stale canonical/alternate bytes cannot satisfy a no-output producer"
+    else
+      fail "PLAN-AUTH-AC2f-${_plan_no_output_exit}: non-zero no-output producer skipped harness-failure handling"
+    fi
+  else
+    fail "PLAN-AUTH-AC2f-${_plan_no_output_exit}: stale output remained eligible or a forbidden effect occurred"
+  fi
+done
+unset GAAI_TEST_NO_OUTPUT_EXIT PLAN_NO_OUTPUT_HARNESS_LOG
+
+# Freshness is exclusion plus ownership, not byte inequality: reproducing the
+# exact prior bytes during the admitted invocation remains acceptable.
+reset_plan_attempt
+PLAN_IDENTICAL_SOURCE="$PLAN_FIXTURE_DIR/identical-plan-source.md"
+printf '%s\n' '## byte-identical current PLAN' 'same payload' > "$PLAN_IDENTICAL_SOURCE"
+mkdir -p "$(dirname "$PLAN_PATH")"
+cp "$PLAN_IDENTICAL_SOURCE" "$PLAN_PATH"
+export PLAN_IDENTICAL_SOURCE
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_IDENTICAL'
+#!/usr/bin/env bash
+if [[ ! -e "${GAAI_PLAN_PATH:?}" \
+    && ! -e "$(dirname "${GAAI_PLAN_PATH:?}")/${GAAI_STORY_ID:?}.plan.md" ]]; then
+  printf 'identical|outputs-absent\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+else
+  printf 'identical|stale-visible\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+fi
+cat "${PLAN_IDENTICAL_SOURCE:?}" > "${GAAI_PLAN_PATH:?}"
+exit 0
+SHIM_PLAN_AUTH_IDENTICAL
+chmod +x "$SHIM_DIR/claude"
+if handle_plan_phase "$PLAN_STORY_ID" "trace-identical-bytes" >/dev/null 2>&1 \
+    && [[ "$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" == 'identical|outputs-absent' ]] \
+    && cmp -s "$PLAN_IDENTICAL_SOURCE" "$PLAN_PATH" \
+    && [[ -s "$PLAN_PROVENANCE_PATH" && "$(get_phase_status "$PLAN_STORY_ID")" == planned ]]; then
+  pass "PLAN-AUTH-AC2g: identical prior/current bytes are accepted only after exclusion and one current invocation"
+else
+  fail "PLAN-AUTH-AC2g: byte-identical current output was stale-visible or rejected"
+fi
+unset PLAN_IDENTICAL_SOURCE
+
+# Read/execute access on the lock parent is harmless; write access by group or
+# world is not. Reject it at the outer authority boundary before shared work.
+reset_plan_attempt
+chmod 775 "$LOCK_DIR"
+if ! handle_plan_phase "$PLAN_STORY_ID" "trace-writable-lock-parent" \
+      >"$PLAN_FIXTURE_DIR/writable-lock-parent.out" 2>&1 \
+    && grep -q 'PLAN_PRODUCTION_OWNERSHIP_LOST' "$PLAN_FIXTURE_DIR/writable-lock-parent.out" \
+    && [[ ! -s "$GAAI_TEST_PLAN_MODEL_CALL_LOG" && ! -e "$PLAN_PROVENANCE_PATH" ]] \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]]; then
+  pass "PLAN-AUTH-AC1d: a group-writable lock parent is rejected before spawn and transition"
+else
+  fail "PLAN-AUTH-AC1d: an unsafe writable lock parent reached shared PLAN work"
+fi
+chmod 755 "$LOCK_DIR"
+
+# The documented Claude fallback default is itself the exact invocation token.
+reset_plan_attempt
+make_capturing_claude_shim
+unset CLAUDE_MODEL_PRIMARY
+if handle_plan_phase "$PLAN_STORY_ID" "trace-default-claude" >/dev/null 2>&1 \
+    && grep -q -- '--model claude-sonnet-5' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q '"concrete_model": "claude-sonnet-5"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"model":"claude-sonnet-5"' "$ROUTING_LOG"; then
+  pass "PLAN-AUTH-H2b: default Claude fallback invokes and records claude-sonnet-5 exactly"
+else
+  fail "PLAN-AUTH-H2b: default Claude fallback identity is not exact"
+fi
+
+# Codex fallback is admitted only when the adapter has a concrete model.
+reset_plan_attempt
+make_capturing_codex_shim
+export GAAI_DAEMON_EXECUTOR=codex GAAI_CODEX_MODEL=codex-fallback-exact
+if handle_plan_phase "$PLAN_STORY_ID" "trace-codex-fallback" >/dev/null 2>&1 \
+    && grep -q -- '--model codex-fallback-exact' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q '"concrete_model": "codex-fallback-exact"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"harness": "codex"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"model":"codex-fallback-exact"' "$ROUTING_LOG"; then
+  pass "PLAN-AUTH-H2c: configured Codex fallback identity drives adapter, ledger and routing"
+else
+  fail "PLAN-AUTH-H2c: configured Codex fallback identity drifted"
+fi
+
+# A supported real-router Codex selection drives the existing adapter and all
+# accepted identity records from the one captured route tuple.
+reset_plan_attempt
+make_capturing_codex_shim
+PLAN_CODEX_ROUTING_CONFIG="$PLAN_FIXTURE_DIR/codex-routing.json"
+cp "$PLAN_PROJECT_DIR/.gaai/core/config/delivery-routing.json" "$PLAN_CODEX_ROUTING_CONFIG"
+python3 - "$PLAN_CODEX_ROUTING_CONFIG" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as handle:
+    data = json.load(handle)
+data['roles']['PLAN_PRODUCER']['candidates'] = ['codex_frontier']
+with open(path, 'w', encoding='utf-8') as handle:
+    json.dump(data, handle)
+PY
+export GAAI_MODEL_ROUTING=1 GAAI_ROUTING_CONFIG="$PLAN_CODEX_ROUTING_CONFIG"
+unset GAAI_PLAN_MODEL GAAI_CODEX_MODEL
+if handle_plan_phase "$PLAN_STORY_ID" "trace-router-codex" >/dev/null 2>&1 \
+    && grep -q -- '--model gpt-5.6-sol' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q -- '-c model_reasoning_effort=high' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q '"model_id": "codex_frontier"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"concrete_model": "gpt-5.6-sol"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"harness": "codex"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"model":"gpt-5.6-sol"' "$ROUTING_LOG" \
+    && grep -q '"provider":"codex"' "$ROUTING_LOG"; then
+  pass "PLAN-AUTH-H2e: router-selected Codex invokes and credits the exact captured producer"
+else
+  fail "PLAN-AUTH-H2e: real-router Codex invocation or attribution drifted"
+fi
+unset GAAI_ROUTING_CONFIG PLAN_CODEX_ROUTING_CONFIG
+export GAAI_MODEL_ROUTING=0 GAAI_DAEMON_EXECUTOR=codex
+
+for _codex_missing_variant in unset empty; do
+  reset_plan_attempt
+  : > "$GAAI_TEST_PLAN_MODEL_CALL_LOG"
+  if [[ "$_codex_missing_variant" == unset ]]; then
+    unset GAAI_CODEX_MODEL
+  else
+    export GAAI_CODEX_MODEL=""
+  fi
+  if ! handle_plan_phase "$PLAN_STORY_ID" "trace-codex-missing-${_codex_missing_variant}" \
+        >"$PLAN_FIXTURE_DIR/codex-missing-${_codex_missing_variant}.out" 2>&1 \
+      && grep -q 'PLAN_PHASE_FAILED' "$PLAN_FIXTURE_DIR/codex-missing-${_codex_missing_variant}.out" \
+      && [[ ! -s "$GAAI_TEST_PLAN_MODEL_CALL_LOG" && ! -e "$PLAN_PROVENANCE_PATH" ]] \
+      && grep -q '"fallback_reason":"PLAN_PHASE_FAILED"' "$ROUTING_LOG" \
+      && grep -q '"model":""' "$ROUTING_LOG" \
+      && ! grep -q 'codex-default' "$ROUTING_LOG" \
+      && ! grep -q '"provider":"primary"' "$ROUTING_LOG" \
+      && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]]; then
+    pass "PLAN-AUTH-H2d-${_codex_missing_variant}: missing Codex fallback identity fails without invented identity or effects"
+  else
+    fail "PLAN-AUTH-H2d-${_codex_missing_variant}: missing Codex fallback identity reached a forbidden effect or invented identity"
+  fi
+done
+
+# The existing Claude PLAN pin is not translated onto the Codex harness. The
+# unsupported pairing fails before tuple production and must not invent an
+# identity for its diagnostic record.
+reset_plan_attempt
+export GAAI_DAEMON_EXECUTOR=codex GAAI_CODEX_MODEL=codex-configured-but-not-selected
+export GAAI_PLAN_MODEL=claude-plan-pin
+if ! handle_plan_phase "$PLAN_STORY_ID" "trace-pin-codex-unsupported" \
+      >"$PLAN_FIXTURE_DIR/pin-codex-unsupported.out" 2>&1 \
+    && grep -q 'PLAN_PHASE_FAILED' "$PLAN_FIXTURE_DIR/pin-codex-unsupported.out" \
+    && [[ ! -s "$GAAI_TEST_PLAN_MODEL_CALL_LOG" && ! -e "$PLAN_PROVENANCE_PATH" ]] \
+    && grep -q '"model":""' "$ROUTING_LOG" \
+    && ! grep -q 'codex-default' "$ROUTING_LOG" \
+    && ! grep -q 'codex-configured-but-not-selected' "$ROUTING_LOG" \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]]; then
+  pass "PLAN-AUTH-AC2e: unsupported PLAN pin plus Codex fails without an invented producer identity"
+else
+  fail "PLAN-AUTH-AC2e: unsupported PLAN pin plus Codex reached a producer or invented identity"
+fi
+unset GAAI_PLAN_MODEL GAAI_CODEX_MODEL
+
+# The existing Claude PLAN pin remains exact and does not consult candidate
+# ordering. A late non-zero exit can still accept only the output from this
+# invocation, never bytes that survived entry.
+reset_plan_attempt
+make_capturing_claude_shim
+export GAAI_DAEMON_EXECUTOR=claude GAAI_MODEL_ROUTING=1 GAAI_PLAN_MODEL=claude-plan-pin
+if handle_plan_phase "$PLAN_STORY_ID" "trace-operator-pin" >/dev/null 2>&1 \
+    && grep -q -- '--model claude-plan-pin' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q '"model_id": "external:claude-plan-pin"' "$PLAN_PROVENANCE_PATH" \
+    && grep -q '"note": "operator_pin"' "$PLAN_PROVENANCE_PATH"; then
+  pass "PLAN-AUTH-AC2c: operator pin invokes and credits the captured concrete model"
+else
+  fail "PLAN-AUTH-AC2c: operator-pin tuple drifted"
+fi
+reset_plan_attempt
+unset GAAI_PLAN_MODEL
+export GAAI_MODEL_ROUTING=0 CLAUDE_MODEL_PRIMARY=claude-late-exit GAAI_TEST_PLAN_EXIT=7
+if handle_plan_phase "$PLAN_STORY_ID" "trace-late-exit" >"$PLAN_FIXTURE_DIR/late-exit.out" 2>&1 \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == planned ]] \
+    && grep -q '"concrete_model": "claude-late-exit"' "$PLAN_PROVENANCE_PATH"; then
+  pass "PLAN-AUTH-AC4e: late non-zero with current owned valid output is accepted and credited"
+else
+  fail "PLAN-AUTH-AC4e: late non-zero current output lost its existing acceptance path"
+fi
+unset GAAI_TEST_PLAN_EXIT
+
+# The loop breaker remains a hard failure even if the producer wrote a valid
+# current file before emitting the repeated tool error.
+reset_plan_attempt
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_LOOP'
+#!/usr/bin/env bash
+printf 'loop\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"deterministic failure"}]}}'
+exit 0
+SHIM_PLAN_AUTH_LOOP
+chmod +x "$SHIM_DIR/claude"
+export GAAI_LOOP_BREAKER_THRESHOLD=1
+if ! handle_plan_phase "$PLAN_STORY_ID" "trace-loop-breaker" >/dev/null 2>&1 \
+    && grep -q 'PLAN_PHASE_LOOP_BREAKER' "$ROUTING_LOG" \
+    && [[ ! -e "$PLAN_PROVENANCE_PATH" && "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]]; then
+  pass "PLAN-AUTH-AC4f: loop breaker remains hard despite current valid bytes"
+else
+  fail "PLAN-AUTH-AC4f: loop breaker authorized current output"
+fi
+unset GAAI_LOOP_BREAKER_THRESHOLD
+
+# QA remediation copies prior PLAN bytes into the prompt before exclusion, but
+# accepts only the canonical file produced by the current invocation.
+reset_plan_attempt
+PLAN_PRIOR_QA="$PLAN_FIXTURE_DIR/prior.qa-report.md"
+PLAN_CAPTURED_PROMPT="$PLAN_FIXTURE_DIR/captured-plan-prompt.md"
+export PLAN_CAPTURED_PROMPT GAAI_QA_INJECT_PHASE=plan GAAI_QA_REPORT_PATH="$PLAN_PRIOR_QA"
+printf '%s\n' 'private-prior-marker' > "$PLAN_PRIOR_QA"
+mkdir -p "$(dirname "$PLAN_PATH")"
+printf '%s\n' '## prior PLAN context marker' > "$PLAN_PATH"
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_QA_CONTEXT'
+#!/usr/bin/env bash
+cat > "${PLAN_CAPTURED_PROMPT:?}"
+printf 'qa-context\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+printf '%s\n' '## replacement PLAN from current invocation' > "${GAAI_PLAN_PATH:?}"
+exit 0
+SHIM_PLAN_AUTH_QA_CONTEXT
+chmod +x "$SHIM_DIR/claude"
+if handle_plan_phase "$PLAN_STORY_ID" "trace-qa-replan" >/dev/null 2>&1 \
+    && grep -q 'private-prior-marker' "$PLAN_CAPTURED_PROMPT" \
+    && grep -q 'prior PLAN context marker' "$PLAN_CAPTURED_PROMPT" \
+    && grep -q '^## replacement PLAN from current invocation$' "$PLAN_PATH" \
+    && [[ -z "${GAAI_QA_INJECT_PHASE:-}${GAAI_QA_REPORT_PATH:-}" ]]; then
+  pass "PLAN-AUTH-AC3c: QA replan retains prior context while replacing accepted PLAN"
+else
+  fail "PLAN-AUTH-AC3c: QA prior context or fresh replacement contract drifted"
+fi
+unset PLAN_CAPTURED_PROMPT PLAN_PRIOR_QA GAAI_QA_INJECT_PHASE GAAI_QA_REPORT_PATH
+
+# Filename tolerance applies only to a current invocation's alternate output.
+reset_plan_attempt
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_ALT'
+#!/usr/bin/env bash
+printf 'alternate\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+printf '%s\n' '## current alternate PLAN' > "$(dirname "${GAAI_PLAN_PATH:?}")/${GAAI_STORY_ID:?}.plan.md"
+exit 0
+SHIM_PLAN_AUTH_ALT
+chmod +x "$SHIM_DIR/claude"
+if handle_plan_phase "$PLAN_STORY_ID" "trace-current-alternate" >/dev/null 2>&1 \
+    && grep -q '^## current alternate PLAN$' "$PLAN_PATH" \
+    && [[ -s "$PLAN_PROVENANCE_PATH" ]]; then
+  pass "PLAN-AUTH-AC2d: current alternate output is normalized and credited"
+else
+  fail "PLAN-AUTH-AC2d: current alternate output lost compatibility"
+fi
+
+# A post-producer token replacement invalidates otherwise valid current bytes.
+reset_plan_attempt
+export GAAI_DAEMON_EXECUTOR=claude CLAUDE_MODEL_PRIMARY=claude-owner-test
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_TAMPER'
+#!/usr/bin/env bash
+printf 'tamper\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+printf '%s\n' 'replaced-owner-token' > "${LOCK_DIR:?}/.plan-production.${GAAI_STORY_ID:?}.lock.owner"
+exit 0
+SHIM_PLAN_AUTH_TAMPER
+chmod +x "$SHIM_DIR/claude"
+if ! handle_plan_phase "$PLAN_STORY_ID" "trace-owner-loss" >"$PLAN_FIXTURE_DIR/owner-loss.out" 2>&1 \
+    && [[ "$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" == tamper ]] \
+    && [[ ! -e "$PLAN_PROVENANCE_PATH" ]] \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]]; then
+  pass "PLAN-AUTH-AC3a: post-spawn ownership loss rejects output, credit and transition"
+else
+  fail "PLAN-AUTH-AC3a: post-spawn ownership loss did not fail closed"
+fi
+rm -f "$LOCK_DIR/.plan-production.${PLAN_STORY_ID}.lock.owner"
+
+# A path that cannot be removed is a typed pre-spawn preparation failure.
+reset_plan_attempt
+make_capturing_claude_shim
+rm -f "$PLAN_PATH"
+mkdir -p "$PLAN_PATH"
+if ! handle_plan_phase "$PLAN_STORY_ID" "trace-output-prep" >"$PLAN_FIXTURE_DIR/prep.out" 2>&1 \
+    && grep -q 'PLAN_OUTPUT_PREP_FAILED' "$PLAN_FIXTURE_DIR/prep.out" \
+    && [[ ! -s "$GAAI_TEST_PLAN_MODEL_CALL_LOG" && ! -e "$PLAN_PROVENANCE_PATH" ]]; then
+  pass "PLAN-AUTH-AC4a: output exclusion failure is typed and pre-spawn"
+else
+  fail "PLAN-AUTH-AC4a: output exclusion failure reached a forbidden effect"
+fi
+rmdir "$PLAN_PATH"
+
+# Real resolver import/validation failures close before any producer call. The
+# trailing-LF case exercises the unchanged exported resolver and proves exact
+# bytes are rejected before Bash command substitution can trim them.
+for _plan_resolver_failure in trailing-lf empty multiline import; do
+  reset_plan_attempt
+  make_capturing_claude_shim
+  export GAAI_PROVENANCE_PATH="$PLAN_PROVENANCE_PATH"
+  case "$_plan_resolver_failure" in
+    trailing-lf) export GAAI_PROVENANCE_PATH="${PLAN_PROVENANCE_PATH}"$'\n' ;;
+    empty)
+      cat > "$PLAN_PROVENANCE_MODULE" <<'MODULE_EMPTY'
+export function resolveLedgerPath() { return ''; }
+export function recordContribution() { throw new Error('unreachable'); }
+MODULE_EMPTY
+      ;;
+    multiline)
+      cat > "$PLAN_PROVENANCE_MODULE" <<'MODULE_MULTILINE'
+export function resolveLedgerPath() { return `${process.cwd()}\nsecond-line`; }
+export function recordContribution() { throw new Error('unreachable'); }
+MODULE_MULTILINE
+      ;;
+    import) printf '%s\n' 'export function resolveLedgerPath( {' > "$PLAN_PROVENANCE_MODULE" ;;
+  esac
+  PLAN_RESOLVER_HARNESS_LOG="$PLAN_FIXTURE_DIR/resolver-${_plan_resolver_failure}.harness.log"
+  PLAN_RESOLVER_JOURNAL_LINES=$(wc -l < "$JOURNAL_CALL_LOG" | tr -d ' ')
+  export PLAN_RESOLVER_HARNESS_LOG
+  if ! ( gaai_harness_success() { printf 'success|%s\n' "$1" >> "$PLAN_RESOLVER_HARNESS_LOG"; }; \
+         handle_plan_phase "$PLAN_STORY_ID" "trace-resolver-${_plan_resolver_failure}" ) \
+        >"$PLAN_FIXTURE_DIR/resolver-${_plan_resolver_failure}.out" 2>&1 \
+      && grep -q 'PROVENANCE_WRITE_FAILED' "$PLAN_FIXTURE_DIR/resolver-${_plan_resolver_failure}.out" \
+      && [[ ! -s "$GAAI_TEST_PLAN_MODEL_CALL_LOG" ]] \
+      && [[ ! -e "$PLAN_PROVENANCE_PATH" ]] \
+      && [[ ! -e "${GAAI_PROVENANCE_DIR:-$LOCK_DIR/provenance}/${PLAN_STORY_ID}.provenance.json" ]] \
+      && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]] \
+      && [[ "$(wc -l < "$JOURNAL_CALL_LOG" | tr -d ' ')" == "$PLAN_RESOLVER_JOURNAL_LINES" ]] \
+      && [[ ! -e "$PLAN_RESOLVER_HARNESS_LOG" ]] \
+      && ! grep -Eq '"provider":"(primary|codex)"' "$ROUTING_LOG"; then
+    pass "PLAN-AUTH-AC4b-${_plan_resolver_failure}: real resolver failure is pre-spawn PROVENANCE_WRITE_FAILED"
+  else
+    fail "PLAN-AUTH-AC4b-${_plan_resolver_failure}: invalid resolver output reached a forbidden effect"
+  fi
+done
+unset PLAN_RESOLVER_HARNESS_LOG PLAN_RESOLVER_JOURNAL_LINES
+export GAAI_PROVENANCE_PATH="$PLAN_PROVENANCE_PATH"
+
+# PLAN integrity has no advisory no-digest path. A non-empty authoritative
+# ledger plus unavailable digest evidence is a pre-spawn typed failure.
+reset_plan_attempt
+make_capturing_claude_shim
+mkdir -p "$(dirname "$PLAN_PROVENANCE_PATH")"
+printf '%s\n' '{}' > "$PLAN_PROVENANCE_PATH"
+if ! ( _gaai_digest() { printf '%s\n' 'NO_DIGEST_TOOL'; }; \
+       handle_plan_phase "$PLAN_STORY_ID" "trace-digest-unavailable" ) \
+      >"$PLAN_FIXTURE_DIR/digest-unavailable.out" 2>&1 \
+    && grep -q 'PROVENANCE_WRITE_FAILED' "$PLAN_FIXTURE_DIR/digest-unavailable.out" \
+    && [[ ! -s "$GAAI_TEST_PLAN_MODEL_CALL_LOG" ]] \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]] \
+    && ! grep -Eq '"provider":"(primary|codex)"' "$ROUTING_LOG"; then
+  pass "PLAN-AUTH-AC4b-digest: unavailable digest fails before producer control"
+else
+  fail "PLAN-AUTH-AC4b-digest: unavailable digest reached producer or lifecycle effects"
+fi
+
+# Pre-spawn ownership failure remains independently typed.
+reset_plan_attempt
+if ! ( _plan_production_owner_matches() { return 1; }; \
+       handle_plan_phase "$PLAN_STORY_ID" "trace-pre-owner-loss" ) \
+      >"$PLAN_FIXTURE_DIR/pre-owner.out" 2>&1 \
+    && grep -q 'PLAN_PRODUCTION_OWNERSHIP_LOST' "$PLAN_FIXTURE_DIR/pre-owner.out" \
+    && [[ ! -s "$GAAI_TEST_PLAN_MODEL_CALL_LOG" && ! -e "$PLAN_PROVENANCE_PATH" ]]; then
+  pass "PLAN-AUTH-AC3b: pre-spawn owner verification failure has no producer or credit"
+else
+  fail "PLAN-AUTH-AC3b: pre-spawn ownership loss reached a forbidden effect"
+fi
+
+# A current valid artefact is insufficient when authoritative contribution
+# persistence fails. A later journal failure keeps that truthful contribution
+# but cannot emit harness or routing success.
+reset_plan_attempt
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_RECORD_IMPORT_FAIL'
+#!/usr/bin/env bash
+printf '%s\n' 'record-import-fail' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+printf '%s\n' 'export function recordContribution( {' > "${PLAN_PROVENANCE_MODULE:?}"
+exit 0
+SHIM_PLAN_AUTH_RECORD_IMPORT_FAIL
+chmod +x "$SHIM_DIR/claude"
+if ! handle_plan_phase "$PLAN_STORY_ID" "trace-record-fail" \
+      >"$PLAN_FIXTURE_DIR/record.out" 2>&1 \
+    && grep -q 'PROVENANCE_WRITE_FAILED' "$PLAN_FIXTURE_DIR/record.out" \
+    && [[ "$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" == record-import-fail ]] \
+    && [[ ! -e "$PLAN_PROVENANCE_PATH" && "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]]; then
+  pass "PLAN-AUTH-AC4c: real direct-record import failure follows one producer and blocks transition"
+else
+  fail "PLAN-AUTH-AC4c: real contribution import failure did not gate lifecycle persistence"
+fi
+reset_plan_attempt
+make_capturing_claude_shim
+PLAN_HARNESS_SUCCESS_LOG="$PLAN_FIXTURE_DIR/harness-success.log"
+export PLAN_HARNESS_SUCCESS_LOG GAAI_TEST_JOURNAL_BLOCK=1
+if ! ( gaai_harness_success() { printf '%s\n' "$1" >> "$PLAN_HARNESS_SUCCESS_LOG"; }; \
+       handle_plan_phase "$PLAN_STORY_ID" "trace-journal-fail" ) \
+      >"$PLAN_FIXTURE_DIR/journal.out" 2>&1 \
+    && [[ -s "$PLAN_PROVENANCE_PATH" && ! -e "$PLAN_HARNESS_SUCCESS_LOG" ]] \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == not_started ]] \
+    && ! grep -q '"provider":"primary"' "$ROUTING_LOG"; then
+  pass "PLAN-AUTH-AC4d: journal failure retains contribution without transition, harness success or routing success"
+else
+  fail "PLAN-AUTH-AC4d: journal failure violated authoritative effect ordering"
+fi
+unset GAAI_TEST_JOURNAL_BLOCK PLAN_HARNESS_SUCCESS_LOG
+
+# The direct adapter consumes the frozen tuple even if the selected alias is
+# remapped while the producer controls the harness.
+reset_plan_attempt
+PLAN_REMAP_CONFIG="$PLAN_FIXTURE_DIR/remap-routing.json"
+cp "$PLAN_PROJECT_DIR/.gaai/core/config/delivery-routing.json" "$PLAN_REMAP_CONFIG"
+python3 - "$PLAN_REMAP_CONFIG" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as handle:
+    data = json.load(handle)
+data['models']['claude_strong']['concrete_model'] = 'claude-before-remap'
+with open(path, 'w', encoding='utf-8') as handle:
+    json.dump(data, handle)
+PY
+export GAAI_MODEL_ROUTING=1 GAAI_ROUTING_CONFIG="$PLAN_REMAP_CONFIG"
+export GAAI_PROVENANCE_ATTEMPT="attempt-frozen-before-spawn"
+unset GAAI_DAEMON_EXECUTOR CLAUDE_MODEL_PRIMARY
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_REMAP'
+#!/usr/bin/env bash
+printf 'remap|%s\n' "$*" >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+python3 - "${GAAI_ROUTING_CONFIG:?}" <<'PY'
+import json, sys
+path = sys.argv[1]
+with open(path, encoding='utf-8') as handle:
+    data = json.load(handle)
+data['models']['claude_strong']['concrete_model'] = 'claude-after-remap'
+with open(path, 'w', encoding='utf-8') as handle:
+    json.dump(data, handle)
+PY
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+exit 0
+SHIM_PLAN_AUTH_REMAP
+chmod +x "$SHIM_DIR/claude"
+if handle_plan_phase "$PLAN_STORY_ID" "trace-alias-remap" >/dev/null 2>&1 \
+    && grep -q -- '--model claude-before-remap' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && grep -q -- '--effort high' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
+    && ! grep -q 'claude-after-remap' "$PLAN_PROVENANCE_PATH" \
+    && python3 - "$PLAN_PROVENANCE_PATH" "$ROUTING_LOG" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    ledger = json.load(handle)
+with open(sys.argv[2], encoding='utf-8') as handle:
+    routing = [json.loads(line) for line in handle if line.strip()]
+entry = ledger['contributions'][-1]
+record = routing[-1]
+expected = {
+    'artifact': 'PLAN',
+    'model_id': 'claude_strong',
+    'concrete_model': 'claude-before-remap',
+    'harness': 'claude',
+    'role': 'PLAN_PRODUCER',
+    'attempt': 'attempt-frozen-before-spawn',
+    'effort': 'high',
+    'capability_waived': '',
+    'fallback_trace': '',
+    'note': 'router',
+}
+valid = all(entry.get(key) == value for key, value in expected.items())
+valid = valid and isinstance(entry.get('duration_ms'), int) and entry['duration_ms'] >= 0
+valid = valid and record.get('model') == entry['concrete_model']
+valid = valid and record.get('duration_ms') == entry['duration_ms']
+raise SystemExit(0 if valid else 1)
+PY
+then
+  pass "PLAN-AUTH-AC2b: registry remap preserves the complete frozen invocation/provenance/routing tuple"
+else
+  fail "PLAN-AUTH-AC2b: post-selection mutation changed or incompletely recorded the captured tuple"
+fi
+unset GAAI_ROUTING_CONFIG GAAI_PROVENANCE_ATTEMPT PLAN_REMAP_CONFIG
+export GAAI_MODEL_ROUTING=0 GAAI_DAEMON_EXECUTOR=claude CLAUDE_MODEL_PRIMARY=claude-owner-test
+
+# While one real handler is in producer control, a duplicate returns BUSY and
+# never starts a second producer. The holder still completes normally.
+reset_plan_attempt
+PLAN_HOLD_READY="$PLAN_FIXTURE_DIR/hold.ready"
+PLAN_HOLD_RELEASE="$PLAN_FIXTURE_DIR/hold.release"
+export PLAN_HOLD_READY PLAN_HOLD_RELEASE
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_HOLD'
+#!/usr/bin/env bash
+printf 'holder\n' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+: > "${PLAN_HOLD_READY:?}"
+while [[ ! -e "${PLAN_HOLD_RELEASE:?}" ]]; do sleep 0.05; done
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+exit 0
+SHIM_PLAN_AUTH_HOLD
+chmod +x "$SHIM_DIR/claude"
+handle_plan_phase "$PLAN_STORY_ID" "trace-lock-holder" >"$PLAN_FIXTURE_DIR/holder.out" 2>&1 &
+PLAN_HOLDER_PID=$!
+while [[ ! -e "$PLAN_HOLD_READY" ]] \
+    && kill -0 "$PLAN_HOLDER_PID" 2>/dev/null; do
+  sleep 0.05
+done
+PLAN_LOSER_SENTINEL_LOG="$PLAN_FIXTURE_DIR/loser-shared-operations.log"
+export PLAN_LOSER_SENTINEL_LOG
+if ! ( _plan_expected_target_guard() { printf 'target\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       _plan_story_worktree_owned() { printf 'worktree\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       git() { printf 'git\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       ensure_wt_dependencies_installed() { printf 'dependencies\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       _expand_daemon_prompt_template() { printf 'output\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       gaai_routing_bind_worktree() { printf 'routing-bind\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       gaai_route_select() { printf 'selection\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       _plan_resolve_ledger_path() { printf 'resolver\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       _run_claude_with_loop_breaker() { printf 'producer\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       _journal_persist_lifecycle() { printf 'journal\n' >> "$PLAN_LOSER_SENTINEL_LOG"; return 1; }; \
+       handle_plan_phase "$PLAN_STORY_ID" "trace-lock-loser" ) \
+      >"$PLAN_FIXTURE_DIR/loser.out" 2>&1 \
+    && grep -q 'PLAN_PRODUCTION_BUSY' "$PLAN_FIXTURE_DIR/loser.out" \
+    && [[ ! -s "$PLAN_LOSER_SENTINEL_LOG" ]]; then
+  pass "PLAN-AUTH-AC1a: a BUSY loser performs no target/Git/worktree/dependency/output/router/producer/journal operation"
+else
+  fail "PLAN-AUTH-AC1a: concurrent loser reached shared work or missed BUSY"
+fi
+: > "$PLAN_HOLD_RELEASE"
+if wait "$PLAN_HOLDER_PID" \
+    && [[ "$(grep -c '^holder$' "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" -eq 1 ]] \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == planned ]]; then
+  pass "PLAN-AUTH-AC1b: the holder alone invokes and retains authority through lifecycle persistence"
+else
+  fail "PLAN-AUTH-AC1b: the admitted lock holder did not complete"
+fi
+unset PLAN_LOSER_SENTINEL_LOG
+
+# Exercise the production lifecycle wrapper, replacing only its locked journal
+# body with a deterministic barrier. At that barrier FD 197 must still identify
+# the PLAN lock while independently acquired FD 198 identifies the lifecycle
+# lock; a competing PLAN caller remains BUSY until journal completion.
+reset_plan_attempt
+chmod 700 "$LOCK_DIR"
+PLAN_JOURNAL_READY="$PLAN_FIXTURE_DIR/journal.ready"
+PLAN_JOURNAL_RELEASE="$PLAN_FIXTURE_DIR/journal.release"
+PLAN_JOURNAL_FD_PROOF="$PLAN_FIXTURE_DIR/journal-fds.log"
+PLAN_JOURNAL_LOSER_SENTINEL="$PLAN_FIXTURE_DIR/journal-loser-shared.log"
+PLAN_JOURNAL_STAGING_LOCK="$LOCK_DIR/.plan-journal-barrier.staging.lock"
+export PLAN_JOURNAL_READY PLAN_JOURNAL_RELEASE PLAN_JOURNAL_FD_PROOF
+export PLAN_JOURNAL_STAGING_LOCK STAGING_LOCK="$PLAN_JOURNAL_STAGING_LOCK"
+cat > "$SHIM_DIR/claude" << 'SHIM_PLAN_AUTH_JOURNAL_BARRIER'
+#!/usr/bin/env bash
+printf '%s\n' 'journal-holder' >> "${GAAI_TEST_PLAN_MODEL_CALL_LOG:?}"
+printf '%s\n' '## Current invocation plan' > "${GAAI_PLAN_PATH:?}"
+exit 0
+SHIM_PLAN_AUTH_JOURNAL_BARRIER
+chmod +x "$SHIM_DIR/claude"
+(
+  eval "$REAL_JOURNAL_PERSIST_DEF"
+  _journal_persist_lifecycle_locked() {
+    python3 - "${GAAI_TEST_PLAN_LOCK_PATH:?}" "${PLAN_JOURNAL_STAGING_LOCK:?}" 197 198 \
+        > "${PLAN_JOURNAL_FD_PROOF:?}" <<'PY'
+import os, sys
+plan_path, lifecycle_path = sys.argv[1], sys.argv[2]
+plan_fd, lifecycle_fd = int(sys.argv[3]), int(sys.argv[4])
+plan_stat, lifecycle_stat = os.stat(plan_path), os.stat(lifecycle_path)
+plan_open, lifecycle_open = os.fstat(plan_fd), os.fstat(lifecycle_fd)
+plan_matches = (plan_stat.st_dev, plan_stat.st_ino) == (plan_open.st_dev, plan_open.st_ino)
+lifecycle_matches = ((lifecycle_stat.st_dev, lifecycle_stat.st_ino)
+                     == (lifecycle_open.st_dev, lifecycle_open.st_ino))
+print(f"plan={'yes' if plan_matches else 'no'} lifecycle={'yes' if lifecycle_matches else 'no'}")
+raise SystemExit(0 if plan_matches and lifecycle_matches else 1)
+PY
+    : > "${PLAN_JOURNAL_READY:?}"
+    while [[ ! -e "${PLAN_JOURNAL_RELEASE:?}" ]]; do sleep 0.05; done
+    "$SCHEDULER" --set-field "$1" "$3" "$4" "$BACKLOG_FILE" >/dev/null
+  }
+  handle_plan_phase "$PLAN_STORY_ID" "trace-journal-lock-holder"
+) >"$PLAN_FIXTURE_DIR/journal-holder.out" 2>&1 &
+PLAN_JOURNAL_HOLDER_PID=$!
+while [[ ! -e "$PLAN_JOURNAL_READY" ]] \
+    && kill -0 "$PLAN_JOURNAL_HOLDER_PID" 2>/dev/null; do
+  sleep 0.05
+done
+if ! ( _handle_plan_phase_owned() { printf 'shared-body\n' >> "$PLAN_JOURNAL_LOSER_SENTINEL"; return 1; }; \
+       handle_plan_phase "$PLAN_STORY_ID" "trace-journal-lock-loser" ) \
+      >"$PLAN_FIXTURE_DIR/journal-loser.out" 2>&1 \
+    && grep -q 'PLAN_PRODUCTION_BUSY' "$PLAN_FIXTURE_DIR/journal-loser.out" \
+    && [[ ! -s "$PLAN_JOURNAL_LOSER_SENTINEL" ]] \
+    && grep -q '^plan=yes lifecycle=yes$' "$PLAN_JOURNAL_FD_PROOF"; then
+  pass "PLAN-AUTH-AC3d: FD 197 remains authoritative while real lifecycle FD 198 is held and the loser stays pre-shared-work BUSY"
+else
+  fail "PLAN-AUTH-AC3d: nested PLAN/lifecycle descriptor ownership or journal-time contention drifted"
+fi
+: > "$PLAN_JOURNAL_RELEASE"
+if wait "$PLAN_JOURNAL_HOLDER_PID" \
+    && [[ "$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG")" == journal-holder ]] \
+    && [[ "$(get_phase_status "$PLAN_STORY_ID")" == planned ]]; then
+  pass "PLAN-AUTH-AC3e: journal barrier holder alone persists and completes after nested lock release"
+else
+  fail "PLAN-AUTH-AC3e: nested lifecycle holder failed to complete exactly once"
+fi
+unset PLAN_JOURNAL_READY PLAN_JOURNAL_RELEASE PLAN_JOURNAL_FD_PROOF
+unset PLAN_JOURNAL_STAGING_LOCK PLAN_JOURNAL_LOSER_SENTINEL PLAN_JOURNAL_HOLDER_PID STAGING_LOCK
+
+# Census only the diagnostics introduced by the PLAN authority boundary. Seeded
+# prompt/prior/credential/path/operator/project values were present in the
+# exercised runs but may never appear in these stable records.
+PLAN_DIAGNOSTIC_CENSUS="$PLAN_FIXTURE_DIR/diagnostic-census.log"
+grep -Eh 'PLAN_PRODUCTION_BUSY|PLAN_OUTPUT_PREP_FAILED|PLAN_PRODUCTION_OWNERSHIP_LOST|PLAN_PROVENANCE_TAMPERED|phase=plan producer=|exited [0-9]+ with a plan artefact present' \
+  "$PLAN_FIXTURE_DIR/fresh.out" \
+  "$PLAN_FIXTURE_DIR/late-exit.out" \
+  "$PLAN_FIXTURE_DIR/prep.out" \
+  "$PLAN_FIXTURE_DIR/loser.out" \
+  "$PLAN_FIXTURE_DIR/owner-loss.out" \
+  "$PLAN_FIXTURE_DIR/path-tamper.out" > "$PLAN_DIAGNOSTIC_CENSUS" || true
+if grep -q 'phase=plan producer=' "$PLAN_DIAGNOSTIC_CENSUS" \
+    && grep -q 'PLAN_OUTPUT_PREP_FAILED' "$PLAN_DIAGNOSTIC_CENSUS" \
+    && grep -q 'PLAN_PRODUCTION_BUSY' "$PLAN_DIAGNOSTIC_CENSUS" \
+    && grep -q 'PLAN_PRODUCTION_OWNERSHIP_LOST' "$PLAN_DIAGNOSTIC_CENSUS" \
+    && grep -q 'PLAN_PROVENANCE_TAMPERED' "$PLAN_DIAGNOSTIC_CENSUS" \
+    && ! grep -Eq 'private-(plan|prior|credential|path|workspace|org|operator)-marker|reus(e|ing)' \
+      "$PLAN_DIAGNOSTIC_CENSUS"; then
+  pass "PLAN-AUTH-AC5a: seeded success/late/preparation/contention/ownership diagnostics expose only permitted operational fields"
+else
+  fail "PLAN-AUTH-AC5a: diagnostic census is incomplete or exposes seeded private content"
+fi
+unset PLAN_DIAGNOSTIC_CENSUS
+
+unset GAAI_PROVENANCE_PATH GAAI_MODEL_ROUTING GAAI_DAEMON_EXECUTOR GAAI_CODEX_MODEL
+unset GAAI_TEST_PLAN_LOCK_PATH PLAN_HOLD_READY PLAN_HOLD_RELEASE PLAN_HOLDER_PID
+export CLAUDE_MODEL_PRIMARY="claude-sonnet-4-6"
+chmod 700 "$LOCK_DIR"
+
 # Restore PATH and PROJECT_DIR
 export PATH="$OLD_PATH"
 export PROJECT_DIR="$PROJECT_DIR_ORIG"
 unset GAAI_WORKTREES_BASE
 unset GAAI_TEST_PLAN_MODEL_CALL_LOG GAAI_EXPECTED_TARGET_SOURCE \
-  GAAI_EXPECTED_TARGET_BLOB GAAI_EXPECTED_TARGET_RECORD
+  GAAI_EXPECTED_TARGET_BLOB GAAI_EXPECTED_TARGET_RECORD GAAI_OPERATOR_ID
+unset ANTHROPIC_AUTH_TOKEN PLAN_PROVENANCE_MODULE
 
 # Cleanup plan phase test fixtures
 rm -rf "$PLAN_FIXTURE_DIR"
