@@ -3329,7 +3329,13 @@ d10_row8() {
   if [[ "$fault" == "fchmod" ]]; then
     core=$(d10_private_core "$base/core") || { printf 'PRIVATE_CORE_FAILED\n'; return 0; }
   fi
-  d10_make_repo "$base" "$sid"
+  # This row asserts the helper outside the three vendor paths is still at its
+  # checkout mode (0644) afterwards, to prove the normalizer touched nothing else.
+  # Git materializes a checkout at 0666 & ~umask, so under a caller's restrictive
+  # umask — the delivery wrapper runs at 077 — the helper is 0600 before anything
+  # runs and the assertion fails for a reason unrelated to the normalizer. Pin
+  # the fixture's umask the way this suite already does for its own umask cases.
+  ( umask 022; d10_make_repo "$base" "$sid" )
   D10_FAULT="$fault" D10_SOURCE_VENDOR="$D10_VENDOR" D10_LINK_TARGET="$(d10_link_target)" \
   D10_STUB="$D10_STUB_BODY" \
   "$TEST_BASH" -s -- "$core" "$base" "$sid" <<'BASH' 2>&1
