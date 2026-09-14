@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: add the missing pre-commit dispatcher
+- fix: bind the landed-PR check to the exact tip, not the branch name
 - fix: preserve an interrupted implementation attempt as a commit
 - fix: quarantine an unsettleable Story at startup instead of halting
 - fix: bound the working-memory file at the size that actually harms

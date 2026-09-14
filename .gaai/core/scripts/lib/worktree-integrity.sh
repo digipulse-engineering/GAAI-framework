@@ -244,6 +244,10 @@ _recover_worktree_safe_base() {
 # this exact branch exist (pushed-but-not-yet-merged)? Any check that cannot
 # be verified (network/gh/remote-read failure) simply does not affirm —
 # the predicate naturally fails closed if nothing confirms landed.
+#
+# Every affirmation is bound to the branch's CURRENT TIP OBJECT, never to its
+# name. story/<sid> is reused across delivery cycles, so a name proves nothing
+# about which work the ref holds today.
 _worktree_branch_is_landed() {
   local sid="$1" branch="$2"
   local _project_dir="${PROJECT_DIR:-}"
@@ -269,20 +273,40 @@ _worktree_branch_is_landed() {
   fi
   rm -f "$_remote_backlog_tmp" 2>/dev/null || true
 
-  # (a2) PR state MERGED via gh — absent/unauthenticated gh silently no-ops
-  # (empty output), which correctly does not affirm.
-  local _pr_json _pr_state
-  _pr_json=$(gh pr list --state all --head "$branch" --json state --limit 1 2>/dev/null || echo "")
-  if [[ -n "$_pr_json" && "$_pr_json" != "[]" ]]; then
-    _pr_state=$(printf '%s' "$_pr_json" | grep -oE '"state":"[A-Z]+"' | head -1 | cut -d'"' -f4)
-    [[ "$_pr_state" == "MERGED" ]] && return 0
+  # The exact object this local ref currently points at. Both remaining checks
+  # are bound to it: a branch NAME is not an identity here, because story/<sid>
+  # is reused across delivery cycles for the same Story.
+  local _local_tip _remote_tip
+  _local_tip=$(git -C "$_project_dir" rev-parse --verify -q "$branch" 2>/dev/null || echo "")
+
+  # (a2) A merged PR affirms only when it merged THIS EXACT TIP.
+  #
+  # Matching on `--head <branch>` alone was a data-loss path. story/<sid> is
+  # reused whenever a Story is re-delivered, and GitHub retains headRefName on
+  # merged PRs forever, so a merged PR from an EARLIER cycle kept affirming
+  # "landed" for a branch whose current tip was unrelated, unpushed work — and
+  # the caller then ran `branch -D` on it. Comparing headRefOid to the current
+  # tip makes the affirmation about the object rather than the name: a reused
+  # branch that has moved on no longer matches, and fails closed to preserve.
+  #
+  # `--state merged` rather than `--state all` because only a merged PR can
+  # affirm, and a reused branch legitimately carries several PRs across cycles
+  # — the old `--limit 1` over all states could return any one of them.
+  # Absent, unauthenticated or failing gh yields empty output, which matches
+  # nothing and therefore does not affirm.
+  if [[ -n "$_local_tip" ]]; then
+    local _merged_oids
+    _merged_oids=$(gh pr list --state merged --head "$branch" \
+      --json headRefOid --limit 20 --jq '.[].headRefOid' 2>/dev/null || echo "")
+    if [[ -n "$_merged_oids" ]] \
+        && printf '%s\n' "$_merged_oids" | grep -qxF "$_local_tip"; then
+      return 0
+    fi
   fi
 
   # (b) local branch tip present on a remote ref (pushed-but-not-yet-merged
   # is also safe to drop the LOCAL ref for — a remote copy still exists).
   # ls-remote queries live remote state directly, no local fetch required.
-  local _local_tip _remote_tip
-  _local_tip=$(git -C "$_project_dir" rev-parse --verify -q "$branch" 2>/dev/null || echo "")
   _remote_tip=$(git -C "$_project_dir" ls-remote origin "refs/heads/${branch}" 2>/dev/null | awk '{print $1}')
   if [[ -n "$_local_tip" && -n "$_remote_tip" && "$_local_tip" == "$_remote_tip" ]]; then
     return 0
