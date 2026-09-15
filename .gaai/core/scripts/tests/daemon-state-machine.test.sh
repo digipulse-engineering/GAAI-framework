@@ -8,6 +8,13 @@
 
 set -euo pipefail
 
+# The delivery wrapper exports its phase pointers — GAAI_QA_REPORT_PATH names a
+# file inside the live story worktree. This suite's executor shims honour
+# those names to play the executor, so an inherited value would make them
+# write into a real delivery. Never inherit them.
+unset GAAI_QA_REPORT_PATH GAAI_QA_VERDICT_PATH GAAI_PLAN_PATH \
+  GAAI_QA_INJECT_PHASE GAAI_QA_INJECT_PHASE_SNAPSHOT
+
 PASS_COUNT=0
 FAIL_COUNT=0
 

@@ -16,6 +16,19 @@ export const canonicalJson = value => {
   return JSON.stringify(value);
 };
 
+// Delivery-variable filtering, not a sandbox. The gate attests a sealed
+// candidate, and the caller is usually the delivery wrapper, whose GAAI_*
+// variables describe the delivery in progress: phase pointers into the live
+// worktree, routing, executor credentials. A command that honours one of them
+// reaches past the seal (a test shim once overwrote the live QA report through
+// GAAI_QA_REPORT_PATH, unsealing the candidate mid-run on every cycle). So the
+// GAAI_ namespace is dropped, except the names the project's policy declares
+// as pass-through — those are legitimate test and corpus inputs, and the
+// resolver has already bound a digest of each value into the receipt. Every
+// other variable passes through unchanged.
+export const gateEnvironment = (env = process.env, keep = []) =>
+  Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith('GAAI_') || keep.includes(name)));
+
 function terminate(child) {
   try {
     if (process.platform === 'win32') child.kill('SIGKILL');
@@ -23,7 +36,7 @@ function terminate(child) {
   } catch { /* already exited */ }
 }
 
-export function executeCommand(command, { cwd, signal } = {}) {
+export function executeCommand(command, { cwd, signal, keep = [] } = {}) {
   return new Promise(resolve => {
     const started = Date.now();
     const counts = { stdout: 0, stderr: 0 };
@@ -32,7 +45,7 @@ export function executeCommand(command, { cwd, signal } = {}) {
     let settled = false;
     let timer;
     const child = spawn(command.argv[0], command.argv.slice(1), {
-      cwd, env: process.env, shell: false, detached: process.platform !== 'win32',
+      cwd, env: gateEnvironment(process.env, keep), shell: false, detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe']
     });
     const finish = (code, childSignal) => {
@@ -62,9 +75,11 @@ export function executeCommand(command, { cwd, signal } = {}) {
   });
 }
 
-export async function executePlan(plan, options) {
+export async function executePlan(plan, options = {}) {
+  const declared = Array.isArray(plan.environment_passthrough) ? plan.environment_passthrough : [];
+  if (!declared.every(name => typeof name === 'string' && /^GAAI_[A-Z0-9_]+$/.test(name))) throw new Error('plan_invalid');
   const results = [];
-  for (const command of plan.selected_commands) results.push(await executeCommand(command, options));
+  for (const command of plan.selected_commands) results.push(await executeCommand(command, { ...options, keep: declared }));
   return results;
 }
 

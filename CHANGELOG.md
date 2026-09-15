@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: gate commands no longer inherit the delivery's GAAI_* state
 - ci(local-admission): record why a run was judged stale
 - test: make two suites independent of the environment the delivery wrapper inherits to them
 - fix: add the missing pre-commit dispatcher

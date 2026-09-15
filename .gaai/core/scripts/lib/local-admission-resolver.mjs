@@ -51,7 +51,12 @@ function runGit(repo, args, maxBuffer, reason = 'repository_unresolvable') {
 }
 
 function validatePolicy(policy, policyBytes, baseRef) {
-  if (!exactKeys(policy, POLICY_KEYS) || policy.schema_version !== VERSION
+  // environment_passthrough is the one optional key: the names (or PREFIX_*
+  // patterns) of GAAI_ variables the project lets its gate commands inherit.
+  // Absent means none. Everything else in the policy stays closed-world.
+  const declaresPassthrough = Object.hasOwn(policy, 'environment_passthrough');
+  if (!exactKeys(policy, declaresPassthrough ? [...POLICY_KEYS, 'environment_passthrough'] : POLICY_KEYS)
+      || policy.schema_version !== VERSION
       || !text(policy.policy_version)
       || !exactKeys(policy.repository, ['project_id', 'remote', 'base_ref'])
       || !text(policy.repository.project_id) || !text(policy.repository.remote)
@@ -73,6 +78,10 @@ function validatePolicy(policy, policyBytes, baseRef) {
     max_argument_bytes: argBytes } = policy.limits;
   if (!boundedId(policy.policy_version, idLimit)
       || !boundedId(policy.repository.project_id, idLimit)) fail('policy_malformed');
+  if (declaresPassthrough && (!Array.isArray(policy.environment_passthrough)
+      || !unique(policy.environment_passthrough)
+      || !policy.environment_passthrough.every(name => boundedId(name, idLimit)
+        && /^GAAI_[A-Z0-9]+(?:_[A-Z0-9]+)*(?:_\*)?$/.test(name)))) fail('policy_malformed');
   const commandIds = new Set();
   for (const command of policy.commands) {
     if (!exactKeys(command, COMMAND_KEYS) || !boundedId(command.id, idLimit) || commandIds.has(command.id))
@@ -271,7 +280,19 @@ export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyP
     };
     const missingFacts = policy.required_environment.filter(name => !Object.hasOwn(runtimeEnvironment, name));
     if (missingFacts.length) fail('environment_fact_missing', { fact_digests: missingFacts.map(digest) });
-    const facts = policy.required_environment.map(name => [name, runtimeEnvironment[name]]);
+    // The declared pass-through, resolved against this process: the exact names
+    // the executor will let through, each with a digest of its value. They join
+    // the environment facts, so the receipt binds what the commands actually
+    // saw — a changed value is a changed binding — and a policy that declares
+    // nothing binds exactly what it always did.
+    const passthroughRules = policy.environment_passthrough || [];
+    // A rule is an exact name or an underscore-delimited PREFIX_*. Only names the
+    // executor will accept (uppercase, digits, underscores) can match — anything
+    // else in the namespace is simply not part of the gate.
+    const passthroughNames = Object.keys(process.env).filter(name => /^GAAI_[A-Z0-9_]+$/.test(name)
+      && passthroughRules.some(rule => rule.endsWith('*') ? name.startsWith(rule.slice(0, -1)) : name === rule)).sort();
+    const facts = [...policy.required_environment.map(name => [name, runtimeEnvironment[name]]),
+      ...passthroughNames.map(name => [name, digest(process.env[name])])];
     const commands = policy.commands.filter(command => selected.has(command.id)).map(command => ({
       id: command.id, argv: materializeArgv(command.argv, baseSha, headSha),
       timeout_seconds: command.timeout_seconds,
@@ -295,7 +316,7 @@ export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyP
       changed_path_count: paths.length, rename_count: entries.filter(item => item.status.startsWith('R')).length,
       selected_surface_ids: [...surfaces].sort(), selected_command_ids: commands.map(item => item.id) };
     return { status: 'resolved', binding, binding_digest: summary.binding_digest,
-      selected_commands: commands, limits: { max_receipt_bytes: policy.limits.max_receipt_bytes,
+      selected_commands: commands, environment_passthrough: passthroughNames, limits: { max_receipt_bytes: policy.limits.max_receipt_bytes,
         max_result_bytes: policy.limits.max_result_bytes }, summary };
   } catch (error) {
     const reason = error instanceof AdmissionError ? error.reason : 'resolver_error';

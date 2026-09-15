@@ -60,21 +60,25 @@ _local_admission_note_stale() {
   local receipt_dir="$1" story="$2" boundary="$3" stage="$4"
   local bound="$5" observed="$6" summary_file="$7"
   local bound_base="$8" bound_head="$9" fresh_base="${10}" fresh_head="${11}"
-  local note="${receipt_dir}/.local-admission-${story}-${boundary}.stale.json" why
+  local note="${receipt_dir}/.local-admission-${story}-${boundary}.stale.json" why reason=""
+  # When the re-resolve rejected the candidate, the resolver wrote its reason
+  # into the summary file. That word — candidate_unsealed, repository_mismatch,
+  # candidate_stale — is the finding, so it travels with the note.
+  [[ -s "$summary_file" ]] && reason=$(node -e 'try{const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(s.status==="resolved"?"":String(s.reason||""))}catch{}' "$summary_file" 2>/dev/null || true)
   if [[ ! -s "$summary_file" ]]; then why=resolver_no_output
   elif [[ -z "$observed" ]]; then why=resolver_no_binding
   elif [[ "$bound_base" != "$fresh_base" ]]; then why=base_advanced
   elif [[ "$bound_head" != "$fresh_head" ]]; then why=head_advanced
   else why=binding_differs_without_ref_change; fi
-  ( umask 077; printf '{"story":"%s","boundary":"%s","stage":"%s","why":"%s",' \
-      "$story" "$boundary" "$stage" "$why"
+  ( umask 077; printf '{"story":"%s","boundary":"%s","stage":"%s","why":"%s","resolver_reason":"%s",' \
+      "$story" "$boundary" "$stage" "$why" "$reason"
     printf '"bound_binding":"%s","observed_binding":"%s",' "$bound" "$observed"
     printf '"bound_base":"%s","fresh_base":"%s","bound_head":"%s","fresh_head":"%s",' \
       "$bound_base" "$fresh_base" "$bound_head" "$fresh_head"
     printf '"recorded_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   ) > "$note" 2>/dev/null || true
-  printf '[LOCAL-ADMISSION] story=%s boundary=%s stale_reason=%s note=%s\n' \
-    "$story" "$boundary" "$why" "$note"
+  printf '[LOCAL-ADMISSION] story=%s boundary=%s stale_reason=%s resolver_reason=%s note=%s\n' \
+    "$story" "$boundary" "$why" "${reason:-none}" "$note"
 }
 
 _local_admission_resolve() {

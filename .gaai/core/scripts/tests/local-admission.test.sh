@@ -23,6 +23,9 @@ printf 'export const value = 1;\n' > "$REPO/src/value.mjs"
 cat > "$REPO/checks/unit.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'token=do-not-store-me\n'
+[[ -z "${GAAI_LEAK_PROBE:-}" ]] || exit 7
+[[ -z "${EXPECT_KEEP:-}" || -n "${GAAI_KEEP_PROBE:-}" ]] || exit 8
+[[ -z "${UNIT_MUTATE:-}" ]] || : > mutated.txt
 [[ "${1:-}" == '; touch /tmp/gaai-admission-pwned' ]]
 EOF
 chmod +x "$REPO/checks/unit.sh"
@@ -44,6 +47,7 @@ process.stdout.write(`${JSON.stringify({
   risk_input_policy:{keys:['cross_cutting','dependency_changed'],
     exhaustive_when_true:['cross_cutting','dependency_changed']},
   required_environment:['node_version','platform','arch','path_digest'],
+  environment_passthrough:['GAAI_KEEP_*','GAAI_ADVANCE_REPO'],
   executable_suffixes:['.sh','.js','.mjs','.json'],executable_names:['Dockerfile','Makefile']
 }, null, 2)}\n`);
 NODE
@@ -80,6 +84,49 @@ if (
 else
   fail 'symlink-aliased framework path skipped a local-admission entrypoint'
 fi
+
+# The delivery wrapper exports its phase state, including a pointer into the
+# live candidate worktree; the gate must not hand any of it to its commands.
+# What a command may inherit from the GAAI_ namespace is exactly what the
+# policy declares. checks/unit.sh exits 7 when it can see GAAI_LEAK_PROBE
+# (undeclared) and 8 when EXPECT_KEEP is set but GAAI_KEEP_PROBE (declared
+# through GAAI_KEEP_*) did not arrive.
+export GAAI_LEAK_PROBE=1 GAAI_KEEP_PROBE=kept EXPECT_KEEP=1
+if _run_local_admission pre_qa TST-ENV "$REPO" staging "$RECEIPTS" >/dev/null \
+   && [[ "$LOCAL_ADMISSION_OUTCOME" == pass ]]; then
+  pass 'gate commands inherit only the GAAI_* names the policy declares'
+else fail "GAAI_* pass-through contract (outcome=$LOCAL_ADMISSION_OUTCOME)"; fi
+unset GAAI_LEAK_PROBE GAAI_KEEP_PROBE EXPECT_KEEP
+node --input-type=module - "$EXECUTOR" <<'NODE'
+const { gateEnvironment } = await import(process.argv[2]);
+const env = gateEnvironment({ PATH: '/p', HOME: '/h', GAAI_QA_REPORT_PATH: '/x', GAAI_KEPT: 'k' }, ['GAAI_KEPT']);
+if (env.PATH !== '/p' || env.HOME !== '/h' || env.GAAI_KEPT !== 'k') process.exit(1);
+if (Object.hasOwn(env, 'GAAI_QA_REPORT_PATH')) process.exit(2);
+NODE
+[[ $? -eq 0 ]] && pass 'gateEnvironment keeps the declared GAAI_ names and drops the rest' \
+  || fail 'gateEnvironment contract'
+
+# A declared pass-through value is bound: changing it changes the binding.
+# An undeclared GAAI_ value is not part of the gate at all, so it does not.
+bind_of() { node -e 'const r=require(process.argv[1]);process.stdout.write(r.binding_digest)' "$RECEIPTS/.local-admission-$1-pre_qa.json"; }
+GAAI_KEEP_PROBE=a _run_local_admission pre_qa TST-BIND-A "$REPO" staging "$RECEIPTS" >/dev/null
+GAAI_KEEP_PROBE=b _run_local_admission pre_qa TST-BIND-B "$REPO" staging "$RECEIPTS" >/dev/null
+GAAI_KEEP_PROBE=a GAAI_LEAK_PROBE=x _run_local_admission pre_qa TST-BIND-C "$REPO" staging "$RECEIPTS" >/dev/null
+if [[ -n "$(bind_of TST-BIND-A)" && "$(bind_of TST-BIND-A)" != "$(bind_of TST-BIND-B)" \
+   && "$(bind_of TST-BIND-A)" == "$(bind_of TST-BIND-C)" ]]; then
+  pass 'a declared pass-through value is bound into the receipt; an undeclared one is not'
+else fail "pass-through binding: A=$(bind_of TST-BIND-A | cut -c1-8) B=$(bind_of TST-BIND-B | cut -c1-8) C=$(bind_of TST-BIND-C | cut -c1-8)"; fi
+
+# A command that mutates the candidate unseals it. The re-resolve then rejects
+# with candidate_unsealed, the run is stale although no ref moved, and the
+# note must say exactly that — this was undiagnosable for five cycles.
+STALE_NOTE="$RECEIPTS/.local-admission-TST-MUT-pre_qa.stale.json"
+UNIT_MUTATE=1 _run_local_admission pre_qa TST-MUT "$REPO" staging "$RECEIPTS" >/dev/null
+MUT_RC=$?; rm -f "$REPO/mutated.txt"
+if [[ $MUT_RC -ne 0 && "$LOCAL_ADMISSION_OUTCOME" == blocked:stale_evidence && -s "$STALE_NOTE" \
+   && "$(node -e 'const n=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(`${n.why}|${n.resolver_reason}|${n.bound_base===n.fresh_base&&n.bound_head===n.fresh_head}`)' "$STALE_NOTE")" == 'resolver_no_binding|candidate_unsealed|true' ]]; then
+  pass 'a command that mutates the candidate is reported stale with resolver_reason=candidate_unsealed and unmoved refs'
+else fail "mutating command: rc=$MUT_RC outcome=$LOCAL_ADMISSION_OUTCOME note=$(cut -c1-160 "$STALE_NOTE" 2>/dev/null)"; fi
 
 if _run_local_admission final TST-LA "$REPO" staging "$RECEIPTS" >/dev/null; then
   FINAL="$LOCAL_ADMISSION_RECEIPT_PATH"
@@ -135,15 +182,22 @@ git -C "$REPO" switch -q staging; git -C "$REPO" reset -q --hard origin/staging
 git -C "$REPO" switch -qC story/base-advance
 cat > "$REPO/checks/unit.sh" <<'EOF'
 #!/usr/bin/env bash
+# The updater repo arrives through the policy's declared pass-through. An
+# empty path would make git act on the candidate itself and pass this test
+# for the wrong reason, so refuse it.
+[[ -n "${GAAI_ADVANCE_REPO:-}" ]] || exit 9
 git -C "$GAAI_ADVANCE_REPO" push -q origin HEAD:staging
 EOF
 chmod +x "$REPO/checks/unit.sh"
 git -C "$REPO" add -A; git -C "$REPO" commit -qm advancing-command
 export GAAI_ADVANCE_REPO="$ADVANCE"
+BASE_NOTE="$RECEIPTS/.local-admission-TST-BASE-final.stale.json"
 if ! _run_local_admission final TST-BASE "$REPO" staging "$RECEIPTS" >/dev/null \
-  && [[ "$LOCAL_ADMISSION_OUTCOME" == blocked:stale_evidence ]]; then
-  pass 'second fetch rejects a base advanced while checks execute'
-else fail "base-currentness outcome=$LOCAL_ADMISSION_OUTCOME"; fi
+  && [[ "$LOCAL_ADMISSION_OUTCOME" == blocked:stale_evidence && -s "$BASE_NOTE" \
+    && "$(node -e 'const n=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(`${n.why}|${n.fresh_base}`)' "$BASE_NOTE")" \
+       == "base_advanced|$(git -C "$ADVANCE" rev-parse HEAD)" ]]; then
+  pass 'second fetch rejects a base advanced by the updater while checks execute, and the note names the advance'
+else fail "base-currentness outcome=$LOCAL_ADMISSION_OUTCOME note=$(cut -c1-160 "$BASE_NOTE" 2>/dev/null)"; fi
 git -C "$REPO" push -q --force origin "$BASE_SHA:staging"
 git -C "$REPO" fetch -q origin staging
 unset GAAI_ADVANCE_REPO
@@ -245,6 +299,12 @@ if (cancelled.outcome !== 'cancelled') process.exit(3);
 NODE
 [[ $? -eq 0 ]] && pass 'normal completion and timeout kill the process group; cancellation stays distinct' \
   || fail 'timeout/cancellation executor contract'
+
+# The corpus suite that installs an executor shim honouring GAAI_QA_REPORT_PATH
+# must never inherit that pointer from the process that runs it.
+if grep -qE '^unset GAAI_QA_REPORT_PATH GAAI_QA_VERDICT_PATH GAAI_PLAN_PATH' "$SCRIPT_DIR/tests/daemon-state-machine.test.sh"; then
+  pass 'the state-machine suite refuses the wrapper phase pointers at start'
+else fail 'daemon-state-machine.test.sh no longer unsets the wrapper phase pointers'; fi
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

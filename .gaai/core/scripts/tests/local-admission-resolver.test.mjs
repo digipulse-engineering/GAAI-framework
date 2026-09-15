@@ -159,6 +159,30 @@ test('configuration and required environment values invalidate the binding', asy
   assert.equal(resolve(fx, RISK, {}).reason, 'environment_fact_missing');
 });
 
+test('declared pass-through names are bound by value and carried to the executor; the rest stay out', async t => {
+  const withRule = p => { p.environment_passthrough = ['GAAI_PT_*', 'GAAI_PT_EXACT']; };
+  const fx = await fixture(t, { alterPolicy: withRule });
+  const saved = { ...process.env };
+  t.after(() => { for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key]; Object.assign(process.env, saved); });
+  delete process.env.GAAI_PT_EXACT;
+  process.env.GAAI_PT_ONE = 'one'; process.env.GAAI_NOT_DECLARED = 'x'; process.env.GAAI_PT_lower = 'ignored';
+  const first = resolve(fx, RISK);
+  assert.equal(first.status, 'resolved');
+  assert.deepEqual(first.environment_passthrough, ['GAAI_PT_ONE']);
+  process.env.GAAI_NOT_DECLARED = 'y';
+  assert.equal(resolve(fx, RISK).binding.environment_digest, first.binding.environment_digest);
+  process.env.GAAI_PT_ONE = 'two';
+  assert.notEqual(resolve(fx, RISK).binding.environment_digest, first.binding.environment_digest);
+  process.env.GAAI_PT_EXACT = 'e';
+  assert.deepEqual(resolve(fx, RISK).environment_passthrough, ['GAAI_PT_EXACT', 'GAAI_PT_ONE']);
+  const plain = await fixture(t);
+  assert.deepEqual(resolve(plain, RISK).environment_passthrough, []);
+  for (const bad of [['NOT_GAAI'], ['GAAI_A', 'GAAI_A'], 'GAAI_A', ['gaai_lower'], ['GAAI_*'], ['GAAI_A*B'], ['GAAI_A*'], ['GAAI__X']]) {
+    const broken = await fixture(t, { alterPolicy: p => { p.environment_passthrough = bad; } });
+    assert.equal(resolve(broken, RISK).reason, 'policy_malformed', JSON.stringify(bad));
+  }
+});
+
 test('selector and command descriptor values independently invalidate their digests', async t => {
   const ordinary = await fixture(t);
   const changed = await fixture(t, { alterPolicy: value => {
