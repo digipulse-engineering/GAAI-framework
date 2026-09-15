@@ -586,11 +586,30 @@ fi
 DISC_BASE=""; DISC_ROOT_OK=1
 # RUNNER_TEMP is a candidate for direct hosted runs; the closed-matrix lane
 # runs under `env -i` and does not pass it, and is saved by HOME instead.
-for cand in "${HOME:-}" "${RUNNER_TEMP:-}" "$TMP_ROOT"; do
+# Last resort: the repository's git common directory. Under the delivery
+# daemon HOME and TMPDIR both live beneath /tmp — a world-writable ancestor —
+# so none of the roots above can qualify there, while .git/ sits on the
+# operator's own path and is never part of the working tree.
+_yr_git_scratch=""
+if command -v git >/dev/null 2>&1; then
+  _yr_git_scratch="$(git -C "$SCRIPT_DIR" rev-parse --git-common-dir 2>/dev/null)" || _yr_git_scratch=""
+  if [ -n "$_yr_git_scratch" ] && [ -d "$_yr_git_scratch" ]; then
+    _yr_git_scratch="$(cd "$_yr_git_scratch" && pwd -P)/gaai"
+    mkdir -p "$_yr_git_scratch" 2>/dev/null || _yr_git_scratch=""
+  else
+    _yr_git_scratch=""
+  fi
+fi
+for cand in "${HOME:-}" "${RUNNER_TEMP:-}" "$TMP_ROOT" "$_yr_git_scratch"; do
   [ -n "$cand" ] && [ -d "$cand" ] && [ -w "$cand" ] || continue
   probe="$(mktemp -d "$cand/.gaai-yaml-disc.XXXXXX" 2>/dev/null)" || continue
   chmod 0700 "$probe"
-  if _yr_audit_owner_chain "$probe" 2>/dev/null; then
+  # Audit what the runtime will audit: it resolves a candidate before walking
+  # its ancestors, and on macOS /tmp is a symlink into /private/tmp (1777) that
+  # lstat reports as 0755. Auditing the unresolved path accepts a root the
+  # runtime must then refuse, and 2.i blames the predicate for the harness.
+  probe_real="$(cd "$probe" 2>/dev/null && pwd -P)" || probe_real="$probe"
+  if _yr_audit_owner_chain "$probe_real" 2>/dev/null; then
     DISC_BASE="$probe"
     break
   fi
