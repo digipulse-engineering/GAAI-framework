@@ -10,6 +10,10 @@
 #     Returns: 0=landed (safe to hard-delete), 1=not verifiably landed (fail-closed)
 #   _worktree_branch_delete_or_preserve <sid> <branch> <caller_tag>
 #     Returns: 0=branch handled (deleted, or already gone), 1=preserved by rename
+#     Preservation replicates the tip to refs/gaai/preserved/<name> on origin
+#     first. Replication never blocks the rename, but an unreplicated
+#     preservation is recorded as replicated=no in the audit line and always
+#     logged, outside the throttle.
 #
 # Env vars (all optional, have defaults):
 #   GAAI_WORKTREE_COMMITS_AHEAD_MAX  — commits-ahead threshold (default 100)
@@ -345,12 +349,53 @@ _worktree_branch_delete_or_preserve() {
   _tip=$(git -C "$_project_dir" rev-parse "$branch" 2>/dev/null || echo "unknown")
   _preserved_name="${branch}-preserved-$(date -u +%Y%m%dT%H%M%SZ)"
 
+  # Replicate the tip before the local ref moves.
+  #
+  # A rename preserves nothing durable on its own. The renamed ref lives in one
+  # object store, nothing pushes it, and when that store loses the object the
+  # work is unrecoverable while the ref name survives — so the audit trail below
+  # goes on describing a preservation that no longer has a commit behind it.
+  # That is not hypothetical: it is the observed state of several preserved refs
+  # in a real repository, discovered only because an unrelated fetch broke on
+  # them. The name outliving the commit is the quietest possible failure.
+  #
+  # The push therefore happens BEFORE the rename, into a private namespace so a
+  # preserved tip never appears in the branch list of a collaborator's clone.
+  # That namespace is already proven to round-trip on a hosted forge by the id
+  # allocator, which uses the same prefix.
+  #
+  # Replication is NOT allowed to block preservation. Offline, unauthenticated
+  # and read-only-remote are all normal, and refusing to rename in those cases
+  # would convert a network condition into a stalled delivery for no data-safety
+  # gain — nothing is destroyed either way. What must never happen is a silent
+  # unreplicated preservation, so the outcome is recorded in the audit line and
+  # an unreplicated one bypasses the operator-log throttle entirely.
+  local _preserved_ref="refs/gaai/preserved/${_preserved_name}"
+  local _replicated=no _remote_tip=""
+  if [[ "$_tip" =~ ^[0-9a-f]{40}$ || "$_tip" =~ ^[0-9a-f]{64}$ ]]; then
+    if git -C "$_project_dir" push --quiet origin "${_tip}:${_preserved_ref}" 2>/dev/null; then
+      # Judge by what the remote actually holds, not by the push's exit status.
+      _remote_tip=$(git -C "$_project_dir" ls-remote origin "$_preserved_ref" 2>/dev/null \
+        | awk '{print $1}')
+      [[ "$_remote_tip" == "$_tip" ]] && _replicated=yes
+    fi
+  fi
+
   git -C "$_project_dir" branch -m "$branch" "$_preserved_name" 2>/dev/null || true
 
   mkdir -p "$_lock_dir" 2>/dev/null || true
-  printf '%s|%s|%s|%s|%s\n' \
+  # Sixth field appended; the first five keep their positions and meaning so
+  # existing readers are unaffected.
+  printf '%s|%s|%s|%s|%s|replicated=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" "$_preserved_name" "$_tip" "$caller_tag" \
+    "$_replicated" \
     >> "$_audit_log" 2>/dev/null || true
+
+  # An unreplicated preservation is a data-safety event, not routine progress:
+  # say so every time, outside the throttle, and name what to do about it.
+  if [[ "$_replicated" != yes ]]; then
+    echo "[WORKTREE-GUARD] ${sid} : branch ${branch} preserved LOCALLY ONLY as ${_preserved_name} (tip=${_tip}) — replication to ${_preserved_ref} did not land; this work exists in exactly one object store. Push it or copy it out before that store is pruned, re-cloned or lost." >&2
+  fi
 
   # AC4: single-fire log throttle per sid (mirrors the reconcile-sweep
   # unmerged-marker pattern) — the audit line above is always written (every
