@@ -309,12 +309,17 @@ gaai_harness_mark() {
 
 # gaai_harness_autodetect <HARNESS> <LOG_PATH>
 #
-# Call after a FAILED phase. Parks the harness on a structured error code, else
-# on a known message, else once it has failed enough times in a row that the
-# reason stops mattering. All three layers are configuration, and the last one
-# is what makes the first two optional: a provider can reword its error, ship it
-# localised, or fail in a way nobody anticipated, and a harness that keeps
-# failing is unusable whether or not we can explain why.
+# Call after a FAILED phase. Parks the harness on structured evidence only —
+# how the session ended, the provider's last rate-limit verdict, the last error
+# the harness raised (a structured code first, then a known message) — else once
+# it has failed enough times in a row that the reason stops mattering. Free text
+# in the transcript never counts: a story about rate limiting mentions every
+# signature word without the provider refusing a single request. A session that
+# ended on its own turn or spend cap is not evidence about the harness at all.
+# Every layer is configuration, and the last one is what makes the others
+# optional: a provider can reword its error, ship it localised, or fail in a way
+# nobody anticipated, and a harness that keeps failing is unusable whether or
+# not we can explain why.
 #
 # Returns 0 when the harness was parked, 1 when it was left in rotation.
 gaai_harness_autodetect() {
@@ -325,9 +330,10 @@ gaai_harness_autodetect() {
 
   local out
   if out=$(node "$(_gaai_router_bin)" harness-observe --harness "$harness" --log "$log_path" 2>/dev/null); then
-    local until_at
+    local until_at via
     until_at=$(sed -n 's/.*"until": *"\([^"]*\)".*/\1/p' <<<"$out" | head -1)
-    echo "[ROUTING] harness=${harness} marked QUOTA_EXHAUSTED until ${until_at:-<backoff>} (out-of-budget signature in ${log_path##*/})"
+    via=$(sed -n 's/.*"via": *"\([^"]*\)".*/\1/p' <<<"$out" | head -1)
+    echo "[ROUTING] harness=${harness} marked QUOTA_EXHAUSTED until ${until_at:-<backoff>} (out-of-budget ${via:-evidence} in ${log_path##*/})"
     return 0
   fi
   return 1

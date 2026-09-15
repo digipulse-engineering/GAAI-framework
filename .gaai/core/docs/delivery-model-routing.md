@@ -295,28 +295,38 @@ status file, where `QUOTA_EXHAUSTED` expires on its TTL so a spent quota heals
 itself → a PATH probe for the harness binary.
 
 The daemon parks a harness automatically when a failed phase shows it is
-unusable. Three layers, cheapest and most reliable first, all of them
-configuration (`quota_detection`):
+unusable. Only structured evidence counts: a phase log carries everything the
+agent said, read and ran, and an agent working on rate limiting writes "429"
+and "rate_limit" all day without the provider refusing a single request. Free
+text inside assistant, user or tool-result content is never read. What is,
+cheapest and most reliable first, all of it configuration (`quota_detection`):
 
-1. **A structured error code** in the JSON payload (`code`, `type`,
-   `error_type`), read from the payload itself — never scraped out of prose,
-   which would just be signature matching wearing a different hat.
-2. **A known message**, matched case-insensitively against the tail of the log.
-   Deliberately narrow: a generic 5xx or a timeout is not a quota signal, and
-   mis-parking a harness costs real capacity.
-3. **A consecutive-failure circuit breaker**, which is what makes the first two
-   optional.
+1. **How the session ended** — the final `result` event. A session that ended
+   on one of its own ceilings (max turns, max spend) was being answered right
+   up to the cap: it is not out of budget, and that verdict outranks anything
+   the log said on the way there. It neither parks the harness nor counts
+   toward the breaker.
+2. **The provider's last verdict** — the most recent `rate_limit_event`, when
+   its status is not one under which the provider still serves. It carries the
+   reset time, so it beats every message-based hint.
+3. **The last error the harness raised**, and the terminal result when it is
+   itself an error — a structured `code`/`type`/status field listed in `codes`
+   first, then the provider's own message matched case-insensitively against
+   `signatures`. Deliberately narrow: a generic 5xx or a timeout is not a quota
+   signal, and mis-parking a harness costs real capacity.
+4. **A consecutive-failure circuit breaker**, which is what makes the first
+   three optional.
 
-That third layer is the point. A provider can reword its error, ship it
+That last layer is the point. A provider can reword its error, ship it
 localised, or fail in a way nobody anticipated — and a harness that keeps
 failing is unusable whether or not we can explain why. After a configured run of
 consecutive failed phases the harness is parked regardless of cause, and any
 success clears the count so unrelated stories never accumulate into a park.
 
 Not every harness emits a structured code today: one CLI's exec stream carries
-only `{type, message}` with human prose, which is exactly why layer 2 exists and
-why layer 3 is the one that has to hold. The code path costs nothing and wins
-the day it becomes available.
+only `{type, message}` with human prose, which is exactly why the message layer
+exists and why the breaker is the one that has to hold. The code path costs
+nothing and wins the day it becomes available.
 
 When the provider states when it will resume, that beats the flat backoff. A
 one-hour default park against a reset a day and a half out would wake the
@@ -342,6 +352,13 @@ evaluate block as `AVAILABILITY` — retryable, not a failed story.
 > provider actually says *"You've hit your usage limit"* — so a spent quota went
 > undetected and every phase kept spawning against a dead harness. The captured
 > wording is now a test fixture.
+>
+> And match them only against what the harness raised, never against what the
+> model wrote. The second version ran the signatures over the whole log tail and
+> parked a healthy harness for an hour: the story under review was about rate
+> limiting, so the agent's own transcript contained every signature word, while
+> the session had actually ended on its turn cap. That transcript is now a test
+> fixture too.
 
 ### Harness features
 

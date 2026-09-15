@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: admit GAAI_QA_MAX_TURNS through the entry allowlist
+- fix: classify harness quota exhaustion from structured evidence only
 - fix: replicate a preserved branch tip instead of only renaming it
 - test: audit the discovery root the way the runtime will, and keep a clean root under the daemon
 - fix: gate commands no longer inherit the delivery's GAAI_* state

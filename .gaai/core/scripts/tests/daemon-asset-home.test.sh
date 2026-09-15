@@ -420,6 +420,18 @@ for _n in GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED; do
   fi
 done
 
+# Every phase turn cap the wrapper reads must be admitted here, or the operator's
+# exported value silently collapses to the wrapper's built-in default. The QA cap
+# was absent from the list while the impl cap was present, so `GAAI_QA_MAX_TURNS`
+# set at launch never reached the QA phase.
+for _n in GAAI_MAX_TURNS GAAI_IMPL_MAX_TURNS GAAI_QA_MAX_TURNS; do
+  if sed -n '/^_GAAI_CONFIG_ALLOW=/,/'"'"'$/p' "$START" | grep -qw "$_n"; then
+    pass "ENTRY-config[allow]: $_n is in _GAAI_CONFIG_ALLOW"
+  else
+    fail "ENTRY-config[allow]: $_n is not in _GAAI_CONFIG_ALLOW — the operator's cap never reaches the wrapper"
+  fi
+done
+
 # The daemon child re-runs this entry inside the pane, whose environment the private
 # server copies from the parent — including the three values above. Section 4 refuses
 # any inherited GIT_* member, so the pane command must strip them before the child's

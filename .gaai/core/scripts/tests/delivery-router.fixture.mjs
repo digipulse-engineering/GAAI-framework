@@ -11,7 +11,7 @@
 import { describe, test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync,
+  mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, symlinkSync, existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -680,9 +680,135 @@ describe('out-of-budget detection', () => {
     assert.equal(observeQuota(log, cfg, 'codex').matched, false);
   });
 
+  // The second real failure was of the detection itself. The phase under review
+  // was about rate limiting, so the agent's own transcript carried every
+  // signature word — in its reasoning, its grep, and a tool result echoing a
+  // 429 error object verbatim — while the session actually ended on its turn
+  // cap. Matching the log tail as prose parked a healthy harness for an hour.
+  const HARNESS = Object.keys(SHIPPED.harnesses).find((h) => !h.startsWith('_'));
+  const failedOnSomethingElse = '{"type":"result","subtype":"error_during_execution","is_error":true,'
+    + '"num_turns":7,"errors":["process exited"],"api_error_status":null}';
+
+  test('a session that ran out of turns is not out of budget, whatever the transcript says', () => {
+    const obs = observeQuota(fixture('harness-max-turns-noisy'), SHIPPED, HARNESS);
+    assert.equal(obs.matched, false);
+    assert.equal(obs.localCap, true);
+    assert.equal(obs.terminal, 'error_max_turns');
+  });
+
+  test('signature words inside assistant, user and tool-result content never count', () => {
+    // The same transcript, ending in a failure the transcript does not explain.
+    const transcript = fixture('harness-max-turns-noisy').split('\n')
+      .filter((l) => !l.includes('"type":"result"'));
+    const log = [...transcript, failedOnSomethingElse].join('\n');
+    assert.equal(observeQuota(log, SHIPPED, HARNESS).matched, false);
+  });
+
+  test('a turn cap outranks a rate-limit verdict recorded earlier in the same log', () => {
+    const log = [
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}',
+      '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":101}',
+    ].join('\n');
+    const obs = observeQuota(log, SHIPPED, HARNESS);
+    assert.equal(obs.matched, false);
+    assert.equal(obs.localCap, true);
+  });
+
+  test('a rejected rate-limit verdict parks the harness and carries its own reset', () => {
+    const obs = observeQuota(fixture('harness-rate-limit-rejected'), SHIPPED, HARNESS);
+    assert.equal(obs.matched, true);
+    assert.equal(obs.via, 'rate_limit_event');
+    assert.ok(obs.resetAt && Date.parse(obs.resetAt) > Date.now(), 'reset stamp not recovered');
+  });
+
+  test('a serving rate-limit status is not a verdict, even beside a rejected overage', () => {
+    // A live event under an allowed status still carries "overageStatus":
+    // "rejected" — a substring match on the word would park a serving harness.
+    const resets = Math.floor(Date.now() / 1000) + 3600;
+    const log = [
+      `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":${resets},"overageStatus":"rejected"}}`,
+      `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":${resets},"overageStatus":"rejected"}}`,
+      failedOnSomethingElse,
+    ].join('\n');
+    assert.equal(observeQuota(log, SHIPPED, HARNESS).matched, false);
+  });
+
+  test('the most recent verdict wins over an earlier rejection', () => {
+    const log = [
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}',
+      '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}',
+      failedOnSomethingElse,
+    ].join('\n');
+    assert.equal(observeQuota(log, SHIPPED, HARNESS).matched, false);
+  });
+
+  test('a 429 the harness itself raised parks the harness', () => {
+    const log = [
+      '{"type":"system","subtype":"api_retry","attempt":3,"max_retries":3,"retry_delay_ms":8000,"error_status":429,"error":"rate_limit"}',
+      '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":4,"errors":["API Error: 429 rate limit"],"api_error_status":429}',
+    ].join('\n');
+    const obs = observeQuota(log, SHIPPED, HARNESS);
+    assert.equal(obs.matched, true);
+    assert.equal(obs.via, 'code');
+  });
+
+  test('an event-level error class counts; the same words in the content do not', () => {
+    const content = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"rate_limit 429 quota exceeded"}]}}';
+    assert.equal(observeQuota(content, SHIPPED, HARNESS).matched, false);
+    const flagged = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"opaque"}]},"error":"rate_limit"}';
+    assert.equal(observeQuota(flagged, SHIPPED, HARNESS).matched, true);
+  });
+
+  test('a transient error raised last is not rescued by an older quota error', () => {
+    const log = [
+      '{"type":"error","message":"You\'ve hit your usage limit."}',
+      '{"type":"turn.failed","error":{"message":"request failed after 3 attempts: ECONNRESET"}}',
+    ].join('\n');
+    assert.equal(observeQuota(log, SHIPPED, HARNESS).matched, false);
+  });
+
   test('backoff bounds keep a park useful and reversible', () => {
     assert.ok(QUOTA_TTL_MIN_SEC >= 60, 'a sub-minute park just churns');
     assert.ok(QUOTA_TTL_MAX_SEC <= 30 * 24 * 3600, 'a park this long retires a provider silently');
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+describe('harness-observe marks only on structured evidence', () => {
+  // What the daemon actually calls after a failed phase, end to end: the
+  // classification above, then the status file the next spawn will route on.
+  const routerPath = join(LIB, 'delivery-router.mjs');
+  const HARNESS = Object.keys(SHIPPED.harnesses).find((h) => !h.startsWith('_'));
+  const statusDir = () => join(tmp, 'hs');
+  const statusFile = () => join(statusDir(), `${HARNESS}.json`);
+  const observe = (log) => spawnSync(process.execPath, [
+    routerPath, 'harness-observe', '--harness', HARNESS, '--log', log, '--config', SHIPPED_CONFIG_PATH,
+  ], { encoding: 'utf8', env: { ...process.env, GAAI_HARNESS_STATUS_DIR: statusDir() } });
+  const logFixture = (name) => join(HERE, 'fixtures', `${name}.log`);
+
+  beforeEach(() => { process.env.GAAI_HARNESS_STATUS_DIR = statusDir(); });
+  afterEach(() => { delete process.env.GAAI_HARNESS_STATUS_DIR; });
+
+  test('a noisy transcript ending on the turn cap leaves the harness in rotation', () => {
+    const r = observe(logFixture('harness-max-turns-noisy'));
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.match(r.stdout, /"terminal": "error_max_turns"/);
+    assert.equal(existsSync(statusFile()), false, 'harness was marked');
+  });
+
+  test('a turn-cap exit does not count toward the breaker either', () => {
+    writeBreaker(HARNESS, 1);
+    observe(logFixture('harness-max-turns-noisy'));
+    assert.equal(readBreaker(HARNESS).consecutive, 1);
+  });
+
+  test('a rejected rate-limit verdict marks the harness with an expiry', () => {
+    const r = observe(logFixture('harness-rate-limit-rejected'));
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /"via": "rate_limit_event"/);
+    const rec = JSON.parse(readFileSync(statusFile(), 'utf8'));
+    assert.equal(rec.status, 'QUOTA_EXHAUSTED');
+    assert.ok(Date.parse(rec.until) > Date.now(), 'park has no future expiry');
   });
 });
 
