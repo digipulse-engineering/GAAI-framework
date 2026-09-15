@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: replicate a preserved branch tip instead of only renaming it
 - test: audit the discovery root the way the runtime will, and keep a clean root under the daemon
 - fix: gate commands no longer inherit the delivery's GAAI_* state
 - ci(local-admission): record why a run was judged stale

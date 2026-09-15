@@ -244,6 +244,93 @@ else
   fail "T4c: expected rc=1 for both calls, got rc1=${_rc_t4_1} rc2=${_rc_t4_2}"
 fi
 
+# ── T8: preservation REPLICATES the tip to the remote before renaming ───────
+# A rename alone preserves nothing durable: the ref lives in one object store and
+# nothing pushes it, so losing that store loses the work while the name survives.
+echo ""
+echo "T8: preservation pushes the tip to refs/gaai/preserved/* and records it"
+T8="${FIXTURE_BASE}/t8"
+setup_fixture "$T8"
+make_unpushed_branch "$T8" "T8"
+
+PROJECT_DIR="${T8}_main"
+LOCK_DIR="${T8}_main/.gaai-locks"
+mkdir -p "$LOCK_DIR"
+TARGET_BRANCH="staging"
+
+_t8_tip=$(git -C "${T8}_main" rev-parse story/T8)
+( _worktree_branch_delete_or_preserve "T8" "story/T8" "test-replication" ) >/dev/null 2>&1
+_rc_t8=$?
+
+_t8_preserved=$(git -C "${T8}_main" for-each-ref --format='%(refname:short)' "refs/heads/story/T8-preserved-*" | head -1)
+_t8_remote_tip=$(git -C "${T8}_main" ls-remote origin "refs/gaai/preserved/${_t8_preserved}" 2>/dev/null | awk '{print $1}')
+
+if [[ "$_t8_remote_tip" == "$_t8_tip" ]]; then
+  pass "T8a: preserved tip is on the remote at refs/gaai/preserved/* with the exact SHA"
+else
+  fail "T8a: remote tip '${_t8_remote_tip}' != local tip '${_t8_tip}' — work is unreplicated"
+fi
+
+if grep -qE '\|T8\|.*\|replicated=yes$' "${LOCK_DIR}/.branch-preserved.audit" 2>/dev/null; then
+  pass "T8b: audit line records replicated=yes"
+else
+  fail "T8b: audit line missing replicated=yes"
+fi
+
+# The object must survive deletion of the local ref — that is the whole point.
+git -C "${T8}_main" branch -D "$_t8_preserved" >/dev/null 2>&1
+if git -C "${T8}_remote.git" cat-file -e "$_t8_tip" 2>/dev/null; then
+  pass "T8c: tip survives in the remote object store after the local ref is gone"
+else
+  fail "T8c: tip lost once the local ref was deleted — replication did not protect it"
+fi
+
+[[ "$_rc_t8" -eq 1 ]] && pass "T8d: still returns 1 (preserved)" || fail "T8d: expected rc=1, got ${_rc_t8}"
+
+# ── T9: replication failure must be loud, un-throttled, and honestly recorded ─
+# Offline / unauthenticated / read-only remote are normal. Preservation must not
+# be blocked by them, but it must never be silently reported as safe.
+echo ""
+echo "T9: unreachable remote → still preserved, recorded replicated=no, logged every time"
+T9="${FIXTURE_BASE}/t9"
+setup_fixture "$T9"
+make_unpushed_branch "$T9" "T9"
+
+PROJECT_DIR="${T9}_main"
+LOCK_DIR="${T9}_main/.gaai-locks"
+mkdir -p "$LOCK_DIR"
+TARGET_BRANCH="staging"
+git -C "${T9}_main" remote set-url origin "${FIXTURE_BASE}/does-not-exist.git"
+
+_t9_tip=$(git -C "${T9}_main" rev-parse story/T9)
+_t9_out1=$( ( _worktree_branch_delete_or_preserve "T9" "story/T9" "test-offline-1" ) 2>&1 )
+_rc_t9=$?
+
+if git -C "${T9}_main" for-each-ref --format='%(refname:short)' "refs/heads/story/T9-preserved-*" | grep -q .; then
+  pass "T9a: preserved locally despite the unreachable remote (network never blocks preservation)"
+else
+  fail "T9a: preservation was blocked by a network failure"
+fi
+
+if grep -qE '\|T9\|.*\|replicated=no$' "${LOCK_DIR}/.branch-preserved.audit" 2>/dev/null; then
+  pass "T9b: audit line records replicated=no — no false claim of safety"
+else
+  fail "T9b: audit line does not record replicated=no"
+fi
+
+case "$_t9_out1" in
+  *"LOCALLY ONLY"*) pass "T9c: operator log names the unreplicated preservation" ;;
+  *) fail "T9c: unreplicated preservation was not surfaced to the operator" ;;
+esac
+
+# Second event within the throttle window: the throttle must NOT suppress it.
+make_unpushed_branch "$T9" "T9"
+_t9_out2=$( ( _worktree_branch_delete_or_preserve "T9" "story/T9" "test-offline-2" ) 2>&1 )
+case "$_t9_out2" in
+  *"LOCALLY ONLY"*) pass "T9d: second unreplicated preservation also logged (throttle bypassed)" ;;
+  *) fail "T9d: throttle suppressed a data-safety event" ;;
+esac
+
 # ── gh stub for the (a2) merged-PR clause ────────────────────────────────────
 # Answers BOTH call shapes on purpose, so T5 is a true regression test rather
 # than a test that only passes because the implementation changed:
