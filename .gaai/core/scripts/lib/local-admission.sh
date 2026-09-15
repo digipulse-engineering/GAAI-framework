@@ -46,6 +46,37 @@ _local_admission_reject_with_plan() {
     "$results_digest" "$binding_digest" "$outcome" "$limit" "$receipt_dir"
 }
 
+# Record why an admission run was judged stale, next to the receipts.
+#
+# "stale_evidence" is reported for three different situations: the re-resolve
+# produced no output at all, it produced output with no binding_digest, or it
+# produced a binding that differs from the bound one. Only the third is actual
+# staleness. The three are indistinguishable downstream, the verify path deletes
+# the receipt, and the scratch directory is removed — so a blocked run leaves
+# nothing that says which happened, or whether the base moved at all.
+#
+# Evidence only: no gate semantics, no outcome renamed, failures ignored.
+_local_admission_note_stale() {
+  local receipt_dir="$1" story="$2" boundary="$3" stage="$4"
+  local bound="$5" observed="$6" summary_file="$7"
+  local bound_base="$8" bound_head="$9" fresh_base="${10}" fresh_head="${11}"
+  local note="${receipt_dir}/.local-admission-${story}-${boundary}.stale.json" why
+  if [[ ! -s "$summary_file" ]]; then why=resolver_no_output
+  elif [[ -z "$observed" ]]; then why=resolver_no_binding
+  elif [[ "$bound_base" != "$fresh_base" ]]; then why=base_advanced
+  elif [[ "$bound_head" != "$fresh_head" ]]; then why=head_advanced
+  else why=binding_differs_without_ref_change; fi
+  ( umask 077; printf '{"story":"%s","boundary":"%s","stage":"%s","why":"%s",' \
+      "$story" "$boundary" "$stage" "$why"
+    printf '"bound_binding":"%s","observed_binding":"%s",' "$bound" "$observed"
+    printf '"bound_base":"%s","fresh_base":"%s","bound_head":"%s","fresh_head":"%s",' \
+      "$bound_base" "$fresh_base" "$bound_head" "$fresh_head"
+    printf '"recorded_at":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ) > "$note" 2>/dev/null || true
+  printf '[LOCAL-ADMISSION] story=%s boundary=%s stale_reason=%s note=%s\n' \
+    "$story" "$boundary" "$why" "$note"
+}
+
 _local_admission_resolve() {
   local resolver="$1" repo="$2" base_ref="$3" base_sha="$4" head_sha="$5"
   local policy="$6" risk="$7" output="$8"
@@ -125,6 +156,9 @@ _run_local_admission() {
       "$policy" "$risk" "$fresh" 2>/dev/null || true)
     fresh_binding=$(node -e 'const s=JSON.parse(process.argv[1]||"{}");process.stdout.write(s.binding_digest||"")' "$fresh_summary" 2>/dev/null || true)
     if [[ ! -s "$fresh" || -z "$fresh_binding" || "$fresh_binding" != "$binding_digest" ]]; then
+      _local_admission_note_stale "$receipt_dir" "$story" "$boundary" post_run \
+        "$binding_digest" "$fresh_binding" "$fresh" \
+        "$base_sha" "$head_sha" "$fresh_base" "$fresh_head" || true
       outcome="blocked:stale_evidence"
     else
       seal_plan="$fresh"; seal_binding="$fresh_binding"
@@ -142,6 +176,9 @@ _run_local_admission() {
     verify_binding=$(node -e 'const s=JSON.parse(process.argv[1]||"{}");process.stdout.write(s.binding_digest||"")' "$verify_summary" 2>/dev/null || true)
   fi
   if [[ -z "${verify_binding:-}" || "$verify_binding" != "$seal_binding" ]]; then
+    _local_admission_note_stale "$receipt_dir" "$story" "$boundary" post_seal \
+      "$seal_binding" "${verify_binding:-}" "$verify" \
+      "$base_sha" "$head_sha" "$fresh_base" "$fresh_head" || true
     LOCAL_ADMISSION_OUTCOME="blocked:stale_evidence"
     rm -f "$LOCAL_ADMISSION_RECEIPT_PATH" 2>/dev/null || true; LOCAL_ADMISSION_RECEIPT_PATH=""
     _local_admission_cleanup "$scratch"; return 1
