@@ -667,6 +667,14 @@ mkdir -p "$S20_RED_REPO/.gaai" "$S20_RED_REPO/.gaai/project/contexts/backlog" \
 chmod 700 "$S20_RED_STATE" "$S20_RED_STATE/local-admission-receipts" \
   "$S20_RED_STATE/external-merge-settlements"
 cp -R "$SCRIPT_DIR/../.." "$S20_RED_REPO/.gaai/core"
+# The yaml runtime demands its vendored assets at exactly 0644 and refuses
+# group/other-writable directories. cp materialises the copy through the
+# inherited umask (077 under the delivery wrapper -> 0600), which fails that
+# check for the copy under test. Under the daemon this stayed hidden: the lane
+# passed only with the wrapper's environment present (bisected to a real-valued
+# GAAI_REPO_ROOT; the runtime itself does not read it, and the masking path was
+# not traced). The fixture must not depend on either. Fix the modes.
+chmod -R u=rwX,go=rX "$S20_RED_REPO/.gaai/core"
 printf '%s\n' 'items: []' > "$S20_RED_REPO/.gaai/project/contexts/backlog/active.backlog.yaml"
 git init --bare "$S20_RED_REMOTE" -q
 git -C "$S20_RED_REPO" init -q
@@ -731,6 +739,14 @@ mkdir -p "$S20_VALID_REPO/.gaai" "$S20_VALID_REPO/.gaai/project/contexts/backlog
 chmod 700 "$S20_VALID_STATE" "$S20_VALID_STATE/local-admission-receipts" \
   "$S20_VALID_STATE/external-merge-settlements"
 cp -R "$SCRIPT_DIR/../.." "$S20_VALID_REPO/.gaai/core"
+# The yaml runtime demands its vendored assets at exactly 0644 and refuses
+# group/other-writable directories. cp materialises the copy through the
+# inherited umask (077 under the delivery wrapper -> 0600), which fails that
+# check for the copy under test. Under the daemon this stayed hidden: the lane
+# passed only with the wrapper's environment present (bisected to a real-valued
+# GAAI_REPO_ROOT; the runtime itself does not read it, and the masking path was
+# not traced). The fixture must not depend on either. Fix the modes.
+chmod -R u=rwX,go=rX "$S20_VALID_REPO/.gaai/core"
 git init --bare "$S20_VALID_REMOTE" -q
 git -C "$S20_VALID_REPO" init -q
 git -C "$S20_VALID_REPO" config user.email test@example.invalid
