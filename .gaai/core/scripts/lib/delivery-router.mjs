@@ -274,22 +274,53 @@ export function setHarnessStatus(harness, status, opts = {}) {
 }
 
 /**
+ * Result subtypes that mean the session ran into one of its own ceilings — a
+ * turn cap, a spend cap, a structured-output retry cap. A session that hit one
+ * of these was being answered right up to the cap, which is the opposite of an
+ * out-of-budget provider, whatever earlier events in the log said.
+ */
+export const LOCAL_CAP_SUBTYPES = Object.freeze([
+  'error_max_turns', 'error_max_budget_usd', 'error_max_structured_output_retries',
+]);
+
+/** `rate_limit_event` statuses under which the provider is still serving. */
+const RATE_LIMIT_SERVING_STATUSES = new Set(['allowed', 'allowed_warning']);
+
+/**
  * Reads a failed phase's log for evidence that a harness is out of budget.
  *
- * Signatures are configuration, not code, because every provider words this
- * differently and the wording changes. The detection is deliberately narrow:
- * a 5xx or a timeout is not a quota signal, and mis-parking a harness costs
- * real capacity.
+ * Only structured evidence counts. A phase log carries everything the agent
+ * said, read and ran, and an agent working on rate limiting or credentials
+ * writes "429" and "rate_limit" all day without the provider refusing a single
+ * request. So the classifier reads the stream's own status events and the
+ * error objects the harness raised, and never the free text inside assistant,
+ * user or tool-result content:
+ *
+ *   1. how the session ended — the final `result` event. A session that ended
+ *      on a local cap (max turns, max spend, ...) is not out of budget, and
+ *      that verdict outranks anything the log said on the way there;
+ *   2. the provider's last verdict — the most recent `rate_limit_event`, when
+ *      its status is not one under which the provider still serves;
+ *   3. the last error the harness raised, and the terminal result when it is
+ *      itself an error — read for a structured `code`/`type`/status first,
+ *      then for a known message.
+ *
+ * Signatures stay configuration because every provider words this differently
+ * and the wording changes; they only ever run against error messages the
+ * harness itself raised. A 5xx or a timeout is still not a quota signal, and
+ * mis-parking a harness still costs real capacity.
  *
  * When the provider says when it will resume, that beats a flat backoff. A
- * default one-hour park against a reset that is a day and a half out would wake
- * the harness dozens of times, each waking costing a real phase spawn to fail
- * the same way.
+ * default one-hour park against a reset that is a day and a half out would
+ * wake the harness dozens of times, each waking costing a real phase spawn to
+ * fail the same way.
  *
  * @param {string} logText
  * @param {object} cfg
  * @param {string} [harness]
- * @returns {{matched: boolean, signature: string|null, resetAt: string|null, resetRaw: string|null}}
+ * @returns {{matched: boolean, signature: string|null, via: string|null,
+ *            resetAt: string|null, resetRaw: string|null,
+ *            terminal: string|null, localCap: boolean}}
  */
 export function observeQuota(logText, cfg, harness = '') {
   const perHarness = cfg?.harnesses?.[harness]?.quota_detection;
@@ -297,27 +328,58 @@ export function observeQuota(logText, cfg, harness = '') {
   const signatures = perHarness?.signatures || shared.signatures || [];
   const hints = perHarness?.reset_hints || shared.reset_hints || [];
   const codes = perHarness?.codes || shared.codes || [];
-  const text = String(logText || '');
 
-  // Cheapest and most reliable signal first: a structured code the provider
-  // emits. Today one harness's exec stream carries only `{type, message}` with
-  // prose, but others do return codes, and the one that does not may start —
-  // so the code path costs nothing and wins the day it becomes available.
+  const events = parseEvents(String(logText || ''));
+  const result = findLast(events, (e) => e.type === 'result');
+  const terminal = result && typeof result.subtype === 'string' ? result.subtype : null;
+  const none = {
+    matched: false, signature: null, via: null, resetAt: null, resetRaw: null, terminal, localCap: false,
+  };
+
+  // 1. How the session ended.
+  if (terminal && LOCAL_CAP_SUBTYPES.includes(terminal)) return { ...none, localCap: true };
+
+  // 2. The provider's last verdict. It carries the reset time itself, so it
+  //    beats every message-based hint.
+  const verdict = findLast(events, (e) => e.type === 'rate_limit_event');
+  if (verdict) {
+    const info = verdict.rate_limit_info && typeof verdict.rate_limit_info === 'object'
+      ? verdict.rate_limit_info : verdict;
+    const status = typeof info.status === 'string' ? info.status.toLowerCase() : '';
+    if (status && !RATE_LIMIT_SERVING_STATUSES.has(status)) {
+      const at = epochToIso(info.resetsAt ?? info.resets_at);
+      return {
+        ...none, matched: true, via: 'rate_limit_event', signature: `rate_limit_event:${status}`,
+        resetAt: at, resetRaw: at,
+      };
+    }
+  }
+
+  // 3. The last error the harness raised, plus the terminal result when it is
+  //    itself an error. A structured code wins over the prose.
+  const evidence = [];
+  const lastError = findLast(events, (e) => e.type !== 'result' && errorEvidence(e) !== null);
+  if (lastError) evidence.push(errorEvidence(lastError));
+  if (result && result.is_error === true) evidence.push(resultEvidence(result));
+
+  const wanted = new Set(codes.map((c) => String(c).toLowerCase()));
   let signature = null;
   let via = null;
-  const codeFound = findErrorCode(text, codes);
-  if (codeFound) { signature = codeFound; via = 'code'; }
-
-  // Otherwise fall back to matching the prose.
+  for (const ev of evidence) {
+    const hit = ev.codes.find((c) => wanted.has(c.toLowerCase()));
+    if (hit) { signature = hit; via = 'code'; break; }
+  }
+  const texts = evidence.flatMap((ev) => ev.texts);
   if (!signature) {
     for (const sig of signatures) {
       let re;
       try { re = new RegExp(sig, 'i'); } catch { continue; }
-      if (re.test(text)) { signature = sig; via = 'signature'; break; }
+      if (texts.some((t) => re.test(t))) { signature = sig; via = 'signature'; break; }
     }
   }
-  if (!signature) return { matched: false, signature: null, via: null, resetAt: null, resetRaw: null };
+  if (!signature) return none;
 
+  const text = texts.join('\n');
   for (const hint of hints) {
     let m;
     try { m = text.match(new RegExp(hint, 'i')); } catch { continue; }
@@ -327,47 +389,102 @@ export function observeQuota(logText, cfg, harness = '') {
     const cleaned = m[1].replace(/(\d+)(st|nd|rd|th)\b/gi, '$1').trim();
     const at = Date.parse(cleaned);
     if (Number.isFinite(at) && at > Date.now()) {
-      return { matched: true, signature, via, resetAt: new Date(at).toISOString(), resetRaw: m[1].trim() };
+      return { ...none, matched: true, signature, via, resetAt: new Date(at).toISOString(), resetRaw: m[1].trim() };
     }
   }
-  return { matched: true, signature, via, resetAt: null, resetRaw: null };
+  return { ...none, matched: true, signature, via };
 }
 
 /**
- * Looks for a structured error code in the JSON events a harness streams.
- * Only `code`/`type`/`error_type` fields count — matching a code against free
- * prose would just be signature matching wearing a different hat.
+ * The JSON events in a phase log. A phase log is the harness's event stream
+ * with stderr merged in, so prose lines and a line cut by the tail window both
+ * occur; neither is an event.
  * @param {string} text
- * @param {string[]} codes
- * @returns {string|null}
+ * @returns {object[]}
  */
-function findErrorCode(text, codes) {
-  if (!codes.length) return null;
-  const wanted = new Set(codes.map((c) => c.toLowerCase()));
+function parseEvents(text) {
+  const events = [];
   for (const line of text.split('\n')) {
     const t = line.trim();
     if (!t.startsWith('{')) continue;
     let parsed;
     try { parsed = JSON.parse(t); } catch { continue; }
-    const found = scanForCode(parsed, wanted, 0);
-    if (found) return found;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) events.push(parsed);
+  }
+  return events;
+}
+
+function findLast(events, pred) {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (pred(events[i])) return events[i];
   }
   return null;
 }
 
-function scanForCode(node, wanted, depth) {
-  if (depth > 6 || !node || typeof node !== 'object') return null;
-  for (const [k, v] of Object.entries(node)) {
-    if (typeof v === 'string' && ['code', 'type', 'error_type', 'error_code'].includes(k)
-        && wanted.has(v.toLowerCase())) {
-      return v;
+/** Provider reset stamps arrive as epoch seconds, occasionally milliseconds. */
+function epochToIso(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const ms = n > 1e11 ? n : n * 1000;
+  return ms > Date.now() ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * The error a harness event raised, if it raised one: structured
+ * `code`/`type`/status fields and the provider's own message text. This is the
+ * whole allow-list of where evidence may come from — an error event, an API
+ * retry notice, an error item in an item stream, an error object hung on an
+ * event, or an event-level error class. Every other field of every other event
+ * is content the model or a tool produced, and never counts.
+ * @param {object} event
+ * @returns {{codes: string[], texts: string[]}|null}
+ */
+function errorEvidence(event) {
+  if (!event || typeof event !== 'object') return null;
+  const type = typeof event.type === 'string' ? event.type : '';
+  const codes = [];
+  const texts = [];
+  const take = (obj, depth = 0) => {
+    if (!obj || typeof obj !== 'object' || depth > 3) return;
+    for (const k of ['code', 'type', 'error_type', 'error_code']) {
+      if (typeof obj[k] === 'string') codes.push(obj[k]);
     }
-    if (v && typeof v === 'object') {
-      const nested = scanForCode(v, wanted, depth + 1);
-      if (nested) return nested;
+    for (const k of ['status', 'error_status', 'status_code', 'api_error_status']) {
+      if (Number.isFinite(obj[k])) codes.push(String(obj[k]));
     }
+    if (typeof obj.error === 'string') codes.push(obj.error);   // an error class, never prose
+    if (typeof obj.message === 'string') texts.push(obj.message);
+    if (obj.error && typeof obj.error === 'object') take(obj.error, depth + 1);
+  };
+
+  if (type === 'error' || type.endsWith('.failed')
+      || (type === 'system' && typeof event.subtype === 'string' && event.subtype.startsWith('api_'))) {
+    take(event);                                   // the event is the error
+  } else if (event.item && typeof event.item === 'object' && event.item.type === 'error') {
+    take(event.item);                              // an error item in an item stream
+  } else if (typeof event.error === 'string') {
+    codes.push(event.error);                       // event-level error class on a message
+  } else if (event.error && typeof event.error === 'object') {
+    take(event.error);                             // an error object hung on the event
   }
-  return null;
+  return codes.length || texts.length ? { codes, texts } : null;
+}
+
+/**
+ * What the terminal `result` says about the failure: the API status the
+ * session ended on and the harness's own error strings. Never the transcript.
+ * @param {object} result
+ * @returns {{codes: string[], texts: string[]}}
+ */
+function resultEvidence(result) {
+  const codes = [];
+  const texts = [];
+  if (Number.isFinite(result.api_error_status)) codes.push(String(result.api_error_status));
+  if (Array.isArray(result.errors)) {
+    for (const e of result.errors) if (typeof e === 'string') texts.push(e);
+  }
+  if (typeof result.result === 'string') texts.push(result.result);
+  return { codes, texts };
 }
 
 // ── Circuit breaker ────────────────────────────────────────────────────────
@@ -1132,6 +1249,16 @@ function main(argv) {
       return 2;
     }
     const obs = observeQuota(text, config, opts.harness);
+    if (!obs.matched && obs.localCap) {
+      // The session ran into one of its own ceilings. That is a verdict on the
+      // story, not on the harness — which was answering right up to the cap —
+      // so it neither parks the harness nor counts toward the breaker.
+      process.stdout.write(`${JSON.stringify({
+        matched: false, via: 'result', terminal: obs.terminal,
+        consecutive: readBreaker(opts.harness).consecutive,
+      }, null, 2)}\n`);
+      return 1;
+    }
     if (!obs.matched) {
       // Nothing recognisable in the log. That is not proof the harness is
       // healthy — only that we cannot explain this failure. Count it, and park
@@ -1154,7 +1281,7 @@ function main(argv) {
         return 0;
       }
       process.stdout.write(`${JSON.stringify({
-        matched: false, consecutive, threshold,
+        matched: false, consecutive, threshold, terminal: obs.terminal,
       }, null, 2)}\n`);
       return 1;
     }

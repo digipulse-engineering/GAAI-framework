@@ -233,7 +233,7 @@
     }
   },
   "quota_detection": {
-    "_doc": "How a harness is recognised as out of budget, cheapest and most reliable signal first: a structured error `code`/`type` in the JSON payload if the provider emits one, then `signatures` matched case-insensitively against the tail of the log, then the wording-independent `circuit_breaker`. Deliberately narrow: a 5xx or a timeout is NOT a quota signal, and mis-parking a harness costs real capacity. `reset_hints` are regexes whose first capture group is a human-readable resume time; when one parses, it sets the backoff instead of the flat default, so a harness is not woken early only to burn another spawn failing.",
+    "_doc": "How a harness is recognised as out of budget from a failed phase's log. Only structured evidence counts — the stream's own status events and the error objects the harness raised — never the free text inside assistant, user or tool-result content, which mentions rate limits whenever the story is about them. Order: the final `result` event (a session that ended on its own turn or spend cap is NOT out of budget, and that outranks everything else), then the last `rate_limit_event` (a non-serving status parks, and its reset stamp sets the backoff), then the last error object — a structured `code`/`type`/status listed in `codes` first, then its message matched case-insensitively against `signatures` — then the wording-independent `circuit_breaker`. Deliberately narrow: a 5xx or a timeout is NOT a quota signal, and mis-parking a harness costs real capacity. `reset_hints` are regexes whose first capture group is a human-readable resume time; when one parses, it sets the backoff instead of the flat default, so a harness is not woken early only to burn another spawn failing.",
     "signatures": [
       "usage limit",
       "rate limit",
@@ -247,6 +247,8 @@
     "codes": [
       "rate_limit_reached",
       "rate_limit_error",
+      "rate_limit",
+      "429",
       "usage_limit_reached",
       "credits_depleted",
       "insufficient_quota",
