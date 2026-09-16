@@ -67,11 +67,11 @@ _final() {
   # fixture regression that skipped assertions without recording a fail still
   # showed status=pass and CI (which greps status=pass$) stayed green. Raise
   # this number when assertions are added; never lower it to make a run pass.
-  # 151 is the compiler-less interactive minimum; the closed matrix and local
+  # 156 is the compiler-less interactive minimum; the closed matrix and local
   # admission turn every conditional executing-image negative into a FAIL rather
   # than a SKIP, so the floor never masks a vanished negative there (the rebuild
   # proof at 8.a stays gated on GAAI_YAML_TEST_SDIST, per the header).
-  YAML_RUNTIME_PASS_FLOOR=151
+  YAML_RUNTIME_PASS_FLOOR=156
   if [ "$FAIL_COUNT" -eq 0 ] && [ "$ABORTED" -eq 0 ] \
      && [ "$PASS_COUNT" -ge "$YAML_RUNTIME_PASS_FLOOR" ]; then
     status=pass
@@ -604,12 +604,12 @@ for cand in "${HOME:-}" "${RUNNER_TEMP:-}" "$TMP_ROOT" "$_yr_git_scratch"; do
   [ -n "$cand" ] && [ -d "$cand" ] && [ -w "$cand" ] || continue
   probe="$(mktemp -d "$cand/.gaai-yaml-disc.XXXXXX" 2>/dev/null)" || continue
   chmod 0700 "$probe"
-  # Audit what the runtime will audit: it resolves a candidate before walking
-  # its ancestors, and on macOS /tmp is a symlink into /private/tmp (1777) that
-  # lstat reports as 0755. Auditing the unresolved path accepts a root the
-  # runtime must then refuse, and 2.i blames the predicate for the harness.
-  probe_real="$(cd "$probe" 2>/dev/null && pwd -P)" || probe_real="$probe"
-  if _yr_audit_owner_chain "$probe_real" 2>/dev/null; then
+  # The audit resolves the path itself before walking (2.t-2.w prove it), so
+  # the probe asks exactly the question selection asks. On macOS /tmp is a
+  # symlink into /private/tmp (1777) that lstat reports as 0755; a root under
+  # it is refused here for the same reason the runtime refuses it, instead of
+  # being accepted on the unresolved spelling and blamed on 2.i.
+  if _yr_audit_owner_chain "$probe" 2>/dev/null; then
     DISC_BASE="$probe"
     break
   fi
@@ -792,6 +792,137 @@ if [ "$HOSTILE_OUT" = "6.0.3" ] && [ ! -f "$TMP_ROOT/hostile/marker" ]; then
   pass "2.s hostile PYTHONPATH/startup/user-site cannot reach the runtime"
 else
   fail "2.s ambient influence was observable: out=$HOSTILE_OUT marker=$( [ -f "$TMP_ROOT/hostile/marker" ] && echo present || echo absent)"
+fi
+
+# 2.t-2.w Both owner-chain predicates judge the RESOLVED chain, and judge it
+# identically. lstat reports a symlink component with the link's own owner and
+# mode, and on some platforms a link is created 0755: walked unresolved, a chain
+# that crosses such a link into a world-writable directory looks clean at every
+# step. The in-process predicate resolves before it walks; the shell audit must
+# resolve too, or a root the shell admits is one the runtime then refuses.
+# Fixture, inside the private discovery base: a 1777 directory and a 0755
+# directory, each reached through a symlink. The unresolved spellings are alike
+# at every component; the resolved chains differ at exactly one. No /tmp and no
+# platform symlink is involved, so this reproduces on any platform. Which case
+# binds the fix depends on how lstat reports a link: where links are created
+# 0755 the unresolved walk admits the loose chain and 2.u catches it; where a
+# link reads 0777 the unresolved walk refuses every link and 2.t catches it
+# instead; 2.w catches it everywhere.
+_chain_fixture() {
+  # _chain_fixture <base> — every step checked: a failed step is a harness
+  # fault and must not surface as a "refused" verdict that 2.u would accept.
+  mkdir -p "$1/loose/bin" "$1/clean/bin" \
+  && cp "$NATIVE_SAMPLE" "$1/loose/bin/python3.14" \
+  && cp "$NATIVE_SAMPLE" "$1/clean/bin/python3.14" \
+  && chmod 0755 "$1" "$1/loose/bin" "$1/clean" "$1/clean/bin" \
+       "$1/loose/bin/python3.14" "$1/clean/bin/python3.14" \
+  && chmod 1777 "$1/loose" \
+  && ln -s loose "$1/loose-link" \
+  && ln -s clean "$1/clean-link" \
+  && [ -L "$1/loose-link" ] && [ -L "$1/clean-link" ] \
+  && [ -f "$1/loose-link/bin/python3.14" ] && [ -f "$1/clean-link/bin/python3.14" ]
+}
+if [ "$DISC_ROOT_OK" != 1 ]; then
+  echo "  SKIP: 2.t-2.w symlinked-chain cases not evaluable in this environment (reported as a harness failure above)"
+elif [ -n "$NATIVE_SAMPLE" ] && [ -n "$REAL_PY" ] && [ -x "$REAL_PY" ] && _chain_fixture "$DISC_BASE/chain"; then
+  CHAIN_BASE="$DISC_BASE/chain"
+  CLEAN_VIA_LINK="$CHAIN_BASE/clean-link/bin/python3.14"
+  LOOSE_VIA_LINK="$CHAIN_BASE/loose-link/bin/python3.14"
+  CLEAN_REAL="$(_yr_canonicalize "$CLEAN_VIA_LINK")"
+  LOOSE_REAL="$(_yr_canonicalize "$LOOSE_VIA_LINK")"
+
+  _chain_verdict() {
+    # _chain_verdict <path> — the shell audit's verdict, one word
+    if _yr_audit_owner_chain "$1" 2>/dev/null; then printf 'ok'; else printf 'refused'; fi
+  }
+
+  # Positive control first: a symlink component is not itself a reason to
+  # refuse, so a refusal below is about the resolved chain and nothing else.
+  if [ "$(_chain_verdict "$CLEAN_VIA_LINK")" = "ok" ]; then
+    pass "2.t a symlink whose resolved chain is clean is admitted by the shell audit"
+  else
+    fail "2.t the shell audit refused a symlink whose resolved chain is clean"
+  fi
+  if [ "$(_chain_verdict "$LOOSE_VIA_LINK")" = "refused" ]; then
+    pass "2.u a symlink whose resolved chain crosses a world-writable directory is refused by the shell audit"
+  else
+    fail "2.u the shell audit admitted an unresolved chain that resolves through a world-writable directory"
+  fi
+
+  # The in-process predicate: each program's own function text, called the way
+  # attest_interpreter calls it -- on os.path.realpath of the declared path.
+  printf '%s\n' "$_YR_BOOTSTRAP" > "$TMP_ROOT/chain-bootstrap.py"
+  printf '%s\n' "$_YR_NORMALIZE" > "$TMP_ROOT/chain-normalize.py"
+  cat > "$TMP_ROOT/chain-probe.py" <<'PY'
+import os
+import stat
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    source = handle.read()
+start = source.index("\ndef owner_chain_ok(")
+end = source.index("\ndef ", start + 1)
+namespace = {"os": os, "stat": stat}
+exec(compile(source[start:end], "<owner-chain-probe>", "exec"), namespace)
+verdicts = []
+for path in sys.argv[2:]:
+    verdicts.append("ok" if namespace["owner_chain_ok"](os.path.realpath(path)) else "refused")
+sys.stdout.write(" ".join(verdicts) + "\n")
+PY
+  PY_VERDICTS="$("$REAL_PY" -I -S -B "$TMP_ROOT/chain-probe.py" "$TMP_ROOT/chain-bootstrap.py" \
+    "$CLEAN_VIA_LINK" "$LOOSE_VIA_LINK" "$CLEAN_REAL" "$LOOSE_REAL" 2>/dev/null)"
+  NORM_VERDICTS="$("$REAL_PY" -I -S -B "$TMP_ROOT/chain-probe.py" "$TMP_ROOT/chain-normalize.py" \
+    "$CLEAN_VIA_LINK" "$LOOSE_VIA_LINK" "$CLEAN_REAL" "$LOOSE_REAL" 2>/dev/null)"
+  SHELL_VERDICTS="$(_chain_verdict "$CLEAN_VIA_LINK") $(_chain_verdict "$LOOSE_VIA_LINK") $(_chain_verdict "$CLEAN_REAL") $(_chain_verdict "$LOOSE_REAL")"
+  if [ "$PY_VERDICTS" = "ok refused ok refused" ] && [ "$NORM_VERDICTS" = "$PY_VERDICTS" ]; then
+    pass "2.v the in-process predicate admits the clean chain and refuses the world-writable one, resolved or not, in both programs"
+  else
+    fail "2.v the in-process predicate returned unexpected verdicts: bootstrap=[$PY_VERDICTS] normalize=[$NORM_VERDICTS]"
+  fi
+  if [ "$SHELL_VERDICTS" = "$PY_VERDICTS" ] && [ "$SHELL_VERDICTS" = "ok refused ok refused" ]; then
+    pass "2.w the shell audit and the in-process predicate return the same verdict for every spelling of both chains"
+  else
+    fail "2.w the two owner-chain predicates disagree: shell=[$SHELL_VERDICTS] python=[$PY_VERDICTS]"
+  fi
+else
+  fail "2.t the symlinked-chain fixtures could not be prepared (native sample, declared interpreter, or a fixture step failed)"
+fi
+
+# 2.x An empty or relative argument is refused without being resolved against
+# the working directory, and refused promptly: before the audit resolved its
+# input, a relative spelling of an EXISTING file walked `dirname` towards "."
+# forever (a missing one merely failed its first stat), so the relative probe
+# names a real file under a clean chain and the audit runs under a watchdog: a
+# regression fails the case instead of hanging the suite.
+_audit_bounded() {
+  # _audit_bounded <path> — prints ok | refused | hung
+  local rc_file="$TMP_ROOT/audit-bounded.rc" pid ticks=0
+  rm -f "$rc_file"
+  ( _yr_audit_owner_chain "$1" >/dev/null 2>&1; printf '%s' "$?" > "$rc_file" ) &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$ticks" -lt 50 ]; do
+    sleep 0.1
+    ticks=$(( ticks + 1 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    printf 'hung'
+    return 0
+  fi
+  wait "$pid" 2>/dev/null
+  case "$(cat "$rc_file" 2>/dev/null)" in
+    0) printf 'ok' ;;
+    *) printf 'refused' ;;
+  esac
+}
+mkdir -p "$TMP_ROOT/rel/bin" && printf 'x' > "$TMP_ROOT/rel/bin/python3.14" \
+  && chmod 0755 "$TMP_ROOT/rel" "$TMP_ROOT/rel/bin" "$TMP_ROOT/rel/bin/python3.14"
+EMPTY_VERDICT="$(_audit_bounded "")"
+RELATIVE_VERDICT="$(cd "$TMP_ROOT" && _audit_bounded "rel/bin/python3.14")"
+if [ "$EMPTY_VERDICT" = "refused" ] && [ "$RELATIVE_VERDICT" = "refused" ]; then
+  pass "2.x an empty or relative argument is refused by the shell audit without resolving against the working directory"
+else
+  fail "2.x the shell audit did not refuse an empty or relative argument promptly: empty=$EMPTY_VERDICT relative=$RELATIVE_VERDICT"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════

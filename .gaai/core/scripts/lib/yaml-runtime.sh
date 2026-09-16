@@ -242,12 +242,39 @@ _yr_native_magic() {
 # ── Discovery-mode ownership / writability audit ─────────────────────────────
 # owner in {root, euid} and no group/other write, on the canonical target and on
 # every canonical ancestor directory up to the root.
+# The chain is resolved HERE, not by the caller. The verdict has to be a
+# property of the object on disk, never of the spelling a caller chose: an
+# lstat walk over an unresolved path reads a symlink component's own owner and
+# mode, and where links are created 0755 a link into a world-writable tree
+# passes every step that its real ancestors would fail. The in-process
+# predicate resolves before it walks (owner_chain_ok on os.path.realpath), so
+# this audit does the same and the two verdicts cannot part on a symlinked
+# ancestor. Resolution reads link targets only -- nothing is opened or run --
+# and is bounded (realpath(1), or the 32-hop fallback); a chain that resolves
+# into a tree this audit refuses is refused for what it is, which is the
+# point. The verdict is about the object the path resolves to, exactly as the
+# in-process predicate's is; the binding of the executing image in-process is
+# what closes the window between this audit and the exec, as before.
+# Selection hands in a canonical path already, so there resolution is the
+# identity and the verdict is unchanged. An empty or relative argument is
+# refused before resolution: resolving it would answer about the working
+# directory (or, in the fallback resolver, about wherever `cd` is sent), an
+# object the caller never named. It also ends the walk's dependence on the
+# input reaching "/", which a relative input never did.
 _yr_audit_owner_chain() {
   local PATH="$_YR_SAFE_PATH"
   local path="$1" euid owner mode reading
   local IFS=$' \t\n'
   euid="$(id -u 2>/dev/null)" || return 1
-  reading="$path"
+  case "$path" in
+    /*) ;;
+    *) return 1 ;;
+  esac
+  reading="$(_yr_canonicalize "$path")" || return 1
+  case "$reading" in
+    /*) ;;
+    *) return 1 ;;
+  esac
   while :; do
     owner=""
     mode=""

@@ -2661,6 +2661,20 @@ for needle in required:
     if cursor < 0:
         raise SystemExit(1)
 
+# Per-phase turn caps must be baked into the wrapper. The QA and plan phases run
+# THERE, and daemon-dispatch.sh reads them from the wrapper's environment; the
+# daemon's own environment is not inherited through its private tmux server.
+# Admitting a cap through the entry allowlist alone strands it in the daemon while
+# the phase silently runs at the dispatch default.
+#
+# The `${VAR:-}` form is asserted deliberately: baking a literal default here would
+# give the default two homes (this generator and daemon-dispatch.sh), which drift
+# apart silently. Empty is correct — `:-` treats it as unset, so dispatch's own
+# default applies and stays the single source.
+for _cap in ("GAAI_QA_MAX_TURNS", "GAAI_PLAN_MAX_TURNS"):
+    if 'export %s="${%s:-}"' % (_cap, _cap) not in wrapper:
+        raise SystemExit(1)
+
 relaunch = daemon[daemon.index("_forward_relaunch() {"):daemon.index("_forward_retained_settle() {")]
 last = daemon[daemon.index("_forward_last_edge_guard() {"):daemon.index("_forward_context_path() {")]
 if '_forward_worktree_state "$sid" "$allow_absent"' not in last:
