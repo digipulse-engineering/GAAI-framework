@@ -200,6 +200,53 @@ resolve_3phase_log() {
   fi
 }
 
+# The local-admission gate is a phase of its own that the markers do not name.
+# Before the QA agent (boundary pre_qa) and before publication (commit phase) the
+# wrapper runs the deterministic gate for tens of minutes; the agent's per-phase
+# log does not exist until the gate has passed, so the display used to show the
+# next phase with "[no log yet]" and nothing else. The wrapper log records the
+# two edges: "[HH:MM:SS] <sid> phase=<qa|commit> starting" when the gate begins,
+# and "[LOCAL-ADMISSION] story=<sid> boundary=<b> outcome=<o> ..." when it ends
+# (a "stale_reason=" line precedes a blocked outcome). Between the two the gate
+# is running.
+# Prints one line — "running <elapsed_s>", "passed <boundary>",
+# "blocked <boundary> <outcome> <stale_reason|->" — or nothing when no gate is
+# in flight for that phase.
+detect_admission_gate() {
+  local story_id="$1" phase="$2"
+  local wlog="${LOG_DIR}/${story_id}.wrapper.log"
+  [[ -f "$wlog" ]] || return 0
+  local text last_start ln ts after adm outcome boundary stale
+  # Only the tail matters: agent transcripts inflate this log, and the gate's
+  # lines are the most recent ones. Non-printable bytes are dropped so the
+  # anchored patterns below see clean lines.
+  text=$(tail -c 262144 "$wlog" 2>/dev/null | LC_ALL=C tr -cd '\11\12\15\40-\176')
+  last_start=$(printf '%s\n' "$text" | grep -nE "^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ${story_id} phase=${phase} starting" | tail -1)
+  [[ -n "$last_start" ]] || return 0
+  ln="${last_start%%:*}"
+  ts=$(printf '%s' "$last_start" | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+  after=$(printf '%s\n' "$text" | tail -n +"$(( ln + 1 ))")
+  # A later phase edge means the gate is over whatever it printed.
+  printf '%s\n' "$after" | grep -qE "^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ${story_id} phase=" && return 0
+  adm=$(printf '%s\n' "$after" | grep -E "^\[LOCAL-ADMISSION\] story=${story_id} boundary=[A-Za-z0-9_]+ outcome=" | tail -1)
+  if [[ -z "$adm" ]]; then
+    local now_s start_s elapsed
+    now_s=$(( 10#$(date +%H) * 3600 + 10#$(date +%M) * 60 + 10#$(date +%S) ))
+    start_s=$(( 10#${ts:0:2} * 3600 + 10#${ts:3:2} * 60 + 10#${ts:6:2} ))
+    elapsed=$(( now_s - start_s )); (( elapsed < 0 )) && elapsed=$(( elapsed + 86400 ))
+    echo "running $elapsed"
+    return 0
+  fi
+  boundary=$(printf '%s' "$adm" | grep -oE 'boundary=[A-Za-z0-9_]+' | head -1); boundary="${boundary#boundary=}"
+  outcome=$(printf '%s' "$adm" | grep -oE 'outcome=[A-Za-z0-9_:]+' | head -1); outcome="${outcome#outcome=}"
+  if [[ "$outcome" == pass ]]; then
+    echo "passed $boundary"
+  else
+    stale=$(printf '%s\n' "$after" | grep -E "^\[LOCAL-ADMISSION\] story=${story_id} boundary=${boundary} stale_reason=" | tail -1 | grep -oE 'stale_reason=[A-Za-z0-9_]+' | head -1)
+    echo "blocked $boundary $outcome ${stale#stale_reason=}"
+  fi
+}
+
 # Returns the display phase label for a 3phase story using authoritative markers.
 # AC1: markers take priority over phase_status for in-progress display.
 detect_phase_3phase() {
@@ -699,11 +746,40 @@ while true; do
         else
           printf '%b%s%b\n' "$CYAN" "$story_id" "$NC"
         fi
-        printf '  Phase: %b%s%b\n' "$YELLOW" "$phase_label" "$NC"
-        echo -e "  ${DIM}${log_path}${NC}"
+        # The gate before QA / commit is not a marker phase; say what is running.
+        gate=""
+        case "$phase_label" in
+          QA)     gate=$(detect_admission_gate "$story_id" qa) ;;
+          COMMIT) gate=$(detect_admission_gate "$story_id" commit) ;;
+        esac
+        # QA is three stages: 1/3 the deterministic admission gate, 2/3 the QA
+        # agent, 3/3 the publication gate at the commit phase.
+        stage="QA 1/3"; next_stage="2/3 agent"; gate_name="admission gate"
+        if [[ "$phase_label" == COMMIT ]]; then stage="QA 3/3"; next_stage="publication"; gate_name="publication gate"; fi
+        case "$gate" in
+          running\ *)
+            printf '  Phase: %b%s%b — %s running (%s)\n' "$YELLOW" "$stage" "$NC" "$gate_name" "$(format_duration "${gate#running }")"
+            echo -e "  ${DIM}deterministic gate (governance + OSS corpus); the ${next_stage} follows when it passes${NC}"
+            ;;
+          passed\ *)
+            printf '  Phase: %b%s%b — %s %s passed, %s starting\n' "$YELLOW" "$stage" "$NC" "$gate_name" "${gate#passed }" "$next_stage"
+            echo -e "  ${DIM}${log_path}${NC}"
+            ;;
+          blocked\ *)
+            set -- $gate
+            printf '  Phase: %b%s%b — %s %s %bBLOCKED%b (%s%s)\n' "$YELLOW" "$stage" "$NC" "$gate_name" "$2" "$RED" "$NC" "$3" "${4:+, $4}"
+            echo -e "  ${DIM}the wrapper hands the story back to the daemon; the ${next_stage} does not run on this cycle${NC}"
+            ;;
+          *)
+            printf '  Phase: %b%s%b\n' "$YELLOW" "$phase_label" "$NC"
+            echo -e "  ${DIM}${log_path}${NC}"
+            ;;
+        esac
         echo ""
         continue
       fi
+      # The agent's log exists: for QA that is stage 2/3 of the phase.
+      [[ "$phase_label" == QA ]] && phase_label="QA 2/3 agent"
       parse_log "$log_path" "$story_id" "3phase" "$phase_label"
     else
       # Legacy: unchanged path
