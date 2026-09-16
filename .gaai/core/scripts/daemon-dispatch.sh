@@ -1484,7 +1484,12 @@ reap_orphaned_worktrees() {
   [[ -d "$_base" ]] || return 0
 
   local _target="${TARGET_BRANCH:-staging}"
-  git -C "$PROJECT_DIR" fetch origin "$_target" --quiet 2>/dev/null || true
+  # A failed fetch leaves origin/<target> stale; every integration signal below
+  # would then be judged against evidence that is not current. Skip the sweep.
+  if ! git -C "$PROJECT_DIR" fetch origin "$_target" --quiet 2>/dev/null; then
+    log "${YELLOW:-}[WT-REAP] fetch of origin/${_target} failed — sweep skipped this cycle${NC:-}"
+    return 0
+  fi
 
   local _proj_real
   _proj_real=$(realpath "${REPO_ROOT:-$PROJECT_DIR}" 2>/dev/null || echo "${REPO_ROOT:-$PROJECT_DIR}")
@@ -1523,14 +1528,40 @@ reap_orphaned_worktrees() {
     _porcelain=$(git -C "$_wt" status --porcelain 2>/dev/null); _rc=$?
     { (( _rc != 0 )) || [[ -n "$_porcelain" ]]; } && continue
 
-    # Integration signal 1: PR MERGED/CLOSED (branch-independent, authoritative).
+    # Integration signal 1: a PR on this head, MERGED or CLOSED, that belongs to
+    # the CURRENT cycle. Story branch names are reused across cycles, so a PR
+    # merged in an earlier cycle also answers this query; it proves nothing about
+    # the cycle that owns the worktree now. The cycle guard compares the PR's
+    # creation and conclusion instants with the row's started_at; when the guard
+    # is not loaded in this context the signal is not trusted at all.
     _concluded=0; _reason=""
-    _pr_json=$(gh pr list --state all --head "story/${_sid}" --json state --limit 1 2>/dev/null || echo "")
+    _pr_json=$(gh pr list --state all --head "story/${_sid}" \
+      --json number,state,createdAt,mergedAt,closedAt --limit 1 2>/dev/null || echo "")
     if [[ -n "$_pr_json" && "$_pr_json" != "[]" ]]; then
-      _pr_state=$(printf '%s' "$_pr_json" | grep -oE '"state":"[A-Z]+"' | head -1 | cut -d'"' -f4)
+      local _pr_number _pr_created _pr_concluded_at _pr_fields
+      _pr_fields=$(printf '%s' "$_pr_json" | python3 -c '
+import json, sys
+try:
+    rows = json.load(sys.stdin)
+    pr = rows[0] if isinstance(rows, list) and rows else {}
+except Exception:
+    pr = {}
+state = pr.get("state") or ""
+at = pr.get("mergedAt") if state == "MERGED" else pr.get("closedAt") if state == "CLOSED" else None
+print("\t".join(str(v if v is not None else "") for v in (pr.get("number", ""), state, pr.get("createdAt", ""), at)))
+' 2>/dev/null || printf '\t\t\t')
+      IFS=$'\t' read -r _pr_number _pr_state _pr_created _pr_concluded_at <<< "$_pr_fields"
       case "$_pr_state" in
-        MERGED) _concluded=1; _reason="pr_merged" ;;
-        CLOSED) _concluded=1; _reason="pr_closed" ;;
+        MERGED|CLOSED)
+          if declare -f _merged_pr_is_current_cycle >/dev/null 2>&1; then
+            if _merged_pr_is_current_cycle "$_sid" "$_pr_created" "$_pr_concluded_at" "$_pr_number"; then
+              _concluded=1
+              [[ "$_pr_state" == MERGED ]] && _reason="pr_merged" || _reason="pr_closed"
+            fi
+          else
+            log "${YELLOW:-}[WT-REAP] ${_sid}: PR #${_pr_number:-?} ${_pr_state} on story/${_sid} but the cycle guard is not loaded — signal ignored${NC:-}"
+          fi
+          ;;
       esac
     fi
     # Integration signal 2: HEAD already integrated into origin/<target>.

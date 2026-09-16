@@ -15,6 +15,10 @@
 # T5: PR MERGED but live tmux session         → KEPT (live guard wins)
 # T6: PR MERGED but fresh heartbeat (<120s)   → KEPT (live guard wins)
 # T7: throttle — fresh .wt-reap.last marker   → no-op (nothing removed)
+# T8: PR MERGED in an EARLIER cycle (guard says stale) → KEPT (branch names recur)
+# T9: PR CLOSED: current cycle → removed; earlier cycle → KEPT
+# T10: cycle guard not loaded in this context   → KEPT (signal not trusted)
+# T11: fetch of origin/<target> fails            → sweep skipped, nothing removed
 # (concrete IDs are generic placeholders — this file is mirrored to public OSS)
 #
 # Run: bash .gaai/core/scripts/tests/daemon-dispatch-reap-worktrees.test.sh
@@ -81,7 +85,11 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 if [[ -n "$sid" && -f "$GH_STATES/$sid" ]]; then
-  printf '[{"state":"%s"}]' "$(cat "$GH_STATES/$sid")"
+  state="$(cat "$GH_STATES/$sid")"
+  merged=null; closed=null
+  [[ "$state" == MERGED ]] && merged='"2026-01-03T00:00:00Z"'
+  [[ "$state" == CLOSED ]] && closed='"2026-01-03T00:00:00Z"'
+  printf '[{"number":41,"state":"%s","createdAt":"2026-01-02T00:00:00Z","mergedAt":%s,"closedAt":%s}]' "$state" "$merged" "$closed"
 else
   printf '[]'
 fi
@@ -98,6 +106,16 @@ EOF
 chmod +x "$STUB_BIN/gh" "$STUB_BIN/tmux"
 export GH_STATES TMUX_LIVE
 PATH="$STUB_BIN:$PATH"
+
+# Cycle-guard fixture. The daemon defines _merged_pr_is_current_cycle in
+# delivery-daemon.sh; the reaper must consult it before trusting a MERGED/CLOSED
+# PR, because story branch names recur across cycles. Here it records its
+# arguments and answers "not current cycle" when <sid>.stale exists.
+GUARD_CALLS="$SANDBOX/guard-calls"; mkdir -p "$GUARD_CALLS"
+_merged_pr_is_current_cycle() {
+  printf '%s\n' "$*" > "$GUARD_CALLS/$1"
+  [[ ! -f "$GH_STATES/$1.stale" ]]
+}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 mk_wt() {  # mk_wt <sid> : create a worktree on a fresh story/<sid> branch off staging
@@ -119,6 +137,11 @@ reap_orphaned_worktrees
 
 # ── Assertions ────────────────────────────────────────────────────────────────
 exists MERGEDX && fail "T1: MERGED+clean worktree should be removed" || pass "T1: MERGED+clean → removed (divergent local commits ignored)"
+if [[ "$(cat "$GUARD_CALLS/MERGEDX" 2>/dev/null)" == "MERGEDX 2026-01-02T00:00:00Z 2026-01-03T00:00:00Z 41" ]]; then
+  pass "T1b: the cycle guard received the PR's creation and merge instants and number"
+else
+  fail "T1b: cycle guard not consulted with the PR instants (got: $(cat "$GUARD_CALLS/MERGEDX" 2>/dev/null || echo none))"
+fi
 exists INTEGX  && fail "T2: integrated (ancestor) worktree should be removed" || pass "T2: HEAD integrated → removed via ancestor signal"
 exists UNMERGX || fail "T3: unmerged/no-PR worktree must be KEPT"; exists UNMERGX && pass "T3: unmerged + no PR → kept"
 exists DIRTYX  || fail "T4: dirty worktree must be KEPT despite MERGED PR"; exists DIRTYX && pass "T4: dirty → kept (data-safety guard wins)"
@@ -131,6 +154,37 @@ GAAI_WT_REAP_INTERVAL_SEC=1800
 date +%s > "$LOCK_DIR/.wt-reap.last"
 reap_orphaned_worktrees
 exists THROTX && pass "T7: fresh throttle marker → sweep is a no-op" || fail "T7: throttle marker ignored — sweep ran when it should not have"
+
+# ── T8: MERGED PR from an earlier cycle (guard says stale) ───────────────────
+GAAI_WT_REAP_INTERVAL_SEC=0; rm -f "$LOCK_DIR/.wt-reap.last"
+mk_wt STALEX; diverge STALEX; echo MERGED > "$GH_STATES/STALEX"; : > "$GH_STATES/STALEX.stale"
+reap_orphaned_worktrees
+exists STALEX && pass "T8: MERGED PR of an earlier cycle → kept" || fail "T8: a MERGED PR from an earlier cycle reaped a live cycle's worktree"
+
+# ── T9: CLOSED PR — current cycle removes, earlier cycle keeps ───────────────
+mk_wt CLOSEDX; diverge CLOSEDX; echo CLOSED > "$GH_STATES/CLOSEDX"
+mk_wt CLOSEDOLDX; diverge CLOSEDOLDX; echo CLOSED > "$GH_STATES/CLOSEDOLDX"; : > "$GH_STATES/CLOSEDOLDX.stale"
+reap_orphaned_worktrees
+exists CLOSEDX && fail "T9a: CLOSED PR of the current cycle should remove the worktree" || pass "T9a: CLOSED PR of the current cycle → removed"
+[[ "$(cat "$GUARD_CALLS/CLOSEDX" 2>/dev/null)" == "CLOSEDX 2026-01-02T00:00:00Z 2026-01-03T00:00:00Z 41" ]] \
+  && pass "T9b: a CLOSED PR is judged on its closedAt instant" || fail "T9b: closedAt not passed to the guard for a CLOSED PR"
+exists CLOSEDOLDX && pass "T9c: CLOSED PR of an earlier cycle → kept" || fail "T9c: an earlier cycle's CLOSED PR reaped a live worktree"
+
+# ── T10: guard not loaded in this context → signal not trusted ───────────────
+mk_wt NOGUARDX; diverge NOGUARDX; echo MERGED > "$GH_STATES/NOGUARDX"
+_saved_guard=$(declare -f _merged_pr_is_current_cycle); unset -f _merged_pr_is_current_cycle
+reap_orphaned_worktrees
+eval "$_saved_guard"
+exists NOGUARDX && pass "T10: cycle guard absent → MERGED signal ignored, kept" || fail "T10: reaped on a MERGED PR without a cycle guard"
+
+# ── T11: fetch failure → sweep skipped ───────────────────────────────────────
+mk_wt FETCHX; diverge FETCHX; echo MERGED > "$GH_STATES/FETCHX"
+git -C "$REPO" remote set-url origin "$SANDBOX/does-not-exist.git"
+reap_orphaned_worktrees
+git -C "$REPO" remote set-url origin "$REMOTE"
+exists FETCHX && pass "T11: failed fetch → sweep skipped, nothing removed" || fail "T11: reaped against a stale origin ref after a failed fetch"
+reap_orphaned_worktrees
+exists FETCHX && fail "T11b: with the fetch restored the same worktree should be removed" || pass "T11b: fetch restored → removed on the next sweep"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
