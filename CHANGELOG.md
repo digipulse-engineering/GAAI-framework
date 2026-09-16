@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [2.49.0] - 2026-09-17
 
 ### Changed
+- feat: publish what a gate has bound while it holds it
+- fix: say why a stale head halted delivery, and say it once
 - fix: keep the vendored runtime assets at 0644 across every fixture checkout
 - fix: discard an empty lifecycle run state instead of wedging dispatch
 - fix: restore the entry-owned private home after every agent phase
@@ -41,9 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fix: link the operator's agent account state into the private HOME
 - fix: re-bind the launch target after the daemon's own claim
 - fix: let the recovery scan skip a Story it does not own
--: carry the admitted forge identity to the daemon over the attempt's bound channel
 - fix: close every interactive git/gh prompt path under the daemon and type the fetch failure
--: fix real daemon bootstrap after exact-home admission
+
 
 ## [2.49.0] - 2026-09-08
 

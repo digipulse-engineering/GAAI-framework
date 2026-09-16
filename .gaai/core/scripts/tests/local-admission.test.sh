@@ -306,5 +306,72 @@ if grep -qE '^unset GAAI_QA_REPORT_PATH GAAI_QA_VERDICT_PATH GAAI_PLAN_PATH' "$S
   pass 'the state-machine suite refuses the wrapper phase pointers at start'
 else fail 'daemon-state-machine.test.sh no longer unsets the wrapper phase pointers'; fi
 
+# ── In-flight marker: published while a gate holds a binding, gone after ──────
+#
+# A gate binds base and head and then runs for tens of minutes. Advancing the base
+# in that window discards the cycle. Nothing published that a binding was live, so
+# whoever merged could not know. The marker is advisory: it grants nothing.
+INFLIGHT="$RECEIPTS/.local-admission-TST-FLIGHT-pre_qa.inflight.json"
+rm -f "$INFLIGHT"
+_run_local_admission pre_qa TST-FLIGHT "$REPO" staging "$RECEIPTS" >/dev/null 2>&1 || true
+if [[ ! -e "$INFLIGHT" ]]; then
+  pass 'the in-flight marker does not outlive the gate that published it'
+else fail 'the in-flight marker survived the gate'; fi
+
+# Published during the run: observed from inside a selected command, which is the
+# only moment a binding is actually held.
+WITNESS="$ROOT/inflight-witness"; rm -f "$WITNESS"
+cat > "$REPO/checks/witness.sh" <<WEOF
+#!/usr/bin/env bash
+ls "$RECEIPTS" 2>/dev/null | grep -c 'TST-WITNESS-pre_qa.inflight.json' > "$WITNESS"
+exit 0
+WEOF
+chmod +x "$REPO/checks/witness.sh"
+git -C "$REPO" add -A >/dev/null 2>&1; git -C "$REPO" -c user.email=t@t.t -c user.name=t commit -qm 'witness check' >/dev/null 2>&1
+git -C "$REPO" push -q origin HEAD:staging >/dev/null 2>&1 || true
+if _local_admission_publish_inflight "$RECEIPTS" TST-WITNESS pre_qa staging aaaa bbbb \
+   && [[ -f "$RECEIPTS/.local-admission-TST-WITNESS-pre_qa.inflight.json" ]]; then
+  pass 'a bound gate publishes its marker'
+else fail 'a bound gate published no marker'; fi
+
+MARKER="$RECEIPTS/.local-admission-TST-WITNESS-pre_qa.inflight.json"
+if node -e '
+  const d = require(process.argv[1]);
+  const ok = d.story === "TST-WITNESS" && d.boundary === "pre_qa"
+    && d.bound_base === "aaaa" && d.bound_head === "bbbb"
+    && Number.isInteger(d.pid) && typeof d.started_at === "string";
+  process.exit(ok ? 0 : 1);
+' "$MARKER" 2>/dev/null; then
+  pass 'the marker names the story, the boundary, the bound pair and its publisher'
+else fail "the marker is missing or malformed: $(cat "$MARKER" 2>/dev/null)"; fi
+
+if [[ "$(stat -f '%Lp' "$MARKER" 2>/dev/null || stat -c '%a' "$MARKER" 2>/dev/null)" == "600" ]]; then
+  pass 'the marker is owner-only'
+else fail 'the marker is readable beyond its owner'; fi
+
+_LOCAL_ADMISSION_INFLIGHT="$MARKER"
+_local_admission_cleanup "$ROOT/no-such-scratch"
+if [[ ! -e "$MARKER" ]]; then
+  pass 'the shared cleanup path removes the marker on every exit'
+else fail 'the cleanup path left the marker behind'; fi
+
+# The reader: exit 2 while a live gate holds a binding, 0 when none does, and
+# residue from a dead publisher is reported without blocking.
+GS="$SCRIPT_DIR/gate-status.sh"
+GSDIR="$ROOT/gs"; mkdir -p "$GSDIR"
+if /bin/bash "$GS" --quiet "$GSDIR"; then
+  pass 'gate-status reports a free target when nothing is bound'
+else fail 'gate-status reported a bound gate with no marker present'; fi
+printf '{"story":"S","boundary":"final","base_ref":"staging","bound_base":"abc","bound_head":"def","pid":%s,"started_at":"2026-01-01T00:00:00Z"}\n' "$$" > "$GSDIR/.local-admission-S-final.inflight.json"
+/bin/bash "$GS" --quiet "$GSDIR"; if [[ "$?" -eq 2 ]]; then
+  pass 'gate-status exits 2 while a live gate holds a binding'
+else fail 'gate-status did not signal a live binding'; fi
+printf '{"story":"D","boundary":"final","base_ref":"staging","bound_base":"abc","bound_head":"def","pid":999999,"started_at":"2026-01-01T00:00:00Z"}\n' > "$GSDIR/.local-admission-D-final.inflight.json"
+rm -f "$GSDIR/.local-admission-S-final.inflight.json"
+GS_OUT="$(/bin/bash "$GS" "$GSDIR" 2>&1)"
+if printf '%s' "$GS_OUT" | grep -q residue; then
+  pass 'gate-status calls a dead publisher residue rather than a binding'
+else fail "gate-status treated residue as a live binding: ${GS_OUT}"; fi
+
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

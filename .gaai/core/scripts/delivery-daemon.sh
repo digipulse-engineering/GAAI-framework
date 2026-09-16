@@ -1619,10 +1619,36 @@ _per_cycle_home_check() {
   local _repo_root
   _repo_root="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "$REPO_ROOT")"
   if ! _gaai_home_verify "$GAAI_DAEMON_HOME" "$TARGET_BRANCH" "$_repo_root" "$_expected"; then
-    log "${RED}[HOME-INTEGRITY] reason=${GAAI_HOME_REASON} action=${GAAI_HOME_ACTION} evidence=${GAAI_HOME_EVIDENCE}${NC}"
-    log "${RED}[HOME-INTEGRITY] the home is preserved unchanged; this cycle is skipped${NC}"
+    local _home_head="" _pair=""
+    _home_head="$(git -C "$GAAI_DAEMON_HOME" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || echo "")"
+    _pair="${GAAI_HOME_REASON}:${GAAI_HOME_EVIDENCE}:${_expected}:${_home_head}"
+    if [[ "$_pair" != "${_GAAI_HOME_REFUSAL_REPORTED:-}" ]]; then
+      _GAAI_HOME_REFUSAL_REPORTED="$_pair"
+      _GAAI_HOME_REFUSAL_POLLS=0
+      log "${RED}[HOME-INTEGRITY] reason=${GAAI_HOME_REASON} action=${GAAI_HOME_ACTION} evidence=${GAAI_HOME_EVIDENCE}${NC}"
+      log "${RED}[HOME-INTEGRITY] the home is preserved unchanged; this cycle is skipped${NC}"
+      if [[ "$GAAI_HOME_EVIDENCE" == *stale_head* ]]; then
+        # The launch tuple is immutable for the life of this process, so a target
+        # that advanced past it halts every cycle until an authorized restart.
+        # Name the advance and the remedy once; repeating it every poll taught the
+        # operator nothing and buried the cause.
+        log "${RED}[HOME-INTEGRITY] the bound target ${_expected:0:12} is no longer the home's head ${_home_head:0:12}${NC}"
+        if [[ -n "${_GAAI_REBIND_BLOCKED_BY:-}" ]]; then
+          log "${RED}[HOME-INTEGRITY] the self-claim rebind refused because the advance is not this daemon's own projection: ${_GAAI_REBIND_BLOCKED_BY}${NC}"
+        fi
+        log "${RED}[HOME-INTEGRITY] delivery is halted until an authorized restart rebinds the home: stop, run daemon-setup.sh, start${NC}"
+      fi
+    else
+      # Same refusal, same pair: stay quiet, but prove the daemon is still here.
+      _GAAI_HOME_REFUSAL_POLLS=$(( ${_GAAI_HOME_REFUSAL_POLLS:-0} + 1 ))
+      if (( _GAAI_HOME_REFUSAL_POLLS % 20 == 0 )); then
+        log "${RED}[HOME-INTEGRITY] still halted on ${GAAI_HOME_EVIDENCE} after ${_GAAI_HOME_REFUSAL_POLLS} polls — an authorized restart is required${NC}"
+      fi
+    fi
     return 1
   fi
+  _GAAI_HOME_REFUSAL_REPORTED=""
+  _GAAI_HOME_REFUSAL_POLLS=0
 
   # The vendored YAML runtime tuple is verified — never repaired — from here. A tree
   # that cannot present a verifiable tuple is not a tree this daemon may coordinate
@@ -4589,9 +4615,19 @@ _rebind_target_after_self_claim() {
   [[ "$head" == "$remote" ]] || return 1
   [[ "$head" != "$bound" ]] || return 0
   git -C "$home" merge-base --is-ancestor "$bound" "$head" 2>/dev/null || return 1
+  local foreign=""
   while IFS= read -r subject; do
-    [[ "$subject" == chore\(*\):*\[daemon\] ]] || return 1
+    [[ "$subject" == chore\(*\):*\[daemon\] ]] && continue
+    foreign="${foreign:+$foreign; }${subject}"
   done < <(git -C "$home" log --format='%s' "${bound}..${head}" 2>/dev/null)
+  if [[ -n "$foreign" ]]; then
+    # Fail closed, as the exact-current model requires — but say what blocked the
+    # rebind. Without this the daemon goes inert and the log shows only a
+    # `stale_head` refusal repeating every poll, which names neither the cause
+    # nor the remedy.
+    _GAAI_REBIND_BLOCKED_BY="$foreign"
+    return 1
+  fi
   GAAI_TARGET_SHA="$head"
   export GAAI_TARGET_SHA
   log "[HOME-REBIND] target advanced by this daemon's own projection — rebound to ${head:0:12}"
