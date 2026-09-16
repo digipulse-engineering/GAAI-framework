@@ -698,6 +698,29 @@ done
 mv "$SANDBOX/t3-record.original" "$T3_RECORD"
 mv "$SANDBOX/t3-state.original" "$T3_STATE"
 chmod 600 "$T3_RECORD" "$T3_STATE"
+
+# The empty-run discard must never reach a run state that did project a field.
+# This one carries exactly one valid row, so the discard has to refuse it and
+# leave the file byte-identical, and the settle classifier has to report it as
+# a live pending run (rc 0) rather than absence.
+cp "$T3_STATE" "$SANDBOX/t3-rowed-state.expected"
+T3AR_DISCARD_RC=0
+IFS=$'\t' read -r _ _ _ T3AR_STATE_DIGEST _ \
+  <<< "$(_journal_inspect_pending_lifecycle TST-RESTART dispatch.plan | head -1)"
+( cd "$REPO" && _journal_discard_empty_lifecycle TST-RESTART dispatch.plan \
+  "$T3AR_STATE_DIGEST" ) 2>/dev/null || T3AR_DISCARD_RC=$?
+T3AR_SETTLE_RC=0
+T3AR_SETTLE_OUT=$(_journal_settle_pending_lifecycle TST-RESTART dispatch.plan \
+  2>/dev/null) || T3AR_SETTLE_RC=$?
+if [[ "$T3AR_DISCARD_RC" -ne 0 ]] \
+    && cmp -s "$T3_STATE" "$SANDBOX/t3-rowed-state.expected" \
+    && [[ "$T3AR_SETTLE_RC" -eq 0 && "$T3AR_SETTLE_OUT" == *$'\n'* ]]; then
+  pass "T3a6: a run state carrying a projected field is never discarded"
+else
+  fail "T3a6: a projected-field run state was discarded or misclassified"
+fi
+unset T3AR_DISCARD_RC T3AR_SETTLE_RC T3AR_SETTLE_OUT T3AR_STATE_DIGEST
+
 T3B_RC=0
 ( cd "$REPO" && _journal_resume_pending_lifecycle TST-RESTART dispatch.plan ) \
   2>"$SANDBOX/t3-resume.log" || T3B_RC=$?
@@ -718,21 +741,75 @@ else
   fail "T3b: retained run did not resume exactly"
 fi
 
-echo "T3c: header-only run state remains retained ambiguity"
+# A header-only run state is the footprint of a writer killed between the
+# state-file create and its first record append: a run token exists, but no
+# field was ever projected. It names no transition, so there is nothing to
+# resume and nothing to verify — and while it stays on disk every later cycle
+# re-reads it, refuses, and burns one retry, which wedged a live Story for
+# three consecutive cycles until an operator moved the file aside by hand.
+# It is therefore discarded and reported as absence (rc 2, the dispatcher's
+# "nothing pending" result). This replaces the earlier contract, which
+# preserved the file as "retained ambiguity": there is no evidence to
+# preserve when no record was emitted, and the row-bearing case above still
+# proves that a run state which DID project a field is never touched here.
+echo "T3c: header-only run state is discarded as absence"
 backlog_journal_begin_run "$BACKLOG_FILE" dispatch.impl
 T3C_STATE="$LOCK_DIR/.journal-runs/dispatch.impl.TST-EMPTY-RUN.state"
 T3C_SOURCE=$(git -C "$REPO" rev-parse origin/staging)
 _lifecycle_write_run_state "$T3C_STATE" create \
   "$BACKLOG_JOURNAL_RUN_TOKEN" "$T3C_SOURCE"
 T3C_RC=0
-_journal_resume_pending_lifecycle TST-EMPTY-RUN dispatch.impl \
+( cd "$REPO" && _journal_resume_pending_lifecycle TST-EMPTY-RUN dispatch.impl ) \
   >"$SANDBOX/t3c.out" 2>"$SANDBOX/t3c.err" || T3C_RC=$?
-if [[ "$T3C_RC" -ne 0 && -f "$T3C_STATE" ]] \
-    && grep -q 'outcome=rejected reason=empty_run_state' "$SANDBOX/t3c.err"; then
-  pass "T3c: empty run state blocks and preserves exact retained evidence"
+if [[ "$T3C_RC" -eq 2 && ! -e "$T3C_STATE" ]] \
+    && grep -q 'outcome=discarded reason=empty_run_state' "$SANDBOX/t3c.err" \
+    && grep -q 'story=TST-EMPTY-RUN writer=dispatch.impl' "$SANDBOX/t3c.err"; then
+  pass "T3c: empty run state is discarded and reported as nothing pending"
 else
-  fail "T3c: empty run state was erased or treated as absence"
+  sed 's/^/    /' "$SANDBOX/t3c.err" >&2
+  printf '    resume_rc=%s state_present=%s\n' "$T3C_RC" \
+    "$([[ -e "$T3C_STATE" ]] && printf true || printf false)" >&2
+  fail "T3c: empty run state was not discarded as absence"
 fi
+
+echo "T3c2: settle classifies and discards a header-only run state"
+backlog_journal_begin_run "$BACKLOG_FILE" dispatch.qa
+T3C2_STATE="$LOCK_DIR/.journal-runs/dispatch.qa.TST-EMPTY-RUN.state"
+_lifecycle_write_run_state "$T3C2_STATE" create \
+  "$BACKLOG_JOURNAL_RUN_TOKEN" "$T3C_SOURCE"
+T3C2_RC=0
+( cd "$REPO" && _journal_settle_pending_lifecycle TST-EMPTY-RUN dispatch.qa ) \
+  >"$SANDBOX/t3c2.out" 2>"$SANDBOX/t3c2.err" || T3C2_RC=$?
+if [[ "$T3C2_RC" -eq 2 && ! -e "$T3C2_STATE" && ! -s "$SANDBOX/t3c2.out" ]] \
+    && grep -q 'outcome=discarded reason=empty_run_state' "$SANDBOX/t3c2.err"; then
+  pass "T3c2: settle reports absence after discarding the empty run state"
+else
+  fail "T3c2: settle did not discard the empty run state as absence"
+fi
+
+echo "T3c3: a malformed run-state header still fails closed"
+backlog_journal_begin_run "$BACKLOG_FILE" dispatch.commit
+T3C3_STATE="$LOCK_DIR/.journal-runs/dispatch.commit.TST-EMPTY-RUN.state"
+_lifecycle_write_run_state "$T3C3_STATE" create \
+  "$BACKLOG_JOURNAL_RUN_TOKEN" "$T3C_SOURCE"
+# Truncate the run token: the header no longer parses, so this is a corrupt
+# file rather than an un-started run, and must never be silently erased.
+printf 'deadbeef\t%s\n' "$T3C_SOURCE" > "$T3C3_STATE"
+chmod 600 "$T3C3_STATE"
+cp "$T3C3_STATE" "$SANDBOX/t3c3-state.expected"
+T3C3_RC=0
+( cd "$REPO" && _journal_resume_pending_lifecycle TST-EMPTY-RUN dispatch.commit ) \
+  >/dev/null 2>"$SANDBOX/t3c3.err" || T3C3_RC=$?
+T3C3_SETTLE_RC=0
+( cd "$REPO" && _journal_settle_pending_lifecycle TST-EMPTY-RUN dispatch.commit ) \
+  >/dev/null 2>&1 || T3C3_SETTLE_RC=$?
+if [[ "$T3C3_RC" -eq 1 && "$T3C3_SETTLE_RC" -eq 1 ]] \
+    && cmp -s "$T3C3_STATE" "$SANDBOX/t3c3-state.expected"; then
+  pass "T3c3: corrupt run-state header refuses and preserves the file"
+else
+  fail "T3c3: corrupt run-state header was accepted or erased"
+fi
+rm -f "$T3C3_STATE"
 T3D_RC=0
 _journal_inspect_pending_lifecycle TST-ABSENT dispatch.plan >/dev/null 2>&1 || T3D_RC=$?
 if [[ "$T3D_RC" -eq 2 ]]; then

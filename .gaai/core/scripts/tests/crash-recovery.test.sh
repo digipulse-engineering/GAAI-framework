@@ -44,6 +44,19 @@ source "$ROOT/.gaai/core/scripts/lib/commit-retry-containment.sh"
 # shellcheck source=/dev/null
 source "$HARNESS"
 
+# The coordinator spans above call the journal classifier that decides whether
+# a retained run still owns a Story. It lives in daemon-dispatch.sh, which
+# cannot be sourced whole here, so its contiguous span is extracted the same
+# way every other real slice in this suite is — a stub would prove nothing
+# about the empty-run-state discard the coordinator now depends on.
+SETTLE_HARNESS="$TMP/journal-settle.sh"
+awk '/^_journal_discard_empty_lifecycle_locked\(\)/{on=1} /^_lifecycle_record_matches\(\)/{on=0} on{print}' \
+  "$ROOT/.gaai/core/scripts/daemon-dispatch.sh" > "$SETTLE_HARNESS"
+# shellcheck source=/dev/null
+source "$SETTLE_HARNESS"
+declare -F _journal_settle_pending_lifecycle >/dev/null \
+  || { echo "SETTLE_HARNESS_EMPTY"; exit 1; }
+
 AUTH_PROJECT="$TMP/auth-project"
 AUTH_HARNESS="$AUTH_PROJECT/.gaai/core/scripts/daemon-dispatch.sh"
 TRUSTED_CALLER="$AUTH_PROJECT/.gaai/core/scripts/delivery-daemon.sh"

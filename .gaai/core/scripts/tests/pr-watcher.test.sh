@@ -747,6 +747,30 @@ cp -R "$SCRIPT_DIR/../.." "$S20_VALID_REPO/.gaai/core"
 # GAAI_REPO_ROOT; the runtime itself does not read it, and the masking path was
 # not traced). The fixture must not depend on either. Fix the modes.
 chmod -R u=rwX,go=rX "$S20_VALID_REPO/.gaai/core"
+# ...but that chmod is a one-shot on a tree this fixture then COMMITS, and every
+# `git reset --hard` below re-materialises the tracked vendor assets through the
+# same inherited umask -- back to 0600. The daemon invocations do not reveal it:
+# their checkout proof repairs exactly those three files to 0644 before reading
+# them. Nothing else does, so the first consumer of the boundary that is not the
+# daemon -- the scheduler call in the partial-terminal fixture below -- sees
+# whichever mode the immediately preceding reset happened to leave, and dies with
+# one opaque `code=yaml_runtime_manifest_invalid` line. Re-establish the exact
+# mode after every checkout instead, and assert it rather than assume it.
+s20_exact_vendor_modes() {
+  local dir="$S20_VALID_REPO/.gaai/core/vendor/pyyaml/6.0.3" asset
+  for asset in pyyaml-runtime.pyz PROVENANCE.json LICENSE; do
+    [[ -f "$dir/$asset" ]] || continue
+    chmod 0644 "$dir/$asset" 2>/dev/null || true
+    if [[ "$(portable_mode "$dir/$asset" 2>/dev/null || true)" != "644" ]]; then
+      fail "S20-FIXTURE: vendored runtime asset $asset is not at 0644 — every assertion behind the boundary is unreliable"
+      return 1
+    fi
+  done
+  return 0
+}
+if s20_exact_vendor_modes; then
+  pass "S20-FIXTURE: vendored runtime assets start at exactly 0644"
+fi
 git init --bare "$S20_VALID_REMOTE" -q
 git -C "$S20_VALID_REPO" init -q
 git -C "$S20_VALID_REPO" config user.email test@example.invalid
@@ -875,6 +899,7 @@ s20_reset_target() {
   "$S20_REAL_GIT" --git-dir="$S20_VALID_REMOTE" update-ref refs/heads/staging "$S20_MERGE"
   "$S20_REAL_GIT" -C "$S20_VALID_REPO" fetch origin staging -q
   "$S20_REAL_GIT" -C "$S20_VALID_REPO" reset --hard origin/staging -q
+  s20_exact_vendor_modes || true
 }
 s20_new_state() {
   local root="$1"
@@ -1440,20 +1465,35 @@ done
 # otherwise exact and contains the admitted squash; only status is terminal.
 s20_reset_target
 S20_PARTIAL_BACKLOG="$S20_VALID_REPO/.gaai/project/contexts/backlog/active.backlog.yaml"
+# A fixture step that builds state for later assertions is reported as a named
+# assertion of its own. This one runs a real scheduler write through the YAML
+# boundary, and the boundary's refusals are a bare one-line diagnostic plus a
+# non-zero status: under `set -e` that terminated the whole suite here with no
+# FAIL line and no result summary, so the cause had to be inferred from where
+# the log stopped. Capture the status, name it, and let the remaining assertions
+# report as unexercised instead of vanishing.
+S20_PARTIAL_SET_RC=0
 "$BASH" "$S20_VALID_REPO/.gaai/core/scripts/backlog-scheduler.sh" --set-field \
-  WATCHER-STORY-1 status done "$S20_PARTIAL_BACKLOG" >/dev/null
-"$S20_REAL_GIT" -C "$S20_VALID_REPO" add .gaai/project/contexts/backlog/active.backlog.yaml
-"$S20_REAL_GIT" -C "$S20_VALID_REPO" commit -m 'partial terminal fixture' -q
-S20_PARTIAL_COMMIT=$("$S20_REAL_GIT" -C "$S20_VALID_REPO" rev-parse HEAD)
-"$S20_REAL_GIT" -C "$S20_VALID_REPO" push --force origin HEAD:staging -q
-S20_PARTIAL_STATE="$S20_VALID_ROOT/partial-state"; s20_new_state "$S20_PARTIAL_STATE"
-s20_expect_rc "S20-PRESTATE: partial terminal tuple rejected" 3 \
-  "$S20_VALID_REPO" "$S20_PARTIAL_STATE" "$S20_VALID_BIN"
-if [[ ! -e "$S20_PARTIAL_STATE/external-merge-settlements/.external-merge-WATCHER-STORY-1.json" \
-    && "$("$S20_REAL_GIT" --git-dir="$S20_VALID_REMOTE" rev-parse refs/heads/staging)" == "$S20_PARTIAL_COMMIT" ]]; then
-  pass "S20-PRESTATE: partial terminal tuple caused no settlement or remote mutation"
+  WATCHER-STORY-1 status done "$S20_PARTIAL_BACKLOG" >/dev/null || S20_PARTIAL_SET_RC=$?
+if [[ "$S20_PARTIAL_SET_RC" -ne 0 ]]; then
+  fail "S20-PRESTATE: fixture could not write the terminal status (scheduler exit $S20_PARTIAL_SET_RC)"
+  fail "S20-PRESTATE: partial terminal tuple rejected — not exercised, fixture unavailable"
+  fail "S20-PRESTATE: partial terminal tuple caused no settlement or remote mutation — not exercised, fixture unavailable"
 else
-  fail "S20-PRESTATE: partial terminal tuple reached an effect"
+  pass "S20-PRESTATE: fixture wrote the terminal status through the YAML boundary"
+  "$S20_REAL_GIT" -C "$S20_VALID_REPO" add .gaai/project/contexts/backlog/active.backlog.yaml
+  "$S20_REAL_GIT" -C "$S20_VALID_REPO" commit -m 'partial terminal fixture' -q
+  S20_PARTIAL_COMMIT=$("$S20_REAL_GIT" -C "$S20_VALID_REPO" rev-parse HEAD)
+  "$S20_REAL_GIT" -C "$S20_VALID_REPO" push --force origin HEAD:staging -q
+  S20_PARTIAL_STATE="$S20_VALID_ROOT/partial-state"; s20_new_state "$S20_PARTIAL_STATE"
+  s20_expect_rc "S20-PRESTATE: partial terminal tuple rejected" 3 \
+    "$S20_VALID_REPO" "$S20_PARTIAL_STATE" "$S20_VALID_BIN"
+  if [[ ! -e "$S20_PARTIAL_STATE/external-merge-settlements/.external-merge-WATCHER-STORY-1.json" \
+      && "$("$S20_REAL_GIT" --git-dir="$S20_VALID_REMOTE" rev-parse refs/heads/staging)" == "$S20_PARTIAL_COMMIT" ]]; then
+    pass "S20-PRESTATE: partial terminal tuple caused no settlement or remote mutation"
+  else
+    fail "S20-PRESTATE: partial terminal tuple reached an effect"
+  fi
 fi
 s20_reset_target
 
@@ -1556,6 +1596,7 @@ s20_reset_target
 "$S20_REAL_GIT" --git-dir="$S20_VALID_REMOTE" update-ref refs/heads/staging "$S20_HEAD"
 "$S20_REAL_GIT" -C "$S20_VALID_REPO" fetch origin staging -q
 "$S20_REAL_GIT" -C "$S20_VALID_REPO" reset --hard origin/staging -q
+s20_exact_vendor_modes || true
 S20_DIVERGENT_STATE="$S20_VALID_ROOT/divergent-state"; s20_new_state "$S20_DIVERGENT_STATE"
 s20_expect_rc "S20-GITHUB: merge absent from target lineage rejected" 3 \
   "$S20_VALID_REPO" "$S20_DIVERGENT_STATE" "$S20_VALID_BIN"
