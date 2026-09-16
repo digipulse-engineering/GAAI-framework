@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: resolve the chain inside the shell owner audit so both predicates judge the same ancestors
+- fix: carry the per-phase turn caps into the wrapper that uses them
+- fix: run the stale active-spawn marker sweep on every cycle, not only after a launch
 - fix: admit GAAI_QA_MAX_TURNS through the entry allowlist
 - fix: classify harness quota exhaustion from structured evidence only
 - fix: replicate a preserved branch tip instead of only renaming it

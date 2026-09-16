@@ -3840,6 +3840,57 @@ _reconcile_story_file_from_staging() {
 
 # ── PR merge watcher + reconcile helpers ────────────────────────────────────
 
+# ── Stale active-spawn marker sweep (cycle housekeeping) ──────────────────
+# Called from the main loop at the top of EVERY cycle — ahead of the orphan-lock
+# tick scan, the periodic recovery scan and the pre-spawn gate, all of which hold
+# a Story on a leftover <sid>.<phase>.active marker — so it runs whether or not
+# a Story is ready. It touches only $LOCK_DIR (gitignored local state), never the
+# home's git state, so it needs no home guard.
+#
+# The wrapper touches the marker at phase start and clears it only on a clean
+# phase exit. A SIGKILL, a daemon crash or an operator --stop that kills the
+# wrapper mid-phase leaves it behind, and _forward_active_markers_clear() then
+# holds every relaunch of that Story (outcome=blocked reason=effect_inhibited)
+# for as long as the marker exists. mtime alone is insufficient — the marker is
+# touch-ed once at phase start and never updated, so a legitimate 30 min Impl
+# phase on the secondary route looks identical to a crashed wrapper. Removal
+# therefore requires BOTH: no live wrapper tmux session for the Story AND a
+# marker older than the grace window. Removing a marker under a still-live lock
+# has no effect: the relaunch path checks lock liveness before the markers.
+#
+# History: this sweep used to sit after the ready-Story launch loop, so the idle
+# branch ("No stories ready. Waiting..." → sleep; continue) never reached it and
+# a Story wedged this way never relaunched — with no error anywhere.
+sweep_stale_active_markers() {
+  local grace_sec=600
+  local now marker base sid phase mtime age
+  [[ -d "$LOCK_DIR" ]] || return 0
+  now=$(date +%s)
+  for marker in "$LOCK_DIR"/*.plan.active "$LOCK_DIR"/*.impl.active \
+                "$LOCK_DIR"/*.qa.active   "$LOCK_DIR"/*.commit.active; do
+    [[ -f "$marker" ]] || continue
+    base=$(basename "$marker" .active)
+    sid="${base%.*}"
+    phase="${base##*.}"
+    # Skip removal when the wrapper tmux session still exists.
+    if tmux has-session -t "gaai-deliver-${sid}" 2>/dev/null; then
+      continue
+    fi
+    # No live wrapper — apply the mtime grace.
+    if [[ "$(uname)" == "Darwin" ]]; then
+      mtime=$(stat -c %Y "$marker" 2>/dev/null || stat -f %m "$marker" 2>/dev/null || echo 0)
+    else
+      mtime=$(stat -c %Y "$marker" 2>/dev/null || echo 0)
+    fi
+    age=$(( now - mtime ))
+    (( age > grace_sec )) || continue
+    if rm -f "$marker" 2>/dev/null; then
+      log "${YELLOW:-}[STALE-MARKER] story=${sid} phase=${phase} age=${age}s removed ${marker} (no gaai-deliver-${sid} tmux session, grace ${grace_sec}s)${NC:-}"
+    fi
+  done
+  return 0
+}
+
 # Retries pending worktree/branch cleanup entries from .cleanup-pending.audit.
 # Called each main-loop cycle. Idempotent: entries cleared on success, kept on failure.
 sweep_cleanup_pending() {
@@ -4992,6 +5043,18 @@ export GAAI_IMPL_MODEL="${GAAI_IMPL_MODEL:-}"
 export GAAI_IMPL_MODEL_FALLBACK="${GAAI_IMPL_MODEL_FALLBACK:-}"
 export GAAI_AUTO_MERGE_POLICY="${GAAI_AUTO_MERGE_POLICY:-staging_only}"
 export GAAI_AUTO_MERGE_ADMIN_FALLBACK="${GAAI_AUTO_MERGE_ADMIN_FALLBACK:-false}"
+# Per-phase agent turn caps. The QA and plan phases run inside THIS wrapper, so
+# daemon-dispatch.sh reads these from the wrapper's environment — not the daemon's.
+# The daemon's private tmux server was created with its own environment, which is
+# why every inherited value here is baked explicitly rather than assumed. Without
+# these two lines the entry allowlist admits an override into the daemon and it dies
+# there, and the phase silently runs at the dispatch default.
+#
+# Deliberately baked EMPTY when unset, not defaulted here: daemon-dispatch.sh owns
+# the defaults (QA 100, plan MAX_TURNS), and `:-` treats empty as unset, so the
+# default keeps exactly one home and cannot drift between the two files.
+export GAAI_QA_MAX_TURNS="${GAAI_QA_MAX_TURNS:-}"
+export GAAI_PLAN_MAX_TURNS="${GAAI_PLAN_MAX_TURNS:-}"
 export GAAI_QA_REPORT_PATH="${GAAI_QA_REPORT_PATH:-}"
 export GAAI_QA_INJECT_PHASE="${GAAI_QA_INJECT_PHASE:-}"
 export GAAI_QA_INJECT_PHASE_SNAPSHOT="${GAAI_QA_INJECT_PHASE:-}"
@@ -5395,6 +5458,13 @@ while true; do
   fi
   _last_loop_ts=$_loop_now
 
+  # Stale active-spawn marker sweep — first thing in every cycle, ahead of the
+  # orphan-lock tick scan, the periodic recovery scan and the pre-spawn gate
+  # (all of which hold a Story on a leftover <sid>.<phase>.active marker), and
+  # ahead of the home guard (it touches only gitignored $LOCK_DIR state). It
+  # must not depend on a Story being ready — see sweep_stale_active_markers.
+  sweep_stale_active_markers || true
+
   # Per-cycle home guard: verify before any coordination git-state op (mark
   # in_progress, reconcile, status push). Verify-only — any drift, dirt or
   # unavailable proof skips the cycle with a typed reason and leaves the home
@@ -5468,6 +5538,35 @@ while true; do
     fi
     last_recovery_scan_ts=$(date +%s)
   fi
+
+  # ── Cycle housekeeping — runs whether or not a Story is ready ─────────────
+  # Placed BEFORE the ready-Story evaluation on purpose: the idle branch below
+  # ends its cycle with `sleep; continue`, so anything after the launch loop
+  # never runs while the backlog has no refined Story — which is exactly when
+  # leftover worktrees and cleanup-pending entries would otherwise sit forever.
+  # (The stale active-spawn marker sweep runs even earlier, at the top of the
+  # cycle — see sweep_stale_active_markers.)
+
+  # PR watcher: retry pending worktree/branch cleanup entries.
+  sweep_cleanup_pending || true
+
+  # Worktree prune: reaps administrative entries left behind by failed/escalated
+  # wrappers. `git worktree prune` only removes entries whose directory is gone
+  # — it never deletes a live worktree. Cheap, safe, runs once per cycle.
+  git -C "$PROJECT_DIR" worktree prune 2>/dev/null || true
+
+  # Reconciliation sweep: remove worktrees of done+merged stories. Complements
+  # watch_pr_merge_status(): that watcher only tracks in_progress stories; by
+  # the time a manual merge lands, the story is already done. This sweep
+  # detects integrated worktrees post-hoc via git branch --merged.
+  reconcile_done_merged_worktrees || true
+
+  # Orphaned-worktree reaper: reclaim worktrees of stories no longer in the
+  # active backlog (archived-done / escalated / failed / branch-deleted) — the
+  # accumulation class reconcile_done_merged_worktrees() cannot see because it
+  # only iterates active-backlog `done` ids. Enumerates on-disk worktrees,
+  # removes only concluded+clean+non-live ones, throttled internally.
+  reap_orphaned_worktrees || true
 
   # Find stories ready for delivery (via git fetch + scheduler)
   ready_stories=$(find_ready_stories || true)
@@ -5858,56 +5957,6 @@ PY
   if (( launched == 0 )); then
     log "${BLUE}All ready stories already in progress. Waiting...${NC}"
   fi
-
-  # ── Stale active-spawn marker cleanup (AC1) ──────────────────────────────
-  # Markers left behind by SIGKILL / daemon crash. mtime alone is insufficient
-  # — the marker is touch-ed once at phase start and never updated, so a
-  # legitimate 30 min Impl phase on the secondary route looks identical to a
-  # crashed wrapper. Skip removal when the wrapper tmux session still exists.
-  if [[ -d "$LOCK_DIR" ]]; then
-    _stale_now=$(date +%s)
-    for _stale_marker in "$LOCK_DIR"/*.plan.active "$LOCK_DIR"/*.impl.active \
-                         "$LOCK_DIR"/*.qa.active   "$LOCK_DIR"/*.commit.active; do
-      [[ -f "$_stale_marker" ]] || continue
-      _stale_basename=$(basename "$_stale_marker" .active)
-      _stale_sid="${_stale_basename%.*}"
-      # Skip removal when the wrapper tmux session still exists.
-      if tmux has-session -t "gaai-deliver-${_stale_sid}" 2>/dev/null; then
-        continue
-      fi
-      # No live wrapper — apply mtime grace (600s).
-      if [[ "$(uname)" == "Darwin" ]]; then
-        _stale_mtime=$(stat -c %Y "$_stale_marker" 2>/dev/null || stat -f %m "$_stale_marker" 2>/dev/null || echo 0)
-      else
-        _stale_mtime=$(stat -c %Y "$_stale_marker" 2>/dev/null || echo 0)
-      fi
-      if [[ $(( _stale_now - _stale_mtime )) -gt 600 ]]; then
-        rm -f "$_stale_marker" 2>/dev/null || true
-      fi
-    done
-  fi
-
-  # ── PR watcher: sweep pending cleanup entries ────────────────────────────
-  sweep_cleanup_pending || true
-
-  # ── Worktree prune (cycle housekeeping) ──────────────────────────────────
-  # Reaps administrative entries left behind by failed/escalated wrappers.
-  # `git worktree prune` only removes entries whose directory is gone — it
-  # never deletes a live worktree. Cheap, safe, runs once per cycle.
-  git -C "$PROJECT_DIR" worktree prune 2>/dev/null || true
-
-  # ── Reconciliation sweep: remove worktrees of done+merged stories ─────────
-  # Complements watch_pr_merge_status(): that watcher only tracks in_progress
-  # stories; by the time a manual merge lands, the story is already done.
-  # This sweep detects integrated worktrees post-hoc via git branch --merged.
-  reconcile_done_merged_worktrees || true
-
-  # ── Orphaned-worktree reaper: reclaim worktrees of stories no longer in the
-  # active backlog (archived-done / escalated / failed / branch-deleted) — the
-  # accumulation class reconcile_done_merged_worktrees() cannot see because it
-  # only iterates active-backlog `done` ids. Enumerates on-disk worktrees,
-  # removes only concluded+clean+non-live ones, throttled internally. (#1365 follow-up)
-  reap_orphaned_worktrees || true
 
   sleep "$POLL_INTERVAL"
 done
