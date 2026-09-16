@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: show the admission gate before QA and commit as its own state
 - fix: reap a story worktree only on current-cycle PR evidence
 - fix: resolve the chain inside the shell owner audit so both predicates judge the same ancestors
 - fix: carry the per-phase turn caps into the wrapper that uses them

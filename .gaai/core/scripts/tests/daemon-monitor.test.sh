@@ -343,6 +343,34 @@ printf '%s\n' "$result" | grep -q "1 tools" && pass "T24" || fail "T24: expected
 echo "T25: parse_log renders latest Codex command activity after non-JSON stderr line"
 printf '%s\n' "$result" | grep -q 'rg -n seat workers' && pass "T25" || fail "T25: expected latest Codex command activity, got '$result'"
 
+# ── T-GATE: the admission gate before QA/commit is displayed as its own state ──
+echo ""
+echo "=== T-GATE: detect_admission_gate (wrapper-log edges) ==="
+gate_log="${LOG_DIR}/TST-MON-GATE.wrapper.log"
+now_hms=$(date +%H:%M:%S)
+printf '[%s] TST-MON-GATE phase=qa starting\n{"type":"assistant","noise":"agent json"}\n' "$now_hms" > "$gate_log"
+result=$(LOG_DIR="$LOG_DIR" detect_admission_gate "TST-MON-GATE" qa)
+[[ "$result" =~ ^running\ [0-9]+$ ]] && pass "T-GATE-1: qa started, no admission outcome yet → running <elapsed>" || fail "T-GATE-1: expected 'running <s>', got '$result'"
+
+printf '[LOCAL-ADMISSION] story=TST-MON-GATE boundary=pre_qa outcome=pass head=abc selected=governance,oss publication_admitted=false\n' >> "$gate_log"
+result=$(LOG_DIR="$LOG_DIR" detect_admission_gate "TST-MON-GATE" qa)
+[[ "$result" == "passed pre_qa" ]] && pass "T-GATE-2: outcome=pass → passed pre_qa" || fail "T-GATE-2: expected 'passed pre_qa', got '$result'"
+
+printf '[%s] TST-MON-GATE phase=qa starting\n[LOCAL-ADMISSION] story=TST-MON-GATE boundary=pre_qa stale_reason=base_advanced resolver_reason=none note=/x\n[LOCAL-ADMISSION] story=TST-MON-GATE boundary=pre_qa outcome=blocked:stale_evidence publication_admitted=false\n' "$now_hms" >> "$gate_log"
+result=$(LOG_DIR="$LOG_DIR" detect_admission_gate "TST-MON-GATE" qa)
+[[ "$result" == "blocked pre_qa blocked:stale_evidence base_advanced" ]] && pass "T-GATE-3: blocked outcome carries boundary, outcome and stale_reason" || fail "T-GATE-3: got '$result'"
+
+printf '[%s] TST-MON-GATE phase=impl starting\n' "$now_hms" >> "$gate_log"
+result=$(LOG_DIR="$LOG_DIR" detect_admission_gate "TST-MON-GATE" qa)
+[[ -z "$result" ]] && pass "T-GATE-4: a later phase edge ends the gate state → nothing" || fail "T-GATE-4: expected empty, got '$result'"
+
+result=$(LOG_DIR="$LOG_DIR" detect_admission_gate "TST-MON-NOLOG" qa)
+[[ -z "$result" ]] && pass "T-GATE-5: no wrapper log → nothing" || fail "T-GATE-5: expected empty, got '$result'"
+
+printf '[%s] TST-MON-GATE phase=commit starting\n' "$now_hms" >> "$gate_log"
+result=$(LOG_DIR="$LOG_DIR" detect_admission_gate "TST-MON-GATE" commit)
+[[ "$result" =~ ^running\ [0-9]+$ ]] && pass "T-GATE-6: commit-phase gate detected on its own edge" || fail "T-GATE-6: got '$result'"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
