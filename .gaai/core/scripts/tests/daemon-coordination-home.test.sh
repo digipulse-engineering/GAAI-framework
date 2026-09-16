@@ -448,6 +448,83 @@ echo "$OUT" | grep -q 'reason=target_fetch_failed action=none' \
 git -C "$PROJ" remote set-url origin "$ROOT/remote.git"
 
 echo ""
+echo "=== TC19: a target that advanced past the launch tuple is diagnosed once, with its cause ==="
+# The daemon pins its home to the sha its launch proved. When the target advances
+# past it the exact-current model halts every cycle — correctly — but until now the
+# log showed only `home_role=stale_head` repeating every poll, naming neither the
+# advance nor the remedy, and a foreign commit interleaved with the daemon's own
+# backlog projection silently defeated the self-claim rebind.
+DD="$SCRIPTS_DIR/delivery-daemon.sh"
+
+if grep -q '_GAAI_REBIND_BLOCKED_BY' "$DD"; then
+  pass "TC19-1: the rebind records what blocked it"
+else
+  fail "TC19-1: the rebind still refuses without recording a cause"
+fi
+
+if sed -n '/^_rebind_target_after_self_claim()/,/^}/p' "$DD" | grep -q 'foreign='; then
+  pass "TC19-2: the rebind separates foreign commits from this daemon's own projection"
+else
+  fail "TC19-2: the rebind does not identify the foreign commits"
+fi
+
+if sed -n '/^_per_cycle_home_check()/,/^}/p' "$DD" | grep -q '_GAAI_HOME_REFUSAL_REPORTED'; then
+  pass "TC19-3: the per-cycle refusal is reported per distinct advance, not per poll"
+else
+  fail "TC19-3: the per-cycle refusal still repeats on every poll"
+fi
+
+if sed -n '/^_per_cycle_home_check()/,/^}/p' "$DD" | grep -q 'an authorized restart'; then
+  pass "TC19-4: the refusal names the remedy"
+else
+  fail "TC19-4: the refusal does not name the remedy"
+fi
+
+# The refusal must still be fail-closed: no rebind, no repair, no continuation.
+if sed -n '/^_per_cycle_home_check()/,/^}/p' "$DD" | grep -q 'return 1'; then
+  pass "TC19-5: a refused home still stops the cycle"
+else
+  fail "TC19-5: a refused home no longer stops the cycle"
+fi
+
+# Behavioural: a foreign commit between the bound sha and the new head must defeat
+# the rebind, and the daemon must say so.
+TC19_ROOT="$ROOT/tc19"; mkdir -p "$TC19_ROOT"
+git init --quiet --bare "$TC19_ROOT/remote.git"
+git clone --quiet "$TC19_ROOT/remote.git" "$TC19_ROOT/home" 2>/dev/null
+git -C "$TC19_ROOT/home" config user.email t@t.t
+git -C "$TC19_ROOT/home" config user.name t
+git -C "$TC19_ROOT/home" checkout -q -b staging
+echo seed > "$TC19_ROOT/home/seed.txt"
+git -C "$TC19_ROOT/home" add -A && git -C "$TC19_ROOT/home" commit -q -m seed
+git -C "$TC19_ROOT/home" push -q origin staging
+TC19_BOUND=$(git -C "$TC19_ROOT/home" rev-parse HEAD)
+echo a > "$TC19_ROOT/home/a.txt"; git -C "$TC19_ROOT/home" add -A
+git -C "$TC19_ROOT/home" commit -q -m 'chore(backlog): reset a row [operator]'
+echo b > "$TC19_ROOT/home/b.txt"; git -C "$TC19_ROOT/home" add -A
+git -C "$TC19_ROOT/home" commit -q -m 'chore(STORY-1): in_progress [daemon]'
+git -C "$TC19_ROOT/home" push -q origin staging
+git -C "$TC19_ROOT/home" fetch -q origin staging
+
+# delivery-daemon.sh runs launch guards at load, so the function is extracted
+# rather than sourced — the same idiom the other daemon suites use.
+TC19_FN="$TC19_ROOT/rebind.sh"
+sed -n '/^_rebind_target_after_self_claim()/,/^}/p' "$DD" > "$TC19_FN"
+TC19_OUT=$(
+  GAAI_DAEMON_HOME="$TC19_ROOT/home" GAAI_TARGET_SHA="$TC19_BOUND" TARGET_BRANCH=staging \
+  /bin/bash -c '
+    log() { :; }
+    . "'"$TC19_FN"'"
+    if _rebind_target_after_self_claim; then echo "REBOUND:$GAAI_TARGET_SHA"; else echo "REFUSED:${_GAAI_REBIND_BLOCKED_BY:-none}"; fi
+  ' 2>/dev/null | tail -1
+)
+case "$TC19_OUT" in
+  REFUSED:*operator*) pass "TC19-6: a foreign commit in the advance defeats the rebind and is named" ;;
+  REFUSED:*)          fail "TC19-6: the rebind refused but did not name the foreign commit: $TC19_OUT" ;;
+  *)                  fail "TC19-6: the rebind accepted an advance it did not author: $TC19_OUT" ;;
+esac
+
+echo ""
 echo "════════════════════════════════════════"
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 [[ "$FAIL_COUNT" -eq 0 ]] || exit 1

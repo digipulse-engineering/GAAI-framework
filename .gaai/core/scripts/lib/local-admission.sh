@@ -5,7 +5,38 @@
 LOCAL_ADMISSION_OUTCOME=""
 LOCAL_ADMISSION_RECEIPT_PATH=""
 
-_local_admission_cleanup() { rm -rf "$1" 2>/dev/null || true; }
+_local_admission_cleanup() {
+  rm -rf "$1" 2>/dev/null || true
+  # The in-flight marker exists only while this gate holds a binding. Every exit
+  # path of the run function passes through here, so the marker cannot outlive
+  # the gate that published it.
+  if [[ -n "${_LOCAL_ADMISSION_INFLIGHT:-}" ]]; then
+    rm -f "$_LOCAL_ADMISSION_INFLIGHT" 2>/dev/null || true
+    _LOCAL_ADMISSION_INFLIGHT=""
+  fi
+  return 0
+}
+
+# Publishes what a gate has bound, for as long as it holds it.
+#
+# A gate binds (base, head, policy, risk, environment) and then runs its selected
+# commands for tens of minutes. Any advance of the base in that window invalidates
+# the receipt and discards the cycle, however well the commands did. Nothing in the
+# tree said a binding was live, so an operator or a peer session merging a pull
+# request could not know it was about to cost a delivery. This marker is that
+# signal — advisory only. It grants nothing, gates nothing, and its absence is
+# never permission.
+_local_admission_publish_inflight() {
+  local receipt_dir="$1" story="$2" boundary="$3" base_ref="$4" base_sha="$5" head_sha="$6"
+  local path="${receipt_dir}/.local-admission-${story}-${boundary}.inflight.json"
+  local tmp="${path}.tmp.$$"
+  ( umask 077; printf '{"story":"%s","boundary":"%s","base_ref":"%s","bound_base":"%s","bound_head":"%s","pid":%s,"started_at":"%s"}\n' \
+      "$story" "$boundary" "$base_ref" "$base_sha" "$head_sha" "$$" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" ) 2>/dev/null || return 0
+  mv -f "$tmp" "$path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  _LOCAL_ADMISSION_INFLIGHT="$path"
+  return 0
+}
 
 _local_admission_seal() {
   local executor="$1" boundary="$2" story="$3" plan="$4" results="$5"
@@ -125,6 +156,8 @@ _run_local_admission() {
   base_sha=$(git -C "$repo" rev-parse "origin/$base_ref" 2>/dev/null) \
     && head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null) \
     || { LOCAL_ADMISSION_OUTCOME="blocked:candidate_unresolvable"; _local_admission_cleanup "$scratch"; return 1; }
+  _local_admission_publish_inflight "$receipt_dir" "$story" "$boundary" \
+    "$base_ref" "$base_sha" "$head_sha"
   _local_admission_resolve "$resolver" "$repo" "$base_ref" "$base_sha" "$head_sha" \
     "$policy" "$risk" "$plan" >/dev/null 2>&1 || true
   if [[ ! -s "$plan" ]] || [[ "$(node -e 'const p=require(process.argv[1]);process.stdout.write(p.status||"")' "$plan" 2>/dev/null)" != resolved ]]; then
