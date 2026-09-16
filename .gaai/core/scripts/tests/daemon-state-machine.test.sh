@@ -476,7 +476,16 @@ S14_MODEL_CALL_LOG="/tmp/gaai-daemon-state-machine.model.$$.log"
 : > "$S14_MODEL_CALL_LOG"
 export GAAI_TEST_MODEL_CALL_LOG="$S14_MODEL_CALL_LOG"
 mkdir -p "$LOCK_DIR/.journal-runs"
+chmod 700 "$LOCK_DIR/.journal-runs"
 touch "$LOCK_DIR/.journal-runs/dispatch.impl.TST-3PHASE-PLANNED.state"
+chmod 600 "$LOCK_DIR/.journal-runs/dispatch.impl.TST-3PHASE-PLANNED.state"
+# Captured from the library source, not via `declare -f`: this function's
+# here-string over a `${var%%$'\n'*}` expansion does not survive bash's own
+# function re-rendering, and an eval of that rendering silently changes the
+# body. The awk span is verbatim text.
+S14_REAL_RESUME=$(awk '/^_journal_resume_pending_lifecycle\(\) \{/{on=1} on{print} on && /^\}/{on=0}' "$DISPATCH_LIB")
+S14_REAL_INSPECT=$(awk '/^_journal_inspect_pending_lifecycle\(\) \{/{on=1} on{print} on && /^\}/{on=0}' "$DISPATCH_LIB")
+S14_DOUBLE_PERSIST=$(declare -f _journal_persist_lifecycle)
 _journal_resume_pending_lifecycle() { return 1; }
 S14_PHASE_BEFORE=$(get_phase_status "TST-3PHASE-PLANNED")
 if dispatch_3phase_story "TST-3PHASE-PLANNED" "test-trace-s14-block" >/dev/null 2>&1; then
@@ -491,24 +500,81 @@ fi
 S14_EMPTY_STATE="$LOCK_DIR/.journal-runs/dispatch.impl.TST-3PHASE-PLANNED.state"
 S14_EMPTY_HANDLER_LOG="/tmp/gaai-daemon-state-machine.empty-handler.$$.log"
 S14_REAL_IMPL_HANDLER=$(declare -f handle_impl_phase)
-_journal_resume_pending_lifecycle() {
-  rm -f "$S14_EMPTY_STATE"
-  return 2
+# A phase killed between the run-state `create` and its first record `append`
+# leaves a valid header with no projected field. Nothing was emitted, so there
+# is no transition to resume — the file must be retired and reported as
+# absence, or it refuses every later cycle and burns one retry each time.
+# Only the manifest reader is substituted here (a real one needs the full
+# registration/record corpus, covered end to end in post-delivery-hook); the
+# resume branch, the discard and the state-file writer below are production.
+eval "$S14_REAL_RESUME"
+S14_EMPTY_TOKEN=$(printf 'a%.0s' $(seq 1 64))
+S14_EMPTY_SOURCE=$(printf 'b%.0s' $(seq 1 40))
+S14_EMPTY_DIGEST=$(printf 'c%.0s' $(seq 1 64))
+_journal_inspect_pending_lifecycle() {
+  printf '%s\t%s\t%s\t%s\t%s\n' "$S14_EMPTY_TOKEN" "$S14_EMPTY_SOURCE" \
+    "$S14_EMPTY_DIGEST" "$S14_EMPTY_DIGEST" "$S14_EMPTY_DIGEST"
 }
 handle_impl_phase() {
   printf '%s\n' "$1" > "$S14_EMPTY_HANDLER_LOG"
   return 0
 }
 if dispatch_3phase_story "TST-3PHASE-PLANNED" "test-trace-empty-state" >/dev/null 2>&1 \
-    && [[ "$(cat "$S14_EMPTY_HANDLER_LOG" 2>/dev/null || true)" == TST-3PHASE-PLANNED ]]; then
+    && [[ "$(cat "$S14_EMPTY_HANDLER_LOG" 2>/dev/null || true)" == TST-3PHASE-PLANNED ]] \
+    && [[ ! -e "$S14_EMPTY_STATE" ]]; then
   pass "S14-PHASE-BLOCK: retired empty state continues current phase dispatch"
 else
   fail "S14-PHASE-BLOCK: empty state retirement blocked the current phase"
 fi
+
+# A run state that does carry a projected field is never discarded by the
+# empty path: it still blocks the next phase and the file stays on disk.
+printf '%s\t%s\t%s\t%s\t%s\n%s\t%s\t%s\t%s\t%s\n' \
+  "$S14_EMPTY_TOKEN" "$S14_EMPTY_SOURCE" "$S14_EMPTY_DIGEST" \
+  "$S14_EMPTY_DIGEST" "$S14_EMPTY_DIGEST" \
+  phase_status "$(printf '0%.0s' $(seq 1 20))-$(printf 'd%.0s' $(seq 1 16)).json" \
+  "$S14_EMPTY_DIGEST" implemented records > "$S14_EMPTY_STATE.rows"
+chmod 600 "$S14_EMPTY_STATE.rows"
+cp "$S14_EMPTY_STATE.rows" "$S14_EMPTY_STATE"
+chmod 600 "$S14_EMPTY_STATE"
+_journal_inspect_pending_lifecycle() { cat "$S14_EMPTY_STATE.rows"; }
+_journal_persist_lifecycle() { return 1; }
+rm -f "$S14_EMPTY_HANDLER_LOG"
+if dispatch_3phase_story "TST-3PHASE-PLANNED" "test-trace-rowed-state" >/dev/null 2>&1; then
+  fail "S14-PHASE-BLOCK-d: a projected-field run state did not block dispatch"
+elif [[ -e "$S14_EMPTY_HANDLER_LOG" ]]; then
+  fail "S14-PHASE-BLOCK-d: a projected-field run state reached the phase handler"
+elif ! cmp -s "$S14_EMPTY_STATE" "$S14_EMPTY_STATE.rows"; then
+  fail "S14-PHASE-BLOCK-d: a projected-field run state was discarded or rewritten"
+else
+  pass "S14-PHASE-BLOCK-d: a projected-field run state still blocks and is preserved"
+fi
+
+# A header that does not parse stays fail-closed: refuse, keep the evidence.
+printf 'not-a-header\n' > "$S14_EMPTY_STATE"
+chmod 600 "$S14_EMPTY_STATE"
+_journal_inspect_pending_lifecycle() { return 1; }
+rm -f "$S14_EMPTY_HANDLER_LOG"
+if dispatch_3phase_story "TST-3PHASE-PLANNED" "test-trace-corrupt-state" >/dev/null 2>&1; then
+  fail "S14-PHASE-BLOCK-e: a corrupt run-state header did not block dispatch"
+elif [[ -e "$S14_EMPTY_HANDLER_LOG" ]]; then
+  fail "S14-PHASE-BLOCK-e: a corrupt run-state header reached the phase handler"
+elif [[ "$(cat "$S14_EMPTY_STATE")" != "not-a-header" ]]; then
+  fail "S14-PHASE-BLOCK-e: a corrupt run-state header was erased"
+else
+  pass "S14-PHASE-BLOCK-e: a corrupt run-state header fails closed and is preserved"
+fi
+
 eval "$S14_REAL_IMPL_HANDLER"
+# Restore the library function and the suite's own persistence double; an
+# `unset -f` here would delete them outright rather than uncover them.
+eval "$S14_REAL_INSPECT"
+eval "$S14_DOUBLE_PERSIST"
 _journal_resume_pending_lifecycle() { return 2; }
-rm -f "$S14_EMPTY_STATE" "$S14_EMPTY_HANDLER_LOG" "$S14_MODEL_CALL_LOG"
+rm -f "$S14_EMPTY_STATE" "$S14_EMPTY_STATE.rows" "$S14_EMPTY_HANDLER_LOG" "$S14_MODEL_CALL_LOG"
 unset GAAI_TEST_MODEL_CALL_LOG S14_MODEL_CALL_LOG S14_PHASE_BEFORE
+unset S14_REAL_RESUME S14_REAL_INSPECT S14_DOUBLE_PERSIST
+unset S14_EMPTY_TOKEN S14_EMPTY_SOURCE S14_EMPTY_DIGEST
 
 # ── T5: dispatch planned → implemented ───────────────────────
 echo "T5: dispatch planned → implemented (TST-3PHASE-PLANNED)"

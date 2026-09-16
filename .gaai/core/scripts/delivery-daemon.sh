@@ -3039,7 +3039,10 @@ _forward_relaunch() {
     return 1
   fi
   local pending_rc=0
-  _journal_inspect_pending_lifecycle "$sid" recovery.scan >/dev/null 2>&1 || pending_rc=$?
+  # Settle rather than merely observe: a run-state file left with a header and
+  # no projected field names no transition and would otherwise refuse every
+  # relaunch for the lifetime of the Story. Any other retained run still holds.
+  _journal_settle_pending_lifecycle "$sid" recovery.scan >/dev/null || pending_rc=$?
   [[ "$pending_rc" -eq 2 ]] || return 1
   _forward_revalidate_after_reconcile "$sid" "$c_source" "$c_blob" \
     "$c_record" "$bound_scope" "$bound_allow_absent" || return 1
@@ -3151,7 +3154,10 @@ _forward_retained_settle() {
   else
     # A successful projector verifies the remote bytes and retires its own
     # run-state. Absence is therefore the success proof here; attempting a
-    # second retirement turns success into a permanent retry loop.
+    # second retirement turns success into a permanent retry loop. This one
+    # stays a plain observation, never a settle: the projector above already
+    # reported success, so any file here — header-only included — contradicts
+    # that and must fail closed rather than be discarded.
     _journal_inspect_pending_lifecycle "$sid" recovery.scan >/dev/null 2>&1 || pending_rc=$?
     [[ "$pending_rc" -eq 2 ]] || { rm -f "$_FORWARD_SNAPSHOT"; return 1; }
     forward_context_remove "$context" "$context_digest" || {
@@ -3190,7 +3196,7 @@ _forward_recovery_one() {
     recovery_scope=postclaim
   fi
 
-  manifest=$(_journal_inspect_pending_lifecycle "$sid" recovery.scan) || manifest_rc=$?
+  manifest=$(_journal_settle_pending_lifecycle "$sid" recovery.scan) || manifest_rc=$?
   case "$manifest_rc" in
     0|2) ;;
     1)
@@ -5795,7 +5801,7 @@ PY
 
     # Settle retained lifecycle authority before temporary execution checks.
     _pending_rc=0
-    _journal_inspect_pending_lifecycle "$story_id" recovery.scan >/dev/null 2>&1 || _pending_rc=$?
+    _journal_settle_pending_lifecycle "$story_id" recovery.scan >/dev/null || _pending_rc=$?
     if [[ "$_pending_rc" -eq 0 ]]; then
       if ! _forward_main_hold "$story_id" pending_run \
           "$_post_source_digest" "$_post_record"; then

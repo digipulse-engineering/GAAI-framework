@@ -870,6 +870,83 @@ _journal_retire_accepted_lifecycle() {
   _lifecycle_with_staging_lock _journal_retire_accepted_lifecycle_locked "$@"
 }
 
+# A run-state file carrying a valid header and no record row is the footprint
+# of a writer killed between `create` and its first `append`: a run token was
+# registered, but no field was ever projected.  There is no transition to
+# resume and no record to verify, so the file is pure residue — yet every
+# later cycle re-reads it, finds nothing to settle and refuses, which wedges
+# the Story until an operator moves the file aside by hand.  Retire it through
+# the same write primitive the accepted path uses, never an ad-hoc unlink.
+#
+# Correctness rests on the staging lock: `_journal_persist_lifecycle` holds it
+# across create/append/remove, so a header-only file observed while this holds
+# the lock cannot belong to a writer still mid-run.  The manifest is re-read
+# inside the lock and the caller's state digest re-checked, so a run that
+# advanced or restarted between the caller's observation and this call is
+# refused rather than clobbered.
+_journal_discard_empty_lifecycle_locked() {
+  local story_id="$1" writer="$2" expected_state_digest="$3"
+  local manifest token source token_digest state_digest records_digest
+  manifest=$(_journal_inspect_pending_lifecycle "$story_id" "$writer") || return 1
+  if [[ "$manifest" == *$'\n'* ]]; then
+    return 1
+  fi
+  IFS=$'\t' read -r token source token_digest state_digest records_digest \
+    <<< "$manifest" || return 1
+  _lifecycle_run_header_empty "$token" "$source" "$token_digest" \
+    "$state_digest" "$records_digest" || return 1
+  [[ "$state_digest" == "$expected_state_digest" ]] || return 1
+  _lifecycle_write_run_state \
+    "${LOCK_DIR:?}/.journal-runs/${writer}.${story_id}.state" remove
+}
+
+_journal_discard_empty_lifecycle() {
+  _lifecycle_with_staging_lock _journal_discard_empty_lifecycle_locked "$@"
+}
+
+# Shape check for the header of a run state that carries no rows.  Only a
+# fully well-formed header authorizes the discard above; anything else keeps
+# the caller on its existing fail-closed path.
+_lifecycle_run_header_empty() {
+  local token="$1" source="$2" token_digest="$3" state_digest="$4" records_digest="$5"
+  [[ "$token" =~ ^[0-9a-f]{64}$ && "$source" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$token_digest" =~ ^[0-9a-f]{64}$ && "$state_digest" =~ ^[0-9a-f]{64}$ \
+      && "$records_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  return 0
+}
+
+# Answer "may I proceed?" for callers that only need to know whether a pending
+# run still owns this Story.  Return 0 and print the manifest when a real
+# pending run remains, 2 when nothing is pending, 1 when the retained evidence
+# is malformed.  A header-only file is discarded here and reported as nothing
+# pending; every other shape keeps exactly the classification
+# `_journal_inspect_pending_lifecycle` already gives it.
+_journal_settle_pending_lifecycle() {
+  local story_id="$1" writer="$2" manifest inspect_rc=0
+  local token source token_digest state_digest records_digest
+  manifest=$(_journal_inspect_pending_lifecycle "$story_id" "$writer") || inspect_rc=$?
+  if [[ "$inspect_rc" -ne 0 ]]; then
+    return "$inspect_rc"
+  fi
+  if [[ "$manifest" == *$'\n'* ]]; then
+    printf '%s\n' "$manifest"
+    return 0
+  fi
+  IFS=$'\t' read -r token source token_digest state_digest records_digest \
+    <<< "$manifest" || true
+  if ! _lifecycle_run_header_empty "$token" "$source" "$token_digest" \
+      "$state_digest" "$records_digest"; then
+    printf '%s\n' "$manifest"
+    return 0
+  fi
+  if ! _journal_discard_empty_lifecycle "$story_id" "$writer" "$state_digest"; then
+    echo "[LIFECYCLE-JOURNAL] story=$story_id writer=$writer outcome=rejected reason=empty_run_state" >&2
+    return 1
+  fi
+  echo "[LIFECYCLE-JOURNAL] story=$story_id writer=$writer outcome=discarded reason=empty_run_state" >&2
+  return 2
+}
+
 _lifecycle_record_matches() {
   local record_path="$1" story_id="$2" field="$3" writer="$4" token="$5"
   local expected="$6" digest="$7"
@@ -1351,8 +1428,16 @@ _journal_resume_pending_lifecycle() {
     args+=("$field" "$value")
   done <<< "$rows"
   if (( ${#args[@]} < 2 )); then
-    echo "[LIFECYCLE-JOURNAL] story=$story_id writer=$writer outcome=rejected reason=empty_run_state" >&2
-    return 1
+    # Header present, no field ever projected: nothing was emitted, so there
+    # is nothing to resume.  Retire the residue and report absence so the
+    # dispatcher runs the current phase instead of refusing every cycle.
+    if [[ "$manifest" == *$'\n'* ]] \
+        || ! _journal_discard_empty_lifecycle "$story_id" "$writer" "$state_digest"; then
+      echo "[LIFECYCLE-JOURNAL] story=$story_id writer=$writer outcome=rejected reason=empty_run_state" >&2
+      return 1
+    fi
+    echo "[LIFECYCLE-JOURNAL] story=$story_id writer=$writer outcome=discarded reason=empty_run_state" >&2
+    return 2
   fi
 
   echo "[LIFECYCLE-JOURNAL] story=$story_id writer=$writer outcome=retryable reason=pending_run" >&2
@@ -1670,6 +1755,197 @@ _remove_active_marker() {
   rm -f "${mdir}/${story_id}.${phase}.active" 2>/dev/null || true
 }
 
+# ── Shared-home containment for agent phases ─────────────────────────────
+# The daemon entry binds its remote identity into the private root it owns
+# (the per-uid `<private-root>/home`): a two-line git credential configuration
+# whose leading empty helper resets the accumulated chain, plus the links that
+# let the executor and the forge CLI authenticate from a home that holds
+# nothing else. Every agent phase inherits that HOME. A Story whose own test
+# suite launches a daemon — a fixture copy of the entry, an opt-in "real
+# daemon" smoke — therefore re-provisions those exact paths underneath the
+# live daemon that is running the phase. From that moment the daemon's own
+# fetch can no longer authenticate, the phase's durable projection is rejected
+# as source_unavailable, and the cycle is discarded.
+#
+# The OSS corpus runner already contains this for gate runs. Impl, QA and plan
+# agents run outside that runner, so the phase itself has to own the same
+# containment: snapshot the entry-owned paths before the agent starts, put
+# them back when it ends. The list is deliberately the same one the corpus
+# runner protects — keep the two in step.
+#
+# This code only ever reads, compares and names PATHS. No content of any of
+# these files is printed, copied outside the private root, or digested.
+_SHARED_HOME_PATHS='.gitconfig .gaai-git-credential-helper.sh .claude.json .codex/auth.json .claude/.credentials.json Library/Keychains'
+
+# Resolves the home this containment owns, or fails when there is none to own.
+# Without the override the containment engages ONLY on the private root the
+# daemon entry provisions, recomputed with the entry's own formula: a wrapper
+# invoked under an operator HOME (a test, a by-hand dispatch) must not have its
+# real configuration snapshotted or rewritten. GAAI_SHARED_HOME_ROOT exists so
+# the regression suite can point it at a sandbox.
+_shared_home_root() {
+  if [[ -n "${GAAI_SHARED_HOME_ROOT:-}" ]]; then
+    [[ -d "$GAAI_SHARED_HOME_ROOT" ]] || return 1
+    printf '%s' "$GAAI_SHARED_HOME_ROOT"
+    return 0
+  fi
+  local private_home="/tmp/.gaai-p-${UID:-0}/home"
+  [[ "${HOME:-}" == "$private_home" && -d "$private_home" ]] || return 1
+  printf '%s' "$private_home"
+}
+
+# ── Admission-gate interlock ─────────────────────────────────────────────
+# The local admission gate binds the facts its commands ran under and resolves
+# the candidate three times against the remote. A repair that changed the
+# identity those fetches authenticate with, mid-flight, would make a
+# stale_evidence verdict unattributable. The gate therefore publishes a marker
+# for as long as it executes, and the repair waits for quiescence.
+#
+# The marker names the wrapper's pid, so liveness is a real check rather than
+# an age guess: a marker whose writer is gone is swept by the reader and can
+# never inhibit the repair for the rest of the daemon's life.
+_admission_gate_marker_path() {
+  printf '%s/.admission-gate-active.%s' "$(_marker_dir)" "${1:-$$}"
+}
+
+_write_admission_gate_marker() {
+  local marker tmp
+  marker=$(_admission_gate_marker_path)
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || return 1
+  tmp="${marker}.tmp"
+  (
+    umask 077
+    printf 'pid=%s\ncreated_at=%s\n' "$$" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$tmp"
+  ) || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+  mv "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+}
+
+_remove_admission_gate_marker() {
+  rm -f "$(_admission_gate_marker_path)" 2>/dev/null || true
+}
+
+_admission_gate_in_flight() {
+  local mdir marker pid
+  mdir=$(_marker_dir)
+  [[ -d "$mdir" ]] || return 1
+  for marker in "$mdir"/.admission-gate-active.*; do
+    [[ -f "$marker" ]] || continue
+    pid="${marker##*.}"
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+      rm -f "$marker" 2>/dev/null || true
+      continue
+    fi
+    kill -0 "$pid" 2>/dev/null && return 0
+    rm -f "$marker" 2>/dev/null || true
+  done
+  return 1
+}
+
+# Bounded wait for the gate to finish. The bound is failure containment, not a
+# deadline on the gate: a wrapper must not block on a marker whose owner is
+# wedged. Exceeding it defers the repair and says so in the log.
+_await_admission_quiescence() {
+  local waited=0 bound="${GAAI_SHARED_HOME_RESTORE_WAIT_SECONDS:-120}"
+  [[ "$bound" =~ ^[0-9]+$ ]] || bound=120
+  while _admission_gate_in_flight; do
+    (( waited >= bound )) && return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 0
+}
+
+# ── Snapshot / compare / restore ─────────────────────────────────────────
+_shared_home_snapshot() {
+  local home snap p
+  home=$(_shared_home_root) || return 1
+  snap=$(mktemp -d "${TMPDIR:-/tmp}/gaai-phase-home.XXXXXX" 2>/dev/null) || return 1
+  chmod 700 "$snap" 2>/dev/null || true
+  for p in $_SHARED_HOME_PATHS; do
+    if [[ -L "$home/$p" || -f "$home/$p" ]]; then
+      mkdir -p "$snap/$(dirname "$p")" 2>/dev/null || continue
+      cp -a "$home/$p" "$snap/$p" 2>/dev/null || true
+    fi
+  done
+  printf '%s' "$snap"
+}
+
+# True when the live entry is what the snapshot recorded. A symlink is compared
+# by its target, a regular file by `cmp`, which reports sameness without ever
+# emitting a byte of either file. A directory is never a match and never
+# touched — the entry links Library/Keychains, it does not own a real one.
+_shared_home_entry_matches() {
+  local snap="$1" home="$2" p="$3"
+  local live="$home/$p" kept="$snap/$p"
+  if [[ -L "$live" ]]; then
+    [[ -L "$kept" ]] || return 1
+    [[ "$(readlink "$live" 2>/dev/null)" == "$(readlink "$kept" 2>/dev/null)" ]]
+    return
+  fi
+  if [[ -d "$live" ]]; then
+    return 0
+  fi
+  if [[ -f "$live" ]]; then
+    [[ -f "$kept" && ! -L "$kept" ]] || return 1
+    cmp -s "$live" "$kept"
+    return
+  fi
+  [[ ! -L "$kept" && ! -f "$kept" ]]
+}
+
+# Puts one entry back. The replacement is staged beside its destination and
+# renamed onto it, so a concurrent reader sees either the old entry or the new
+# one and never a partial write. A path the snapshot did not hold is removed —
+# that is how a helper script an agent left behind stops being reachable.
+_shared_home_restore_entry() {
+  local snap="$1" home="$2" p="$3"
+  local live="$home/$p" kept="$snap/$p" staged
+  [[ -L "$live" || ! -d "$live" ]] || return 1
+  if [[ ! -L "$kept" && ! -f "$kept" ]]; then
+    rm -f "$live" 2>/dev/null || return 1
+    return 0
+  fi
+  mkdir -p "$(dirname "$live")" 2>/dev/null || return 1
+  staged="${live}.gaai-restore.$$"
+  rm -f "$staged" 2>/dev/null || true
+  cp -a "$kept" "$staged" 2>/dev/null \
+    || { rm -f "$staged" 2>/dev/null || true; return 1; }
+  mv -f "$staged" "$live" 2>/dev/null \
+    || { rm -f "$staged" 2>/dev/null || true; return 1; }
+}
+
+# Restores whatever the agent phase changed, and says so once. Silent when the
+# home is untouched, which is the common case — the log line means a repair
+# actually happened.
+_shared_home_restore() {
+  local snap="$1" story_id="$2" phase="$3"
+  local home p drift="" restored="" failed=""
+  [[ -n "$snap" && -d "$snap" ]] || return 0
+  home=$(_shared_home_root) || { rm -rf -- "$snap" 2>/dev/null || true; return 0; }
+  for p in $_SHARED_HOME_PATHS; do
+    _shared_home_entry_matches "$snap" "$home" "$p" \
+      || drift="${drift}${drift:+,}${p}"
+  done
+  if [[ -z "$drift" ]]; then
+    rm -rf -- "$snap" 2>/dev/null || true
+    return 0
+  fi
+  if ! _await_admission_quiescence; then
+    echo "[SHARED-HOME] story=${story_id} phase=${phase} result=deferred reason=admission_gate_active paths=${drift}"
+    rm -rf -- "$snap" 2>/dev/null || true
+    return 0
+  fi
+  for p in ${drift//,/ }; do
+    if _shared_home_restore_entry "$snap" "$home" "$p"; then
+      restored="${restored}${restored:+,}${p}"
+    else
+      failed="${failed}${failed:+,}${p}"
+    fi
+  done
+  rm -rf -- "$snap" 2>/dev/null || true
+  echo "[SHARED-HOME] story=${story_id} phase=${phase} result=restored paths=${restored:-none}${failed:+ failed=${failed}}"
+}
+
 # ── Per-phase log rotation ────────────────────────────────────────────────
 # Each phase's claude -p run writes to ${worktree}/.delivery-logs/{id}.{phase}.log
 # via `tee -a`. On retry after a failed attempt (e.g., error_max_turns), the
@@ -1890,6 +2166,12 @@ _run_claude_with_loop_breaker() {
       ;;
   esac
 
+  # The agent inherits the daemon's HOME. Record the entry-owned identity paths
+  # now so whatever the phase does to them is undone when it ends, on every
+  # return path below. See _shared_home_snapshot.
+  local _home_snapshot=""
+  _home_snapshot=$(_shared_home_snapshot 2>/dev/null) || _home_snapshot=""
+
   # Bypass mode — original synchronous pipeline (escape hatch / debugging).
   # Subshell + exec replaces the subshell process with the agent after cd, so
   # $! reports the agent's PID and signals propagate correctly.
@@ -1904,6 +2186,7 @@ _run_claude_with_loop_breaker() {
     fi
     local rc=${PIPESTATUS[0]}
     set +o pipefail
+    _shared_home_restore "$_home_snapshot" "$story_id" "$phase"
     # `timeout` exits 124 on SIGTERM, 137 on SIGKILL — translate both to our
     # canonical wall-clock RC. 124 collides with the loop-breaker code, but
     # the breaker path emits a synthetic JSONL marker and only triggers via
@@ -1925,6 +2208,7 @@ _run_claude_with_loop_breaker() {
     ( cd "$worktree_path" && exec "${agent_cmd[@]}" < "$prompt_file" 2>&1 ) | tee -a "$log_path"
     local rc=${PIPESTATUS[0]}
     set +o pipefail
+    _shared_home_restore "$_home_snapshot" "$story_id" "$phase"
     return "$rc"
   fi
 
@@ -2031,6 +2315,7 @@ _run_claude_with_loop_breaker() {
   # out of memory. Running it here — once, after the phase, on every return path —
   # bounds the leak to a single phase.
   _reap_worktree_orphans "$worktree_path"
+  _shared_home_restore "$_home_snapshot" "$story_id" "$phase"
 
   if [[ "$breaker_triggered" == "1" ]]; then
     return 124
@@ -2519,7 +2804,14 @@ _local_admission_gate() {
   local receipts="$(_marker_dir)/local-admission-receipts" expected_publication=false
   GAAI_ADMITTED_SHA=""; GAAI_ADMITTED_BASE_SHA=""; GAAI_ADMISSION_RECEIPT=""
   [[ "$boundary" == final ]] && expected_publication=true
-  if ! _run_local_admission "$boundary" "$story_id" "$repo" "${TARGET_BRANCH:-staging}" "$receipts"; then
+  # Published for as long as the gate executes, so a concurrent phase's
+  # shared-home repair waits instead of moving the ground under its fetches.
+  local _gate_rc=0
+  _write_admission_gate_marker || true
+  _run_local_admission "$boundary" "$story_id" "$repo" "${TARGET_BRANCH:-staging}" "$receipts" \
+    || _gate_rc=$?
+  _remove_admission_gate_marker
+  if (( _gate_rc != 0 )); then
     _route_admission_block "$story_id" "$trace_id" "$boundary" "${LOCAL_ADMISSION_OUTCOME:-blocked:unknown}"
     return 1
   fi
