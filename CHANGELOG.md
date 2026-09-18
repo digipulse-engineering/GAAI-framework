@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.50.0] - 2026-09-18
+
+### Changed
+- feat: publish what a gate has bound while it holds it
+- fix: say why a stale head halted delivery, and say it once
+- fix: restore the entry-owned private home after every agent phase
+- fix: discard an empty lifecycle run state instead of wedging dispatch
+- fix: keep the vendored runtime assets at 0644 across every fixture checkout
+- fix: show the admission gate before QA and commit as its own state
+- fix: reap a story worktree only on current-cycle PR evidence
+
+
 ## [2.49.0] - 2026-09-17
 
 ### Changed
