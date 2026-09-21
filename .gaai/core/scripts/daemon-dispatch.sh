@@ -2916,13 +2916,19 @@ ensure_wt_dependencies_installed() {
     t_start=$(( $(date +%s) * 1000 ))
   fi
 
+  # The install runs under the daemon's private HOME, whose Corepack cache has
+  # never seen the package manager the repository pins. Corepack then asks
+  # "Do you want to continue? [Y/n]" on a terminal nobody is watching, the
+  # install blocks until the timeout, and the phase fails with
+  # PNPM_INSTALL_FAILED before any agent has run. Unattended is the only mode
+  # this code path has, so the prompt is answered by policy, not by a person.
   timeout_cmd=$(_resolve_timeout_cmd)
   install_exit=0
   if [[ -n "$timeout_cmd" ]]; then
-    (cd "$worktree_path" && "$timeout_cmd" "$timeout_s" pnpm install --frozen-lockfile --silent) \
+    (cd "$worktree_path" && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 "$timeout_cmd" "$timeout_s" pnpm install --frozen-lockfile --silent) \
       || install_exit=$?
   else
-    (cd "$worktree_path" && pnpm install --frozen-lockfile --silent) &
+    (cd "$worktree_path" && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm install --frozen-lockfile --silent) &
     local install_pid=$!
     local waited=0
     while kill -0 "$install_pid" 2>/dev/null; do
@@ -5511,6 +5517,19 @@ _merge_exact_pr_head_capture() {
 # any merge API can be reached.
 _resolve_auto_merge_policy() {
   local story_auto_merge="$1" trailer_killswitch="$2" authority_human_required="${3:-false}"
+  # A Story that declares nothing grants nothing.
+  #
+  # The fallback below used to read a workspace policy whose default resolves to
+  # "merge" whenever the target is the configured branch. A Story row that simply
+  # omitted its auto-merge declaration therefore authorized the daemon to merge
+  # its own pull request, with no operator having enabled anything. Backlog rows
+  # that happen to carry an explicit refusal are data, not a control: one row
+  # written without the field removes the only thing standing in the way.
+  #
+  # Manual review is the default while trust is being built, so an absent
+  # declaration resolves to no merge whatever the workspace policy says. Enabling
+  # auto-merge stays possible and stays explicit: a Story row that declares it,
+  # or an operator who sets the policy variable.
   if [[ "$authority_human_required" == "true" ]]; then
     echo "false|trust_surface_changed"
   elif [[ "$trailer_killswitch" == "true" ]]; then
@@ -5519,8 +5538,10 @@ _resolve_auto_merge_policy() {
     echo "true|null"
   elif [[ "$story_auto_merge" == "false" ]]; then
     echo "false|story_override"
+  elif [[ -z "${GAAI_AUTO_MERGE_POLICY:-}" ]]; then
+    echo "false|no_story_declaration"
   else
-    local workspace_policy="${GAAI_AUTO_MERGE_POLICY:-staging_only}"
+    local workspace_policy="$GAAI_AUTO_MERGE_POLICY"
     if [[ "$workspace_policy" == "on" ]]; then
       echo "true|null"
     elif [[ "$workspace_policy" == "staging_only" && "${TARGET_BRANCH:-staging}" == "staging" ]]; then
