@@ -3040,6 +3040,44 @@ else
 fi
 export GAAI_AUTO_MERGE_POLICY=off
 
+# ── T40d: a Story row that omits auto_merge grants nothing ──────────────────
+# The regression this suite never covered. The resolver's fallback read a
+# workspace policy whose default returns "merge" whenever the target is the
+# configured branch, so a row written without the field was authorized to merge
+# itself; rows carrying an explicit refusal were the only thing preventing it.
+# An absent declaration must grant nothing, and enabling auto-merge must stay an
+# explicit act.
+echo "T40d: an absent auto_merge declaration grants no merge authority"
+if declare -F _resolve_auto_merge_policy >/dev/null 2>&1; then
+  _out=$(unset GAAI_AUTO_MERGE_POLICY; TARGET_BRANCH=staging \
+    _resolve_auto_merge_policy "" false false)
+  if [[ "$_out" == "false|no_story_declaration" ]]; then
+    pass "T40d-1: omitted field, no policy set → no merge ($_out)"
+  else
+    fail "T40d-1: an omitted field authorized a merge ($_out)"
+  fi
+  _out=$(GAAI_AUTO_MERGE_POLICY=on TARGET_BRANCH=staging _resolve_auto_merge_policy "" false false)
+  if [[ "$_out" == "true|null" ]]; then
+    pass "T40d-2: an operator policy remains an explicit opt-in"
+  else
+    fail "T40d-2: the explicit operator policy stopped working ($_out)"
+  fi
+  _out=$(TARGET_BRANCH=staging _resolve_auto_merge_policy true false false)
+  if [[ "$_out" == "true|null" ]]; then
+    pass "T40d-3: a Story declaring auto_merge true still opts in"
+  else
+    fail "T40d-3: an explicit Story opt-in stopped working ($_out)"
+  fi
+  _out=$(unset GAAI_AUTO_MERGE_POLICY; TARGET_BRANCH=staging _resolve_auto_merge_policy "" false true)
+  if [[ "$_out" == "false|trust_surface_changed" ]]; then
+    pass "T40d-4: a trust-surface change keeps precedence over everything"
+  else
+    fail "T40d-4: trust-surface precedence lost ($_out)"
+  fi
+else
+  fail "T40d: _resolve_auto_merge_policy is not defined"
+fi
+
 # ── T41: GAAI_AUTO_MERGE_POLICY=off → auto_merge_applied:false ─
 echo "T41: GAAI_AUTO_MERGE_POLICY=off → auto_merge_applied:false in routing record"
 > "$ROUTING_LOG"

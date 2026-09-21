@@ -4615,9 +4615,16 @@ _rebind_target_after_self_claim() {
   [[ "$head" == "$remote" ]] || return 1
   [[ "$head" != "$bound" ]] || return 0
   git -C "$home" merge-base --is-ancestor "$bound" "$head" 2>/dev/null || return 1
+  # This daemon projects to the target through two writers, and both must be
+  # recognised as its own. The claim writer stamps `[daemon]`; the lifecycle
+  # journal writer stamps `[dispatch]`, and it is by far the more frequent of
+  # the two. Accepting only the first meant every journal push the daemon
+  # itself made read as a foreign advance, and the daemon halted on its own
+  # projection. `[operator]` is a human write and stays foreign: fail closed.
   local foreign=""
   while IFS= read -r subject; do
     [[ "$subject" == chore\(*\):*\[daemon\] ]] && continue
+    [[ "$subject" == chore\(*\):*\[dispatch\] ]] && continue
     foreign="${foreign:+$foreign; }${subject}"
   done < <(git -C "$home" log --format='%s' "${bound}..${head}" 2>/dev/null)
   if [[ -n "$foreign" ]]; then

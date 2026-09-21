@@ -42,6 +42,7 @@ trap cleanup EXIT
 cat > "$MOCK_BIN/pnpm" <<'MOCK_EOF'
 #!/usr/bin/env bash
 echo "pnpm $*" >> "$PNPM_LOG"
+echo "env COREPACK_ENABLE_DOWNLOAD_PROMPT=${COREPACK_ENABLE_DOWNLOAD_PROMPT:-unset}" >> "$PNPM_LOG"
 if [[ -n "${MOCK_PNPM_CREATE_MARKER:-}" ]]; then
   mkdir -p "$MOCK_PNPM_CREATE_MARKER"
 fi
@@ -308,6 +309,19 @@ fi
 
 # ════════════════════════════════════════════════════════════════════════════════
 echo ""
+# ── T9: the install answers Corepack's download prompt by policy ─────────────
+# Under the daemon's private HOME, Corepack asks before downloading the pinned
+# package manager. No one is there to answer, so the install must run with the
+# prompt disabled or it blocks until the timeout and the phase never starts.
+echo "T9: pnpm sees COREPACK_ENABLE_DOWNLOAD_PROMPT=0"
+: > "$PNPM_LOG"; rm -rf "$WT_PATH/node_modules"
+ensure_wt_dependencies_installed "TST-T9" "trace-t9" "$WT_PATH" 5 >/dev/null 2>&1 || true
+if grep -q '^env COREPACK_ENABLE_DOWNLOAD_PROMPT=0$' "$PNPM_LOG"; then
+  pass "T9: the prompt is disabled for the unattended install"
+else
+  fail "T9: pnpm ran without the prompt disabled — $(grep '^env' "$PNPM_LOG" | tail -1)"
+fi
+
 echo "══════════════════════════════════════════════════"
 echo "  Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 echo "══════════════════════════════════════════════════"

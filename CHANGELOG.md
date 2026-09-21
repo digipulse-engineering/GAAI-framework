@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+- fix: probe a file mode with GNU stat first, BSD second
+- fix: a Story that declares no auto-merge grants no merge authority
+- fix: recognise the lifecycle journal as this daemon's own projection
+- fix: answer Corepack's download prompt by policy in the worktree install
+
 ## [2.50.0] - 2026-09-18
 
 ### Changed

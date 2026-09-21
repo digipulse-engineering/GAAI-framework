@@ -447,6 +447,51 @@ echo "$OUT" | grep -q 'reason=target_fetch_failed action=none' \
   || fail "TC18-2: a lifecycle was created despite an unreachable target"
 git -C "$PROJ" remote set-url origin "$ROOT/remote.git"
 
+
+echo ""
+echo "=== TC19-7: the rebind accepts both of this daemon's own writers, and only those ==="
+# Behavioural, not a grep: extract the classifier and run it against a real
+# commit chain. The journal writer stamps `[dispatch]`, the claim writer
+# `[daemon]`; an `[operator]` write is human and must still refuse.
+_fn_start=$(grep -n '^_rebind_target_after_self_claim()' "$DD" | cut -d: -f1)
+_fn_end=$(awk -v s="$_fn_start" 'NR>s && /^}/ {print NR; exit}' "$DD")
+_fn_src=$(sed -n "${_fn_start},${_fn_end}p" "$DD")
+_rb=$(mktemp -d "${TMPDIR:-/tmp}/tc19-7.XXXXXX")
+git init -q --bare "$_rb/remote.git"
+git -c init.defaultBranch=staging init -q "$_rb/home"
+git -C "$_rb/home" remote add origin "$_rb/remote.git"
+_gc() { git -C "$_rb/home" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "$1"; }
+_gc "base"; _bound=$(git -C "$_rb/home" rev-parse HEAD)
+_gc "chore(story): in_progress [daemon]"
+_gc "chore(framework): project lifecycle journal [dispatch]"
+git -C "$_rb/home" push -q origin HEAD:staging 2>/dev/null
+_out=$(/bin/bash -c "
+  log() { :; }
+  $_fn_src
+  GAAI_DAEMON_HOME='$_rb/home' GAAI_TARGET_SHA='$_bound' TARGET_BRANCH=staging
+  if _rebind_target_after_self_claim; then echo rebound=\$GAAI_TARGET_SHA; else echo refused blocked=\${_GAAI_REBIND_BLOCKED_BY:-none}; fi
+")
+_head=$(git -C "$_rb/home" rev-parse HEAD)
+if [[ "$_out" == "rebound=$_head" ]]; then
+  pass "TC19-7a: an advance made only of [daemon] and [dispatch] writes rebinds"
+else
+  fail "TC19-7a: the daemon's own journal write was treated as foreign: $_out"
+fi
+_gc "chore(story): reset to refined [operator]"
+git -C "$_rb/home" push -q origin HEAD:staging 2>/dev/null
+_out=$(/bin/bash -c "
+  log() { :; }
+  $_fn_src
+  GAAI_DAEMON_HOME='$_rb/home' GAAI_TARGET_SHA='$_bound' TARGET_BRANCH=staging
+  if _rebind_target_after_self_claim; then echo rebound; else echo refused blocked=\${_GAAI_REBIND_BLOCKED_BY:-none}; fi
+")
+if [[ "$_out" == refused*operator* ]]; then
+  pass "TC19-7b: an interleaved [operator] write still refuses and is named"
+else
+  fail "TC19-7b: a human write was accepted as the daemon's own: $_out"
+fi
+rm -rf "$_rb"
+
 echo ""
 echo "=== TC19: a target that advanced past the launch tuple is diagnosed once, with its cause ==="
 # The daemon pins its home to the sha its launch proved. When the target advances

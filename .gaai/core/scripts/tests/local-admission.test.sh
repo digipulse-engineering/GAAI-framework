@@ -345,9 +345,14 @@ if node -e '
   pass 'the marker names the story, the boundary, the bound pair and its publisher'
 else fail "the marker is missing or malformed: $(cat "$MARKER" 2>/dev/null)"; fi
 
-if [[ "$(stat -f '%Lp' "$MARKER" 2>/dev/null || stat -c '%a' "$MARKER" 2>/dev/null)" == "600" ]]; then
+# GNU stat first, BSD second, and the order is load-bearing: GNU's -f means
+# --file-system, so "stat -f '%Lp' FILE" never reports a mode and the probe
+# silently compares the wrong thing on Linux. BSD stat has no -c and falls
+# through cleanly.
+_marker_mode="$(stat -c '%a' "$MARKER" 2>/dev/null || stat -f '%Lp' "$MARKER" 2>/dev/null)"
+if [[ "$_marker_mode" == "600" ]]; then
   pass 'the marker is owner-only'
-else fail 'the marker is readable beyond its owner'; fi
+else fail "the marker is readable beyond its owner (mode=${_marker_mode:-unreadable})"; fi
 
 _LOCAL_ADMISSION_INFLIGHT="$MARKER"
 _local_admission_cleanup "$ROOT/no-such-scratch"
