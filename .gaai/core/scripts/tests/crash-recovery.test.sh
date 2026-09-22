@@ -2733,12 +2733,13 @@ git -C "$WRAPPER_RUNTIME" add \
   .gaai/project/contexts/artefacts/stories/EWRUNTIME.story.md
 cat > "$WRAPPER_RUNTIME/.gaai/core/scripts/daemon-dispatch.sh" <<EOF
 source "$ROOT/.gaai/core/scripts/daemon-dispatch.sh" || return 1
+eval "\$(declare -f get_phase_status | sed '1s/^get_phase_status/_wrapper_real_get_phase_status/')"
 get_phase_status(){
-  if [[ "\${WRAPPER_TEST_MODE:-guard}" == rebind_* ]]; then
-    cat "\$WRAPPER_TEST_PHASE_FILE"
-  else
-    printf '%s\n' "\${WRAPPER_TEST_PHASE:?}"
-  fi
+  case "\${WRAPPER_TEST_MODE:-guard}" in
+    stale_local) _wrapper_real_get_phase_status "\$@" ;;
+    rebind_*) cat "\$WRAPPER_TEST_PHASE_FILE" ;;
+    *) printf '%s\n' "\${WRAPPER_TEST_PHASE:?}" ;;
+  esac
 }
 _wrapper_set_story_field(){
   yaml_runtime_run "\$BACKLOG_FILE" "\$1" "\$2" "\$3" <<'PY'
@@ -2837,11 +2838,16 @@ handle_impl_phase(){
 }
 handle_qa_phase(){
   case "\${WRAPPER_TEST_MODE:-guard}" in
-    rebind_*) : > "\$WRAPPER_TEST_SENTINELS/qa"; return 1 ;;
+    rebind_*|stale_local) : > "\$WRAPPER_TEST_SENTINELS/qa"; return 1 ;;
     *) : > "\$WRAPPER_TEST_SENTINELS/handler" ;;
   esac
 }
-handle_commit_phase(){ : > "\$WRAPPER_TEST_SENTINELS/handler"; }
+handle_commit_phase(){
+  case "\${WRAPPER_TEST_MODE:-guard}" in
+    stale_local) : > "\$WRAPPER_TEST_SENTINELS/commit"; return 1 ;;
+    *) : > "\$WRAPPER_TEST_SENTINELS/handler" ;;
+  esac
+}
 _emit_routing_record(){ : > "\$WRAPPER_TEST_SENTINELS/routing"; }
 _reconcile_yaml_status_on_exit(){ : > "\$WRAPPER_TEST_SENTINELS/reconcile"; }
 _reap_worktree_orphans(){ : > "\$WRAPPER_TEST_SENTINELS/reaper"; }
@@ -3015,6 +3021,73 @@ printf '  wrapper rebind observed=%s\n' "$rebind_results"
 expect "wrapper accepts other-Story advances and latches every lost target authority" \
   test "$rebind_results" = \
     'rebind_unrelated:1:impl,qa,reaper,reconcile,:absent;rebind_other_story_code:1:impl,qa,reaper,reconcile,:absent;rebind_receipt_same_phase_error:1:impl,:preserved;rebind_same_story_field:1:impl,:preserved;rebind_same_story_contract:1:impl,:preserved;rebind_same_story_phase:1:impl,:preserved;rebind_absent:1:impl,:preserved;rebind_stale:1:impl,:preserved;rebind_nonancestor:1:impl,:preserved;rebind_fetch_fail:1:impl,:preserved;'
+
+# ── WRAPPER-STALE-LOCAL begin ──────────────────────────────────────────────
+# The home's working copy is refreshed only by the projector and can later be
+# reverted to the home's older HEAD, so it may carry a phase the pinned target
+# has already left.  A wrapper resumed against such a copy once routed a
+# qa_passed Story straight back into QA from a stale `implemented`, and the
+# FAIL that QA produced was rejected by the journal because qa_passed ->
+# qa_failed is not an edge.  The generated wrapper must adopt the pinned
+# target's backlog bytes before its before-phase read, route on the target
+# phase (commit, honouring the valid sidecar: no currentness rerun), and treat
+# the heal as local state — no receipt, no rebind, no latched authority — so a
+# retryable handler failure still exits cleanly for forward recovery.
+WRAPPER_TEST_MODE=stale_local; export WRAPPER_TEST_MODE
+WRAPPER_TEST_SENTINELS="$TMP/wrapper-runtime-stale-local"
+export WRAPPER_TEST_SENTINELS
+mkdir -p "$WRAPPER_TEST_SENTINELS"
+GAAI_WORKTREES_BASE="$TMP/wrapper-runtime-worktrees"; export GAAI_WORKTREES_BASE
+mkdir -p "$GAAI_WORKTREES_BASE/EWRUNTIME-workspace/.gaai/project/contexts/artefacts/qa-reports"
+printf '{"verdict":"PASS"}\n' \
+  > "$GAAI_WORKTREES_BASE/EWRUNTIME-workspace/.gaai/project/contexts/artefacts/qa-reports/EWRUNTIME.qa-verdict.json"
+cat > "$BACKLOG" <<EOF
+items:
+- id: EWRUNTIME
+  status: in_progress
+  phase_status: qa_passed
+  started_at: "$started"
+EOF
+git -C "$WRAPPER_RUNTIME" add "$BACKLOG_REL"
+git -C "$WRAPPER_RUNTIME" commit -m "wrapper stale_local authority A" >/dev/null
+git -C "$WRAPPER_RUNTIME" push --force origin HEAD:staging >/dev/null
+git -C "$WRAPPER_RUNTIME" fetch origin staging --quiet
+stale_source=$(git -C "$WRAPPER_RUNTIME" rev-parse origin/staging)
+stale_blob=$(git -C "$WRAPPER_RUNTIME" rev-parse "${stale_source}:${BACKLOG_REL}")
+stale_snapshot=$(mktemp "$WRAPPER_RUNTIME_LOCKS/.stale-XXXXXX")
+git -C "$WRAPPER_RUNTIME" show "${stale_source}:${BACKLOG_REL}" > "$stale_snapshot"
+stale_facts=$(forward_classify_snapshot EWRUNTIME "$stale_snapshot" \
+  "$stale_source" "$stale_blob" postclaim verified false)
+rm -f "$stale_snapshot"
+IFS=$'\t' read -r _ _ _ _ _ stale_record _ _ <<< "$stale_facts"
+# The working copy lags the verified target: an older HEAD's bytes.
+cat > "$BACKLOG" <<EOF
+items:
+- id: EWRUNTIME
+  status: in_progress
+  phase_status: implemented
+  started_at: "$started"
+EOF
+stale_rc=0
+launch_3phase_in_tmux EWRUNTIME trace "$stale_source" "$stale_blob" \
+  "$stale_record" || stale_rc=$?
+stale_effects=$(find "$WRAPPER_TEST_SENTINELS" -type f -exec basename {} \; \
+  | sort | tr '\n' ',')
+stale_authority=absent
+[[ -f "$WRAPPER_RUNTIME_LOCKS/EWRUNTIME.lock" \
+    && -f "$WRAPPER_RUNTIME_LOCKS/EWRUNTIME.heartbeat" ]] \
+  && stale_authority=preserved
+stale_healed=$(awk '$0 == "- id: EWRUNTIME" { f = 1; next } f && /^- id:/ { exit }
+  f && /^[[:space:]]+phase_status:/ { print $2; exit }' "$BACKLOG")
+printf '  wrapper stale-local observed=%s expected=1:commit,reaper,reconcile,:absent:qa_passed\n' \
+  "${stale_rc}:${stale_effects}:${stale_authority}:${stale_healed}"
+expect "wrapper heals a stale home copy from the pinned target and routes on the target phase without a spurious rebind" \
+  test "${stale_rc}:${stale_effects}:${stale_authority}:${stale_healed}" = \
+    '1:commit,reaper,reconcile,:absent:qa_passed'
+rm -f "$WRAPPER_RUNTIME_LOCKS/EWRUNTIME.lock" \
+  "$WRAPPER_RUNTIME_LOCKS/EWRUNTIME.heartbeat"
+unset GAAI_WORKTREES_BASE
+# ── WRAPPER-STALE-LOCAL end ────────────────────────────────────────────────
 
 # The commit-bound Story reducer must authenticate the bytes held on its open
 # descriptor against commit:path.  A same-owner replacement with another valid

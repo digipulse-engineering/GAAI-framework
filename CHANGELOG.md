@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: the wrapper no longer declares an auto-merge policy for the operator
+- fix: fence the direct impl spawn with the shared-home snapshot/restore
 - fix: a concluded recovery context no longer holds a reopened Story
 - fix: answer Corepack's download prompt for every child of the wrapper
 - fix: probe a file mode with GNU stat first, BSD second

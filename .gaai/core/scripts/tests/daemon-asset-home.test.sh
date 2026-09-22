@@ -445,6 +445,17 @@ else
   fail "WRAPPER-env: the wrapper's child environment does not disable Corepack's download prompt — hooks under the private HOME will block on it"
 fi
 
+# The wrapper must not declare an auto-merge policy on the operator's behalf.
+# An unset policy is what lets the dispatch resolver refuse to merge a Story
+# that declares nothing; a `staging_only` default baked here re-enabled that
+# merge for every row omitting the field, while every test of the resolver
+# passed, because the resolver never saw the value the wrapper had set.
+if grep -qE '^export GAAI_AUTO_MERGE_POLICY="\$\{GAAI_AUTO_MERGE_POLICY:-\}"$' "$DAEMON_SRC"; then
+  pass "WRAPPER-env: GAAI_AUTO_MERGE_POLICY is baked empty when the operator set nothing"
+else
+  fail "WRAPPER-env: the wrapper defaults GAAI_AUTO_MERGE_POLICY on the operator's behalf — an undeclared Story would merge itself"
+fi
+
 # The daemon child re-runs this entry inside the pane, whose environment the private
 # server copies from the parent — including the three values above. Section 4 refuses
 # any inherited GIT_* member, so the pane command must strip them before the child's

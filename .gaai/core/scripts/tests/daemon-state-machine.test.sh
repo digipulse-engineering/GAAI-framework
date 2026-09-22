@@ -2169,6 +2169,45 @@ else
 fi
 
 # Cleanup impl phase test fixtures
+# ── T21b: the direct impl spawn is fenced by the shared-home snapshot/restore ──
+# The codex branch runs inside _run_claude_with_loop_breaker, which snapshots
+# the shared private HOME and restores it on every return path. The default
+# branch spawns nested-claude-spawn.js directly and had no such fence, so a
+# Story whose own smoke rewrites the HOME's credential configuration left it
+# rewritten when the phase ended, and the durable phase write that follows
+# failed with source_unavailable. The stub below does what such a smoke does.
+echo "T21b: handle_impl_phase restores the shared HOME the agent rewrote"
+IMPL_SHARED_HOME="$IMPL_FIXTURE_DIR/shared-home"; mkdir -p "$IMPL_SHARED_HOME"; chmod 700 "$IMPL_SHARED_HOME"
+printf '[credential]\n\thelper = !gh auth git-credential\n' > "$IMPL_SHARED_HOME/.gitconfig"
+_impl_home_before=$(shasum -a 256 "$IMPL_SHARED_HOME/.gitconfig" | awk '{print $1}')
+cat > "$IMPL_SHIM_DIR/node" << 'IMPL_NODE_MUTATE_EOF'
+#!/usr/bin/env bash
+if [[ "$1" == *nested-claude-spawn.js* ]]; then
+  printf '[credential]\n\thelper = !/nowhere/fixture-helper.sh\n' > "$GAAI_SHARED_HOME_ROOT/.gitconfig"
+  exec "$IMPL_REAL_NODE" "$IMPL_SPAWN_STUB" "${@:2}" --stub-success true
+fi
+exec "$IMPL_REAL_NODE" "$@"
+IMPL_NODE_MUTATE_EOF
+chmod +x "$IMPL_SHIM_DIR/node"
+"$SCHEDULER" --set-phase-status "$IMPL_STORY_ID" planned "$FIXTURE" 2>/dev/null || true
+rm -f "$IMPL_REPORT_PATH"
+TRACE="test-trace-$(date +%s)-021b"
+_impl_out=$(GAAI_SHARED_HOME_ROOT="$IMPL_SHARED_HOME" handle_impl_phase "$IMPL_STORY_ID" "$TRACE" 2>&1); _impl_rc=$?
+if [[ "$_impl_rc" -eq 0 ]]; then pass "T21b-0: the phase itself still succeeds"; else fail "T21b-0: handle_impl_phase returned $_impl_rc"; fi
+_impl_home_after=$(shasum -a 256 "$IMPL_SHARED_HOME/.gitconfig" | awk '{print $1}')
+if [[ "$_impl_home_after" == "$_impl_home_before" ]]; then
+  pass "T21b-1: the shared HOME's credential configuration is restored after the agent rewrote it"
+else
+  fail "T21b-1: the agent's rewrite of the shared HOME survived the impl phase"
+fi
+if printf '%s' "$_impl_out" | grep -q 'SHARED-HOME\] story=.* phase=impl result=restored'; then
+  pass "T21b-2: the restore is reported for the impl phase"
+else
+  fail "T21b-2: no SHARED-HOME restore report for the impl phase"
+fi
+make_impl_node_shim_success
+unset IMPL_SHARED_HOME _impl_home_before _impl_home_after _impl_out _impl_rc
+
 export PATH="$IMPL_OLD_PATH"
 unset GAAI_WORKTREES_BASE IMPL_OLD_PATH IMPL_REAL_NODE IMPL_SPAWN_STUB
 unset IMPL_STORY_ID IMPL_WORKTREE IMPL_STORY_PATH IMPL_PLAN_PATH IMPL_REPORT_PATH
@@ -4209,6 +4248,141 @@ export PROJECT_DIR="$QAR_OLD_PROJECT_DIR"
 unset GAAI_WORKTREES_BASE CLAUDE_MODEL_PRIMARY GAAI_WORKSPACE_ID GAAI_ORG_ID
 unset QAR_OLD_PATH QAR_OLD_PROJECT_DIR QAR_SHIM_DIR QAR_FIXTURE_DIR QA_FIXTURE_DIR
 rm -rf "/tmp/gaai-qaroute-tests-$$"
+
+# ── TARGET-ADOPT: identity-guarded dispatch routes on the verified target ──
+# The wrapper pins and verifies the remote target identity, but phase routing
+# reads the ambient $BACKLOG_FILE (the daemon home's working copy).  That copy
+# is refreshed only by the projector and can be reverted to the home's older
+# HEAD afterwards, so it may hold a phase the target has already left.  A
+# Story resumed that way was routed into QA from a stale `implemented` while
+# the target held `qa_passed`; the FAIL it produced was then rejected by the
+# journal (qa_passed -> qa_failed is not an edge) and the Story stranded.
+# Guarded dispatch must adopt the verified target bytes before routing.
+echo "TARGET-ADOPT: identity-guarded dispatch adopts the verified target backlog before routing"
+TA_FIXTURE_DIR="/tmp/gaai-target-adopt-tests-$$"
+rm -rf "$TA_FIXTURE_DIR"
+TA_REPO="$TA_FIXTURE_DIR/repo"
+TA_REL="${BACKLOG_REL:-.gaai/project/contexts/backlog/active.backlog.yaml}"
+mkdir -p "$TA_REPO/$(dirname "$TA_REL")" \
+  "$TA_REPO/.gaai/project/contexts/artefacts/stories" "$TA_FIXTURE_DIR/worktrees"
+"$_REAL_GIT_BIN" -C "$TA_REPO" init -q
+"$_REAL_GIT_BIN" -C "$TA_REPO" config user.email "test@example.com"
+"$_REAL_GIT_BIN" -C "$TA_REPO" config user.name "Test"
+cat > "$TA_REPO/$TA_REL" << 'YAML_TA'
+items:
+- id: TST-ADOPT-1
+  status: in_progress
+  phase_status: qa_passed
+  delivery_pipeline: 3phase
+  impl_model: primary
+YAML_TA
+printf '# TST-ADOPT-1 contract\n' \
+  > "$TA_REPO/.gaai/project/contexts/artefacts/stories/TST-ADOPT-1.story.md"
+"$_REAL_GIT_BIN" -C "$TA_REPO" add -A
+"$_REAL_GIT_BIN" -C "$TA_REPO" commit -q -m "target authority: qa_passed"
+_setup_origin_staging "$TA_REPO"
+TA_OLD_PROJECT_DIR="$PROJECT_DIR"
+TA_OLD_BACKLOG_FILE="$BACKLOG_FILE"
+TA_OLD_BACKLOG_REL="${BACKLOG_REL:-}"
+export PROJECT_DIR="$TA_REPO"
+export BACKLOG_FILE="$TA_REPO/$TA_REL"
+export BACKLOG_REL="$TA_REL"
+export GAAI_WORKTREES_BASE="$TA_FIXTURE_DIR/worktrees"
+export TARGET_BRANCH=staging
+# Pin the identity exactly as the production wrapper carries it.
+TA_SOURCE=$("$_REAL_GIT_BIN" -C "$TA_REPO" rev-parse origin/staging)
+TA_BLOB=$("$_REAL_GIT_BIN" -C "$TA_REPO" rev-parse "${TA_SOURCE}:${TA_REL}")
+TA_SNAP=$(mktemp "${LOCK_DIR}/.ta-identity-XXXXXX"); chmod 600 "$TA_SNAP"
+"$_REAL_GIT_BIN" -C "$TA_REPO" show "${TA_SOURCE}:${TA_REL}" > "$TA_SNAP"
+TA_FACTS=$(forward_classify_snapshot TST-ADOPT-1 "$TA_SNAP" "$TA_SOURCE" "$TA_BLOB" postclaim verified false)
+rm -f "$TA_SNAP"
+IFS=$'\t' read -r _ _ _ _ _ TA_RECORD _ _ <<< "$TA_FACTS"
+export GAAI_EXPECTED_TARGET_SOURCE="$TA_SOURCE"
+export GAAI_EXPECTED_TARGET_BLOB="$TA_BLOB"
+export GAAI_EXPECTED_TARGET_RECORD="$TA_RECORD"
+# A valid two-axis sidecar exists: the currentness gate must stay silent.
+mkdir -p "$GAAI_WORKTREES_BASE/TST-ADOPT-1-workspace/.gaai/project/contexts/artefacts/qa-reports"
+printf '{"verdict":"PASS"}\n' \
+  > "$GAAI_WORKTREES_BASE/TST-ADOPT-1-workspace/.gaai/project/contexts/artefacts/qa-reports/TST-ADOPT-1.qa-verdict.json"
+# Handler doubles record which phase handler dispatch selected and what the
+# ambient copy said at that moment.
+TA_REAL_COMMIT_DEF=$(declare -f handle_commit_phase)
+TA_REAL_QA_DEF=$(declare -f handle_qa_phase)
+TA_HANDLER_LOG="$TA_FIXTURE_DIR/handlers.log"
+handle_commit_phase() { printf 'commit:%s\n' "$(get_phase_status "$1")" >> "$TA_HANDLER_LOG"; return 0; }
+handle_qa_phase() { printf 'qa:%s\n' "$(get_phase_status "$1")" >> "$TA_HANDLER_LOG"; return 0; }
+TA_OUT="$TA_FIXTURE_DIR/dispatch.out"
+
+# ── TARGET-ADOPT-1: stale local copy (implemented) vs verified target (qa_passed) ──
+echo "TARGET-ADOPT-1: stale local phase is healed from the verified target before routing"
+"$SCHEDULER" --set-phase-status TST-ADOPT-1 implemented "$BACKLOG_FILE" >/dev/null 2>&1
+: > "$TA_HANDLER_LOG"; : > "$JOURNAL_CALL_LOG"; : > "$ROUTING_LOG"
+TA_RC=0
+GAAI_DISPATCH_IDENTITY_GUARD=required \
+  dispatch_3phase_story TST-ADOPT-1 "test-trace-ta1" > "$TA_OUT" 2>&1 || TA_RC=$?
+if [[ "$TA_RC" -eq 0 && "$(cat "$TA_HANDLER_LOG")" == "commit:qa_passed" ]]; then
+  pass "TARGET-ADOPT-1a: dispatch routed to the commit handler with the target phase (never into QA)"
+else
+  fail "TARGET-ADOPT-1a: rc=$TA_RC handlers='$(tr '\n' ' ' < "$TA_HANDLER_LOG")' out=$(tail -3 "$TA_OUT" | tr '\n' ' ')"
+fi
+if grep -q 'TARGET_BACKLOG_ADOPTED' "$TA_OUT" \
+    && grep -q 'local phase_status=implemented target phase_status=qa_passed' "$TA_OUT"; then
+  pass "TARGET-ADOPT-1b: divergence is logged with both phases"
+else
+  fail "TARGET-ADOPT-1b: no divergence log — $(grep -c . "$TA_OUT") lines: $(head -3 "$TA_OUT" | tr '\n' ' ')"
+fi
+if [[ "$(get_phase_status TST-ADOPT-1)" == "qa_passed" \
+    && "$("$_REAL_GIT_BIN" -C "$TA_REPO" hash-object -- "$BACKLOG_FILE")" == "$TA_BLOB" ]]; then
+  pass "TARGET-ADOPT-1c: local copy now carries the exact verified target blob"
+else
+  fail "TARGET-ADOPT-1c: local phase='$(get_phase_status TST-ADOPT-1)' blob=$("$_REAL_GIT_BIN" -C "$TA_REPO" hash-object -- "$BACKLOG_FILE") expected=$TA_BLOB"
+fi
+if [[ ! -s "$JOURNAL_CALL_LOG" ]] && ! grep -q 'QA_CURRENTNESS_RERUN' "$ROUTING_LOG" 2>/dev/null; then
+  pass "TARGET-ADOPT-1d: no currentness rerun and no journal write — the valid sidecar is honoured"
+else
+  fail "TARGET-ADOPT-1d: journal='$(cat "$JOURNAL_CALL_LOG")' routing has rerun=$(grep -c QA_CURRENTNESS_RERUN "$ROUTING_LOG")"
+fi
+
+# ── TARGET-ADOPT-2: local copy already exact → untouched, routed normally ──
+echo "TARGET-ADOPT-2: an exact local copy is left untouched (negative control)"
+TA_INODE_BEFORE=$(ls -i "$BACKLOG_FILE" | awk '{print $1}')
+: > "$TA_HANDLER_LOG"
+TA_RC=0
+GAAI_DISPATCH_IDENTITY_GUARD=required \
+  dispatch_3phase_story TST-ADOPT-1 "test-trace-ta2" > "$TA_OUT" 2>&1 || TA_RC=$?
+TA_INODE_AFTER=$(ls -i "$BACKLOG_FILE" | awk '{print $1}')
+if [[ "$TA_RC" -eq 0 && "$(cat "$TA_HANDLER_LOG")" == "commit:qa_passed" \
+    && "$TA_INODE_BEFORE" == "$TA_INODE_AFTER" ]] && ! grep -q 'TARGET_BACKLOG_ADOPTED' "$TA_OUT"; then
+  pass "TARGET-ADOPT-2: exact copy not rewritten, no divergence logged, commit routed"
+else
+  fail "TARGET-ADOPT-2: rc=$TA_RC handlers='$(tr '\n' ' ' < "$TA_HANDLER_LOG")' inode $TA_INODE_BEFORE->$TA_INODE_AFTER adopted=$(grep -c TARGET_BACKLOG_ADOPTED "$TA_OUT")"
+fi
+
+# ── TARGET-ADOPT-3: unguarded (legacy_direct) dispatch keeps ambient semantics ──
+echo "TARGET-ADOPT-3: legacy_direct dispatch is unchanged (routes on the ambient copy)"
+"$SCHEDULER" --set-phase-status TST-ADOPT-1 implemented "$BACKLOG_FILE" >/dev/null 2>&1
+: > "$TA_HANDLER_LOG"
+TA_RC=0
+GAAI_DISPATCH_IDENTITY_GUARD=legacy_direct \
+  dispatch_3phase_story TST-ADOPT-1 "test-trace-ta3" > "$TA_OUT" 2>&1 || TA_RC=$?
+if [[ "$TA_RC" -eq 0 && "$(cat "$TA_HANDLER_LOG")" == "qa:implemented" ]] \
+    && ! grep -q 'TARGET_BACKLOG_ADOPTED' "$TA_OUT"; then
+  pass "TARGET-ADOPT-3: unguarded dispatch still routes on the ambient copy without adoption"
+else
+  fail "TARGET-ADOPT-3: rc=$TA_RC handlers='$(tr '\n' ' ' < "$TA_HANDLER_LOG")' adopted=$(grep -c TARGET_BACKLOG_ADOPTED "$TA_OUT")"
+fi
+
+eval "$TA_REAL_COMMIT_DEF"
+eval "$TA_REAL_QA_DEF"
+export PROJECT_DIR="$TA_OLD_PROJECT_DIR"
+export BACKLOG_FILE="$TA_OLD_BACKLOG_FILE"
+if [[ -n "$TA_OLD_BACKLOG_REL" ]]; then export BACKLOG_REL="$TA_OLD_BACKLOG_REL"; else unset BACKLOG_REL; fi
+unset GAAI_WORKTREES_BASE GAAI_EXPECTED_TARGET_SOURCE GAAI_EXPECTED_TARGET_BLOB GAAI_EXPECTED_TARGET_RECORD
+unset TA_REPO TA_REL TA_SOURCE TA_BLOB TA_SNAP TA_FACTS TA_RECORD TA_HANDLER_LOG TA_OUT TA_RC \
+  TA_INODE_BEFORE TA_INODE_AFTER TA_REAL_COMMIT_DEF TA_REAL_QA_DEF TA_OLD_PROJECT_DIR \
+  TA_OLD_BACKLOG_FILE TA_OLD_BACKLOG_REL
+rm -rf "$TA_FIXTURE_DIR" "${TA_FIXTURE_DIR}.origin.git" "$TA_FIXTURE_DIR/repo.origin.git" 2>/dev/null || true
+unset TA_FIXTURE_DIR
 
 # ── QAJSON-DERIVE: _derive_qa_expected_surfaces against a realistic ────────
 # Story "## File Inventory" + PLAN "## Implementation Sequence" table whose
