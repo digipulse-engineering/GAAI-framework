@@ -4266,6 +4266,16 @@ handle_impl_phase() {
     _impl_to_prefix=("$_impl_to_cmd" "--kill-after=15s" "${GAAI_TIMEOUT_IMPL_SEC}s")
   fi
 
+  # The codex branch above runs inside _run_claude_with_loop_breaker, which
+  # snapshots the shared private HOME and restores it on every return path.
+  # This branch spawns the agent directly and had no such fence, so a Story
+  # whose own smoke rewrites the HOME's credential configuration left it
+  # rewritten when the phase ended — and the durable phase write that follows
+  # failed with source_unavailable, on the default harness, on every such
+  # Story. Same fence, same paths, restored right after the agent returns and
+  # before anything durable is attempted.
+  local _impl_home_snapshot=""
+  _impl_home_snapshot=$(_shared_home_snapshot 2>/dev/null) || _impl_home_snapshot=""
   local spawn_output spawn_rc
   spawn_output=$(
     GAAI_STORY_ID="$story_id" \
@@ -4286,6 +4296,7 @@ handle_impl_phase() {
         2>>"$log_path"
   )
   spawn_rc=$?
+  _shared_home_restore "$_impl_home_snapshot" "$story_id" "impl"
   if [[ "$spawn_rc" == "124" || "$spawn_rc" == "137" ]]; then
     echo "[TIMEOUT] ${story_id} handle_impl_phase: nested-claude-spawn wall-clock timeout after ${GAAI_TIMEOUT_IMPL_SEC}s"
     printf '{"type":"system","subtype":"phase_timeout","story_id":"%s","phase":"impl","timeout_sec":%d,"timestamp":"%s"}\n' \
@@ -6425,6 +6436,55 @@ work, not as a reviewed result."
   return 0
 }
 
+# ── Verified-target backlog adoption ──────────────────────────────────────
+# _dispatch_expected_target_guard proves origin/<target> is exactly the
+# pinned GAAI_EXPECTED_TARGET_SOURCE/BLOB the wrapper carries.  Phase routing,
+# however, reads phase_status from the ambient $BACKLOG_FILE — the daemon
+# home's working copy.  Only the lifecycle projector refreshes that copy, and
+# the projector never advances the home's HEAD, so any later revert of the
+# working copy to HEAD (the home cannot fast-forward while that file is
+# dirty, so an operator disposition typically does exactly that) leaves the
+# local copy holding a phase the durable target has already left.  Routing
+# on it then selects the wrong handler, and every transition that handler
+# persists is validated by the journal against the target — where the edge
+# does not exist — so the Story strands with a rejected write.
+#
+# Whenever the local copy differs from the verified target blob, adopt the
+# target's exact bytes (the same whole-file materialisation the projector
+# performs) and log the divergence.  Every subsequent local read — the phase
+# switch, the currentness gate, the wrapper's own before/after comparison —
+# then agrees with what the journal validates against.
+#
+# Returns 0 when the local copy already matches or was adopted; 1 when the
+# pinned target cannot be materialised, so the caller must not route on
+# local bytes.  A no-op outside identity-guarded dispatch.
+_dispatch_adopt_expected_target_backlog() {
+  local story_id="$1"
+  local source="${GAAI_EXPECTED_TARGET_SOURCE:-}" blob="${GAAI_EXPECTED_TARGET_BLOB:-}"
+  local local_blob local_phase target_phase snapshot
+  [[ "$story_id" =~ ^[A-Za-z][A-Za-z0-9._-]{0,63}$ \
+      && "$source" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ \
+      && "$blob" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ \
+      && -n "${BACKLOG_REL:-}" && -n "${BACKLOG_FILE:-}" ]] || return 1
+  [[ "$(git -C "$PROJECT_DIR" rev-parse "${source}:${BACKLOG_REL}" 2>/dev/null)" == "$blob" ]] \
+    || return 1
+  local_blob=$(git -C "$PROJECT_DIR" hash-object --path="$BACKLOG_REL" -- "$BACKLOG_FILE" 2>/dev/null) \
+    || local_blob=""
+  [[ "$local_blob" != "$blob" ]] || return 0
+  snapshot=$(mktemp "${LOCK_DIR:?}/.target-backlog-XXXXXX" 2>/dev/null) || return 1
+  if ! git -C "$PROJECT_DIR" show "${source}:${BACKLOG_REL}" > "$snapshot" 2>/dev/null \
+      || [[ "$(git -C "$PROJECT_DIR" hash-object --no-filters -- "$snapshot" 2>/dev/null)" != "$blob" ]] \
+      || ! chmod 644 "$snapshot" 2>/dev/null; then
+    rm -f "$snapshot"
+    return 1
+  fi
+  local_phase=$(get_phase_status "$story_id" 2>/dev/null || true)
+  target_phase=$(BACKLOG_FILE="$snapshot" get_phase_status "$story_id" 2>/dev/null || true)
+  mv "$snapshot" "$BACKLOG_FILE" 2>/dev/null || { rm -f "$snapshot"; return 1; }
+  echo "[$(date '+%H:%M:%S')] ${story_id} dispatch: local backlog copy diverged from the verified target (local phase_status=${local_phase:-?} target phase_status=${target_phase:-?}) — adopted target ${source:0:12} [class=TARGET_BACKLOG_ADOPTED]"
+  return 0
+}
+
 # ── Main dispatcher (AC1 + AC6) ───────────────────────────────────────────
 #
 # Called by delivery-daemon.sh main loop for stories with delivery_pipeline=3phase.
@@ -6443,6 +6503,11 @@ dispatch_3phase_story() {
         "${GAAI_EXPECTED_TARGET_RECORD:-}"; then
       echo "[ERROR] ${story_id} dispatch_3phase_story: target identity changed" >&2
       return 3
+    fi
+    # Route on the verified target, never on a stale local copy of it.
+    if ! _dispatch_adopt_expected_target_backlog "$story_id"; then
+      echo "[ERROR] ${story_id} dispatch_3phase_story: verified target backlog could not be adopted locally [class=TARGET_BACKLOG_UNAVAILABLE]" >&2
+      return 1
     fi
   fi
 

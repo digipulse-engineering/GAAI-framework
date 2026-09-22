@@ -5112,7 +5112,12 @@ export GAAI_IMPL_BASE_URL="${GAAI_IMPL_BASE_URL:-}"
 export GAAI_IMPL_AUTH_TOKEN="${GAAI_IMPL_AUTH_TOKEN:-}"
 export GAAI_IMPL_MODEL="${GAAI_IMPL_MODEL:-}"
 export GAAI_IMPL_MODEL_FALLBACK="${GAAI_IMPL_MODEL_FALLBACK:-}"
-export GAAI_AUTO_MERGE_POLICY="${GAAI_AUTO_MERGE_POLICY:-staging_only}"
+# Baked EMPTY when unset, never defaulted here. The dispatch resolver treats an
+# unset policy as "no operator declaration" and refuses to merge a Story that
+# declares nothing itself. Defaulting it to `staging_only` in this block silently
+# turned that refusal back into a merge for every Story whose row omitted the
+# field, because the wrapper — not the operator — had declared the policy.
+export GAAI_AUTO_MERGE_POLICY="${GAAI_AUTO_MERGE_POLICY:-}"
 export GAAI_AUTO_MERGE_ADMIN_FALLBACK="${GAAI_AUTO_MERGE_ADMIN_FALLBACK:-false}"
 # Per-phase agent turn caps. The QA and plan phases run inside THIS wrapper, so
 # daemon-dispatch.sh reads these from the wrapper's environment — not the daemon's.
@@ -5159,6 +5164,15 @@ source "$PROJECT_DIR/.gaai/core/scripts/lib/chore-commit.sh"
 
 # 3phase loop — same logic as in-process version, just runs in own tmux
 while true; do
+  # Adopt the pinned target's backlog bytes BEFORE the before-phase read.  The
+  # home's working copy can lag the verified target (it is refreshed only by
+  # the projector and reverted to HEAD by any later disposition); dispatch
+  # heals that divergence itself, but healing it after this read would make
+  # the before/after comparison below mistake the heal for a durable
+  # transition, demand a receipt no handler produced, and latch authority.
+  if declare -f _dispatch_adopt_expected_target_backlog >/dev/null 2>&1; then
+    _dispatch_adopt_expected_target_backlog "$story_id" || true
+  fi
   _ps_before=\$(get_phase_status "$story_id" 2>/dev/null || echo "?")
   CHORE_JOURNAL_OUTCOME=""
   CHORE_JOURNAL_COMMIT=""
