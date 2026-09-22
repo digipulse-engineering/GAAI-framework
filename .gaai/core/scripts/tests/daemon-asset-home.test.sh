@@ -432,6 +432,19 @@ for _n in GAAI_MAX_TURNS GAAI_IMPL_MAX_TURNS GAAI_QA_MAX_TURNS; do
   fi
 done
 
+# Everything the wrapper spawns — agent phases, the dependency install, the
+# repository's git hooks — runs under the private HOME, where Corepack prompts
+# before downloading the pinned package manager. The install path answered that
+# by policy; the pre-push hook chain did not, and an admitted candidate's push
+# was refused while Corepack crashed on the prompt inside the typecheck step.
+# The answer must be baked once in the wrapper's child environment, next to
+# the other values the private tmux server would otherwise not carry.
+if sed -n '/^export GAAI_QA_MAX_TURNS=/,/^export COREPACK_ENABLE_DOWNLOAD_PROMPT=0$/p' "$DAEMON_SRC" | grep -q '^export COREPACK_ENABLE_DOWNLOAD_PROMPT=0$'; then
+  pass "WRAPPER-env: COREPACK_ENABLE_DOWNLOAD_PROMPT=0 is baked into the wrapper's child environment"
+else
+  fail "WRAPPER-env: the wrapper's child environment does not disable Corepack's download prompt — hooks under the private HOME will block on it"
+fi
+
 # The daemon child re-runs this entry inside the pane, whose environment the private
 # server copies from the parent — including the three values above. Section 4 refuses
 # any inherited GIT_* member, so the pane command must strip them before the child's
