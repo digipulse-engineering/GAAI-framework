@@ -2760,6 +2760,7 @@ while [[ $_i -lt ${#_args[@]} ]]; do
 done
 _subcmd="${_args[$_i]:-}"
 if [[ "$_subcmd" == "push" ]]; then
+  [[ -z "${GAAI_COMMIT_PUSH_CRED_FILE:-}" ]] || printf '%s=%s\n' "${GIT_CONFIG_KEY_1:-}" "${GIT_CONFIG_VALUE_1:-}" > "$GAAI_COMMIT_PUSH_CRED_FILE"
   if [[ "${GAAI_SHIM_PUSH_FAIL:-0}" == "1" ]]; then
     echo "error: remote push failed" >&2; exit 1
   fi
@@ -3115,6 +3116,37 @@ if declare -F _resolve_auto_merge_policy >/dev/null 2>&1; then
   fi
 else
   fail "T40d: _resolve_auto_merge_policy is not defined"
+fi
+
+# ── T40e: the publication push carries its own credential helper ────────────
+# The shared private HOME's credential files can be rewritten or deleted by the
+# candidate's own suites during the admission gate that precedes the push. The
+# push must therefore name the operator identity itself, through git's
+# environment config, instead of trusting whatever those files say at that
+# instant. The shim records the config the push arrived with.
+echo "T40e: the exact-SHA push names the operator credential helper itself"
+export GAAI_COMMIT_PUSH_CRED_FILE="$COMMIT_FIXTURE_DIR/push-cred"; : > "$GAAI_COMMIT_PUSH_CRED_FILE"
+make_commit_worktree "TST-COMMIT-AUTOMERGE"
+"$SCHEDULER" --set-phase-status "TST-COMMIT-AUTOMERGE" qa_passed "$FIXTURE" 2>/dev/null || true
+GAAI_SKIP_AUTO_MERGE=0 GAAI_AUTO_MERGE_POLICY=off handle_commit_phase "TST-COMMIT-AUTOMERGE" "test-trace-$(date +%s)-040e" >/dev/null 2>&1 || true
+if [[ "$(cat "$GAAI_COMMIT_PUSH_CRED_FILE")" == 'credential.helper=!gh auth git-credential' ]]; then
+  pass "T40e: the push carried credential.helper=!gh auth git-credential in its environment config"
+else
+  fail "T40e: the push relied on the HOME's credential files — recorded: [$(cat "$GAAI_COMMIT_PUSH_CRED_FILE")]"
+fi
+unset GAAI_COMMIT_PUSH_CRED_FILE
+
+# ── T40h: a refused push keeps its whole stderr beside the worktree logs ────
+echo "T40h: a refused publication push persists its full stderr"
+rm -f "$COMMIT_FIXTURE_DIR/TST-COMMIT-AUTOMERGE-workspace/.delivery-logs/TST-COMMIT-AUTOMERGE.push-1.stderr" 2>/dev/null
+make_commit_worktree "TST-COMMIT-AUTOMERGE"
+"$SCHEDULER" --set-phase-status "TST-COMMIT-AUTOMERGE" qa_passed "$FIXTURE" 2>/dev/null || true
+GAAI_SHIM_PUSH_FAIL=1 GAAI_AUTO_MERGE_POLICY=off handle_commit_phase "TST-COMMIT-AUTOMERGE" "test-trace-$(date +%s)-040h" >/dev/null 2>&1 || true
+_push_err=$(ls "$COMMIT_FIXTURE_DIR"/TST-COMMIT-AUTOMERGE*/.delivery-logs/TST-COMMIT-AUTOMERGE.push-1.stderr 2>/dev/null | head -1)
+if [[ -n "$_push_err" ]] && grep -q 'remote push failed' "$_push_err"; then
+  pass "T40h: the refused push's stderr is kept in full at $(basename "$_push_err")"
+else
+  fail "T40h: no persisted push stderr found (only a truncated tail would have been logged)"
 fi
 
 # ── T41: GAAI_AUTO_MERGE_POLICY=off → auto_merge_applied:false ─

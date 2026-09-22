@@ -5762,6 +5762,22 @@ TRIAGE_PROMPT_EOF
   return 0
 }
 
+# Publication git: the exact-SHA push and the verifications around it must not
+# depend on the credential configuration in the shared private HOME. A Story's
+# own tests may rewrite or delete that HOME's helper during the admission gate
+# that immediately precedes the push — observed live: the helper script was
+# recreated and removed by the candidate's suites while the gate ran, and the
+# push then failed inside a helper that no longer existed. The operator
+# identity the daemon's own setup configures is `gh auth git-credential`; it
+# is applied here through git's environment config (a reset entry, then the
+# helper), which leaves the HOME's files and the argv untouched.
+_publication_git() {
+  GIT_CONFIG_COUNT=2 \
+  GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0= \
+  GIT_CONFIG_KEY_1=credential.helper GIT_CONFIG_VALUE_1='!gh auth git-credential' \
+    git "$@"
+}
+
 handle_commit_phase() {
   local story_id="$1" trace_id="$2"
   local ts t_start_ms t_end_ms duration_ms
@@ -6020,19 +6036,26 @@ ${qa_snippet}"
   local push_exit=1 push_attempt=0 push_max=3 push_stderr="" remote_head="" remote_base=""
   while [[ $push_attempt -lt $push_max ]]; do
     push_attempt=$(( push_attempt + 1 ))
-    if push_stderr=$(git -C "$worktree_path" push origin \
+    if push_stderr=$(_publication_git -C "$worktree_path" push origin \
         "${pushed_head_sha}:refs/heads/${branch}" 2>&1); then
       push_exit=0
     else
       push_exit=$?
     fi
-    remote_head=$(git -C "$worktree_path" ls-remote --heads origin \
+    remote_head=$(_publication_git -C "$worktree_path" ls-remote --heads origin \
       "refs/heads/${branch}" 2>/dev/null | awk 'NR==1{print $1}')
-    remote_base=$(git -C "$worktree_path" ls-remote --heads origin \
+    remote_base=$(_publication_git -C "$worktree_path" ls-remote --heads origin \
       "refs/heads/${TARGET_BRANCH:-staging}" 2>/dev/null | awk 'NR==1{print $1}')
     if [[ "$remote_head" == "$pushed_head_sha" && "$remote_base" == "$GAAI_ADMITTED_BASE_SHA" ]]; then
       push_exit=0; break
     fi
+    # Keep the whole refusal, not its last sixty bytes. Six refused pushes in
+    # one night were diagnosed blind because only the tail of a Node stack
+    # trace survived here; the module it could not find was never recorded.
+    local _push_err_file="${worktree_path}/.delivery-logs/${story_id}.push-${push_attempt}.stderr"
+    mkdir -p "${worktree_path}/.delivery-logs" 2>/dev/null || true
+    printf '%s\n' "$push_stderr" > "$_push_err_file" 2>/dev/null || true
+    echo "[WARN] ${story_id} handle_commit_phase: push stderr kept at ${_push_err_file}; first lines: $(printf '%s\n' "$push_stderr" | grep -vE '^\s*$' | head -3 | tr '\n' ' ' | cut -c1-300)"
     echo "[WARN] ${story_id} handle_commit_phase: exact-SHA push attempt ${push_attempt}/${push_max} not accepted: ${push_stderr: -300}"
     if [[ $push_attempt -lt $push_max ]]; then
       sleep $((push_attempt * 2))
