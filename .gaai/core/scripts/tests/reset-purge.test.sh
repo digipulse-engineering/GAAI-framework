@@ -122,5 +122,34 @@ for forbidden in ('worktree remove --force', 'rm -rf', 'branch -D', 'status refi
 PY
 expect "story reconcile contains no destructive fallback" test "$?" -eq 0
 
+# ── A concluded (terminal) context must not hold a reopened Story hostage ──
+# After an escalation the scan records action=forward_terminal with
+# reason=terminal_projection and intended_fields=status=escalated (the exact
+# record observed on a live daemon). An operator may
+# then reset the row to refined; the next launch binds a non-terminal intention
+# that can never equal the terminal record. That must retire the concluded
+# context (bytes preserved beside it) and install a fresh one — while a
+# non-terminal predecessor that disagrees stays a rejected conflict.
+context_t=$(_forward_context_path ECONCLUDED)
+row_t=$(_forward_bind_context "$context_t" ECONCLUDED "$source_a" "$blob" "$record" \
+  none none none none none none unknown forward_terminal terminal_projection status=escalated) || exit 1
+digest_t=${row_t##*$'\t'}
+bytes_t=$(shasum -a 256 "$context_t" | awk '{print $1}')
+if row_n=$(_forward_bind_context "$context_t" ECONCLUDED "$source_b" "$blob" "$record" \
+    none none none none none none verified resume resumable none); then
+  pass "a reopened Story binds a fresh context over a concluded one"
+else
+  fail "a concluded context still blocks the reopened Story (context_invalid)"
+fi
+expect "the fresh context carries the new intention" test "$(printf '%s' "$row_n" | cut -f12)" = resume
+expect "the concluded context is preserved beside the path under its digest" \
+  test "$(shasum -a 256 "${context_t}.concluded.${digest_t}" 2>/dev/null | awk '{print $1}')" = "$bytes_t"
+if _forward_bind_context "$context_t" ECONCLUDED "$source_a" "$blob" "$record" \
+    none none none none none none verified resume resumable none >/dev/null; then
+  fail "a non-terminal predecessor that disagrees is still rejected"
+else
+  pass "a non-terminal predecessor that disagrees is still rejected"
+fi
+
 printf '\nResults: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

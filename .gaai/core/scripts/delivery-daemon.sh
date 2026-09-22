@@ -2611,8 +2611,30 @@ _forward_bind_context() {
     return $?
   fi
   actual=$(forward_context_read "$path") || return 1
-  [[ "${actual%$'\t'*}" == "$expected" ]] || return 1
-  printf '%s\n' "$actual"
+  if [[ "${actual%$'\t'*}" == "$expected" ]]; then
+    printf '%s\n' "$actual"
+    return 0
+  fi
+  # A context whose recorded action is terminal belongs to a cycle that has
+  # concluded. The row can still be reopened by operator authority — a reset to
+  # refined after an escalation — and the next launch then arrives here with a
+  # non-terminal intention that can never equal the terminal record. Treating
+  # that as a conflict held the reopened Story at context_invalid on every
+  # scan, with no path out short of an operator deleting the file by hand.
+  # The concluded context is preserved beside the path under its own digest
+  # and a fresh one is installed. A non-terminal predecessor that disagrees
+  # is still a conflict and is still rejected, bytes untouched.
+  local stored_action concluded
+  stored_action=$(printf '%s' "$actual" | cut -f12)
+  if [[ "$stored_action" == forward_terminal && "${12}" != forward_terminal ]]; then
+    concluded="${path}.concluded.${actual##*$'\t'}"
+    cp -p -- "$path" "$concluded" 2>/dev/null || return 1
+    forward_context_remove "$path" "${actual##*$'\t'}" || return 1
+    forward_context_install "$path" "$@" || return 1
+    forward_context_read "$path"
+    return $?
+  fi
+  return 1
 }
 
 # Restore only the exact validated context row that this cycle CAS-retired.
@@ -5104,6 +5126,16 @@ export GAAI_AUTO_MERGE_ADMIN_FALLBACK="${GAAI_AUTO_MERGE_ADMIN_FALLBACK:-false}"
 # default keeps exactly one home and cannot drift between the two files.
 export GAAI_QA_MAX_TURNS="${GAAI_QA_MAX_TURNS:-}"
 export GAAI_PLAN_MAX_TURNS="${GAAI_PLAN_MAX_TURNS:-}"
+# Every child of this wrapper — agent phases, the worktree dependency install
+# and the repository's own git hooks — runs under the private HOME, whose
+# Corepack cache has never seen the package manager the repository pins.
+# Corepack then asks "Do you want to continue? [Y/n]" on a stdin nobody
+# watches. The install path already answers that by policy; the pre-push hook
+# chain did not, so an admitted candidate's exact-SHA push was refused three
+# times per cycle while Corepack crashed on the prompt inside the typecheck
+# step. Unattended is the only mode this process has, so the answer is baked
+# once, here, for everything the wrapper spawns.
+export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 export GAAI_QA_REPORT_PATH="${GAAI_QA_REPORT_PATH:-}"
 export GAAI_QA_INJECT_PHASE="${GAAI_QA_INJECT_PHASE:-}"
 export GAAI_QA_INJECT_PHASE_SNAPSHOT="${GAAI_QA_INJECT_PHASE:-}"

@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: a concluded recovery context no longer holds a reopened Story
+- fix: answer Corepack's download prompt for every child of the wrapper
 - fix: probe a file mode with GNU stat first, BSD second
 - fix: a Story that declares no auto-merge grants no merge authority
 - fix: recognise the lifecycle journal as this daemon's own projection
