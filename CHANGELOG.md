@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: never take a PR merged for an earlier cycle as this candidate's landing
 -: The running daemon authenticates as the operator identity its launch admitted
 - fix: the publication push names its own credential helper and keeps its whole stderr
 - fix: the wrapper no longer declares an auto-merge policy for the operator

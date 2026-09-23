@@ -6109,7 +6109,7 @@ work, not as a reviewed result."
   # ── Idempotency Guard 1: HEAD already an ancestor of origin/staging ───────
   # Fast-path: catches true-merge / fast-forward / re-push of an already-pushed
   # HEAD. NOT effective after squash-merge (squash yields a new commit). Fail-open.
-  local pr_url="" _skip_pr_create=0
+  local pr_url="" _skip_pr_create=0 _head_in_base=0
   if ! git -C "$worktree_path" fetch origin staging 2>/dev/null; then
     _route_admission_block "$story_id" "$trace_id" final blocked:base_fetch_failed
     return 1
@@ -6123,6 +6123,7 @@ work, not as a reviewed result."
     pr_url=$(gh pr list --state all --head "$branch" --json url --jq '.[0].url' 2>/dev/null || true)
     [[ "$pr_url" == "null" ]] && pr_url=""
     _skip_pr_create=1
+    _head_in_base=1
   fi
 
   # ── Idempotency Guard 2: existing PR in any state (squash-merge safe) ─────
@@ -6144,8 +6145,22 @@ work, not as a reviewed result."
   # proceeding to the exact-head merge. Mirrors the pattern at L154-160
   # (reap_orphaned_worktrees).
   if [[ "$_skip_pr_create" -eq 1 && -n "$pr_url" ]]; then
-    local _selected_pr_state
-    _selected_pr_state=$(gh pr view "$pr_url" --json state --jq .state 2>/dev/null || echo "OPEN")
+    local _selected_pr_state _selected_pr_head
+    IFS=$'\t' read -r _selected_pr_state _selected_pr_head < <(
+      gh pr view "$pr_url" --json state,headRefOid \
+        --jq '[.state,.headRefOid] | @tsv' 2>/dev/null || true)
+    [[ -z "$_selected_pr_state" ]] && _selected_pr_state="OPEN"
+    # A merged PR proves this candidate landed only when it merged the head
+    # this phase just published, or when Guard 1 already found HEAD in the
+    # base. A PR merged for an earlier cycle of the same story/<id> branch
+    # proves nothing about this one: treating it as landing evidence projected
+    # a fresh candidate to done with nothing in the base, which releases every
+    # dependant. Handle it like a CLOSED PR and open a fresh one.
+    if [[ "$_selected_pr_state" == "MERGED" && "$_head_in_base" -eq 0 \
+        && "$_selected_pr_head" != "$pushed_head_sha" ]]; then
+      echo "[INFO] ${story_id} handle_commit_phase: selected PR ($pr_url) was MERGED for an earlier cycle (head ${_selected_pr_head:-unknown}, published ${pushed_head_sha}) — opening fresh PR"
+      _selected_pr_state="STALE_MERGED"
+    fi
     case "$_selected_pr_state" in
       OPEN)
         :  # nominal path — fall through to exact-head merge
@@ -6158,9 +6173,10 @@ work, not as a reviewed result."
         _emit_commit_routing_record "$story_id" "$trace_id" "daemon-bash" "null" "0" "$pr_url" "false"
         return 0
         ;;
-      CLOSED)
+      CLOSED|STALE_MERGED)
         # AC2: CLOSED and not merged — clear guard, fall through to gh pr create fresh PR
-        echo "[INFO] ${story_id} handle_commit_phase: selected PR ($pr_url) is CLOSED (unmerged) — clearing guard, opening fresh PR"
+        [[ "$_selected_pr_state" == CLOSED ]] \
+          && echo "[INFO] ${story_id} handle_commit_phase: selected PR ($pr_url) is CLOSED (unmerged) — clearing guard, opening fresh PR"
         pr_url=""
         _skip_pr_create=0
         ;;

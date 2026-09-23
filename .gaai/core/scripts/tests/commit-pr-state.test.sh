@@ -830,6 +830,51 @@ else
   fail "T15: integrity failure changed retry class or reached publication"
 fi
 
+# ────────────────────────────────────────────────────────────────────────────
+# T16: a PR merged for an EARLIER cycle of the same story/<id> branch is not
+# landing evidence for the head this phase just published. Guard 2 found it
+# via --state all; treating it as MERGED projected a fresh, unmerged candidate
+# to done/merged and released its dependants. It must be handled like a CLOSED
+# PR: open a fresh PR and record it pending review, never reconcile the story
+# as merged. (T2 keeps the legitimate case: the merged PR's head IS the
+# published head.)
+# ────────────────────────────────────────────────────────────────────────────
+echo "--- T16: MERGED PR from an earlier cycle opens a fresh PR ---"
+SID16="TST-PCS16"
+setup_story "$SID16"
+write_backlog "$SID16"
+_check_worktree_integrity() { return 0; }
+STALE_T16="https://github.com/test/repo/pull/96"
+FRESH_T16="https://github.com/test/repo/pull/101"
+export GH_PR_STALE_URL="$STALE_T16"
+export GH_PR_STATE="MERGED"
+# The earlier cycle merged a different head: here, the base commit.
+export GH_PR_HEAD_SHA="$(git -C "$PROJ" rev-parse staging)"
+export GH_PR_FRESH_URL="$FRESH_T16"
+export GH_PR_NUMBER="101"
+export GAAI_AUTO_MERGE_POLICY="off"
+: > "$GH_CALL_LOG"
+set +e
+handle_commit_phase "$SID16" "trace-t16"
+set -e
+T16_PR_STATUS=$(grep -A 10 "id: ${SID16}" "$BACKLOG_FILE" | grep "pr_status:" | head -1 | awk '{print $2}' || true)
+T16_PR_URL=$(grep -A 10 "id: ${SID16}" "$BACKLOG_FILE" | grep "pr_url:" | head -1 | awk '{print $2}' | tr -d '"' || true)
+if grep -q "gh pr create" "$GH_CALL_LOG"; then
+  pass "T16a: fresh PR created instead of reusing the earlier cycle's merged PR"
+else
+  fail "T16a: gh pr create NOT called — the stale merged PR was taken as this cycle's"
+fi
+if [[ "$T16_PR_STATUS" == pending_review && "$T16_PR_URL" == "$FRESH_T16" ]]; then
+  pass "T16b: row carries the fresh PR pending review, not the earlier merge"
+else
+  fail "T16b: row reconciled against the earlier cycle's PR (pr_status=${T16_PR_STATUS}, pr_url=${T16_PR_URL})"
+fi
+if grep -qE "pulls/96/merge|gh pr merge.*${STALE_T16}" "$GH_CALL_LOG"; then
+  fail "T16c: merge attempted on the earlier cycle's PR"
+else
+  pass "T16c: earlier cycle's PR never merged"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
