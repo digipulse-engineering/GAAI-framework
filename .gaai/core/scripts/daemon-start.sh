@@ -302,11 +302,12 @@ export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 #
 #     The credential path is therefore PROVISIONED INSIDE the private root rather
 #     than inherited: nothing from the environment redirects a tool's config, which
-#     is the property section 7 protects. Only a symlink is created — no token is
-#     copied, and the operator's own configuration remains the single source. Both
-#     legs are conditional and best-effort: a host without `gh`, or without an
-#     operator GitHub configuration, keeps exactly today's behaviour, and a remote
-#     that needs no credentials is unaffected.
+#     is the property section 7 protects. No symlink and no ambient `gh`
+#     configuration is trusted here: an entry-owned helper script and `$HOME/.gitconfig`
+#     are written unconditionally further below (7b), sourcing a credential only from
+#     THIS launch's own admitted identity. A host with no admitted forge credential is
+#     refused (AC4) rather than falling back to a prior launch's or the operator's own
+#     configuration; a remote that needs no credentials is unaffected either way.
 #     Preferred route: a DEDICATED forge credential the operator provisions outside
 #     the private root. It is read once here and nothing is copied to disk; the
 #     operator's own tool configuration is never made reachable, so a credential
@@ -316,25 +317,89 @@ export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 #     fails any of those is IGNORED rather than "repaired" — this entry never widens
 #     permissions on an operator's secret.
 #
-#     Any inherited forge credential is dropped first. The environment must never be
-#     able to choose the identity the daemon acts under, and this variable survives
-#     the section 8 strip precisely so the value set HERE reaches the tools.
-unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST
+#     Any inherited forge credential or forge identity is dropped first. The
+#     environment must never be able to choose the identity the daemon acts under.
+#     The verdict and any admitted identity/token are held in NON-EXPORTED
+#     variables so a later gate (do_start, before any tmux/credential/daemon
+#     effect) can refuse a launch that admitted none, while this entry's OWN
+#     fetch below may still use the exported form to prove the exact target
+#     (permitted — proving the exact target is what requires it).
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN
+_GAAI_FORGE_IDENTITY=""
+_GAAI_FORGE_TOKEN=""
+_GAAI_FORGE_VERDICT="absent"
 _gaai_forge_token_file="${GAAI_OPERATOR_HOME:-}/.gaai/forge-token"
-if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_forge_token_file" \
-      && ! -L "$_gaai_forge_token_file" ]] \
-   && _gaai_private_owner_mode "$_gaai_forge_token_file"; then
-  GH_TOKEN="$(tr -d '[:space:]' < "$_gaai_forge_token_file" 2>/dev/null || printf '')"
-  if [[ -n "$GH_TOKEN" ]]; then export GH_TOKEN; else unset GH_TOKEN; fi
+if [[ -n "${GAAI_OPERATOR_HOME:-}" && -e "$_gaai_forge_token_file" ]]; then
+  if [[ -L "$_gaai_forge_token_file" ]]; then
+    _GAAI_FORGE_VERDICT="symlink"
+  elif [[ ! -f "$_gaai_forge_token_file" ]]; then
+    _GAAI_FORGE_VERDICT="not_regular"
+  elif ! _gaai_private_owner_mode "$_gaai_forge_token_file"; then
+    _GAAI_FORGE_VERDICT="mode_or_owner_invalid"
+  else
+    _gaai_forge_size="$(stat -c '%s' "$_gaai_forge_token_file" 2>/dev/null \
+      || stat -f '%z' "$_gaai_forge_token_file" 2>/dev/null || echo "")"
+    if [[ -z "$_gaai_forge_size" ]] || (( _gaai_forge_size > 4096 )); then
+      _GAAI_FORGE_VERDICT="oversized"
+    else
+      # Grammar: either one bare-token line (identity implied as the fixed forge
+      # convention "x-access-token") or exactly "identity=<v>" / "token=<v>". No
+      # shell evaluation — a bounded read loop, never `source`. A third line, an
+      # unknown key or an unsafe scalar is refused, never guessed at.
+      _gaai_forge_nlines=0 _gaai_forge_l1="" _gaai_forge_l2="" _gaai_forge_ln=""
+      while IFS= read -r _gaai_forge_ln || [[ -n "$_gaai_forge_ln" ]]; do
+        _gaai_forge_nlines=$(( _gaai_forge_nlines + 1 ))
+        case "$_gaai_forge_nlines" in
+          1) _gaai_forge_l1="$_gaai_forge_ln" ;;
+          2) _gaai_forge_l2="$_gaai_forge_ln" ;;
+        esac
+        [[ "$_gaai_forge_nlines" -ge 3 ]] && break
+      done < "$_gaai_forge_token_file" 2>/dev/null
+      case "$_gaai_forge_nlines" in
+        0) _GAAI_FORGE_VERDICT="empty" ;;
+        1)
+          if [[ "$_gaai_forge_l1" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            _GAAI_FORGE_IDENTITY="x-access-token"
+            _GAAI_FORGE_TOKEN="$_gaai_forge_l1"
+            _GAAI_FORGE_VERDICT="ok"
+          else
+            _GAAI_FORGE_VERDICT="charset_invalid"
+          fi
+          ;;
+        2)
+          if [[ "$_gaai_forge_l1" == identity=* && "$_gaai_forge_l2" == token=* ]]; then
+            _gaai_forge_id="${_gaai_forge_l1#identity=}"
+            _gaai_forge_tok="${_gaai_forge_l2#token=}"
+            if [[ "$_gaai_forge_id" =~ ^[A-Za-z0-9._-]+$ && "$_gaai_forge_tok" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              _GAAI_FORGE_IDENTITY="$_gaai_forge_id"
+              _GAAI_FORGE_TOKEN="$_gaai_forge_tok"
+              _GAAI_FORGE_VERDICT="ok"
+            else
+              _GAAI_FORGE_VERDICT="charset_invalid"
+            fi
+          else
+            _GAAI_FORGE_VERDICT="grammar_invalid"
+          fi
+          unset -v _gaai_forge_id _gaai_forge_tok
+          ;;
+        *) _GAAI_FORGE_VERDICT="grammar_invalid" ;;
+      esac
+      unset -v _gaai_forge_nlines _gaai_forge_l1 _gaai_forge_l2 _gaai_forge_ln
+    fi
+    unset -v _gaai_forge_size
+  fi
 fi
 unset -v _gaai_forge_token_file
-#     Fallback: the previous behaviour — link the operator's tool configuration — so
-#     a host without a dedicated credential keeps working exactly as it did.
-if [[ -z "${GH_TOKEN:-}" ]] \
-   && [[ -n "$GAAI_OPERATOR_HOME" && -d "$GAAI_OPERATOR_HOME/.config/gh" \
-         && ! -e "$XDG_CONFIG_HOME/gh" ]] && command -v gh >/dev/null 2>&1; then
-  ln -s "$GAAI_OPERATOR_HOME/.config/gh" "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
+if [[ "$_GAAI_FORGE_VERDICT" == "ok" ]]; then
+  GH_TOKEN="$_GAAI_FORGE_TOKEN"
+  GAAI_FORGE_IDENTITY="$_GAAI_FORGE_IDENTITY"
+  GAAI_FORGE_TOKEN="$_GAAI_FORGE_TOKEN"
+  export GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN
 fi
+#     No ambient carrier: `gh`'s own configuration must never supply an identity
+#     this launch did not itself admit. Anything a previous launch left linked
+#     here is removed outright rather than left to rescue this one.
+rm -rf "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
 #     The delivery agent CLI's account state is the same class of problem and takes
 #     the same shape: a private HOME hides the account binding the CLI keeps in the
 #     home root, and without it the CLI reports itself logged out. Linking it is
@@ -423,15 +488,31 @@ if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_agent_cred_file" \
     && ln -s "$_gaai_agent_cred_file" "$HOME/.claude/.credentials.json" 2>/dev/null || true
 fi
 unset -v _gaai_agent_cred_file
-# The private root's git configuration is entry-owned, so it is rewritten on every
-# entry and a stale chain cannot survive. The leading empty helper resets the list
-# accumulated from higher-level files: on this platform git reads an additional
-# built-in system gitconfig that declares the platform keychain helper and that no
-# environment variable can displace, so without the reset every successful fetch also
-# runs a keychain store that cannot succeed under a private HOME.
-if [[ -n "${GH_TOKEN:-}" || -L "$XDG_CONFIG_HOME/gh" ]]; then
-  ( umask 077; printf '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig" ) 2>/dev/null || true
-fi
+# The private root's git configuration is entry-owned and rewritten on EVERY
+# entry, unconditionally: a stale chain cannot survive, and a launch that admits
+# no identity gets no ambient rescue either. The leading empty helper resets the
+# list accumulated from higher-level files: on this platform git reads an
+# additional built-in system gitconfig that declares the platform keychain helper
+# and that no environment variable can displace, so without the reset every
+# successful fetch also runs a keychain store that cannot succeed under a private
+# HOME. The installed helper reads a credential ONLY from this process's own
+# GAAI_FORGE_IDENTITY / GAAI_FORGE_TOKEN — never from `gh`'s own configuration or
+# a platform keychain — and refuses (exit 1, no output) when either is absent, so
+# a process without this launch's identity gets no credential from it rather than
+# someone else's. The helper string itself carries no secret.
+_gaai_cred_helper="$HOME/.gaai-git-credential-helper.sh"
+( umask 077
+  cat > "$_gaai_cred_helper" <<'GAAI_HELPER_EOF'
+#!/bin/bash
+[[ "${1:-}" == "get" ]] || exit 0
+[[ -n "${GAAI_FORGE_IDENTITY:-}" && -n "${GAAI_FORGE_TOKEN:-}" ]] || exit 1
+printf 'username=%s\npassword=%s\n' "$GAAI_FORGE_IDENTITY" "$GAAI_FORGE_TOKEN"
+GAAI_HELPER_EOF
+  chmod 0700 "$_gaai_cred_helper"
+  printf '[credential]\n\thelper =\n\thelper = !%s\n' "$_gaai_cred_helper" > "$HOME/.gitconfig"
+  chmod 0600 "$HOME/.gitconfig"
+) 2>/dev/null || true
+unset -v _gaai_cred_helper
 
 # 7c. No interactive credential path, ever. The private HOME above leaves git with
 #     no helper unless 7b provisioned one, and a pane of the private tmux server IS
@@ -496,7 +577,7 @@ unset -v _gaai_key _gaai_val _GAAI_EXPORTED_SET
 # an environment value: every hostile inherited entry was refused in sections 3-5,
 # and each entry-owned survivor was assigned unconditionally above.
 for _gaai_name in $(compgen -e 2>/dev/null || true); do
-  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED " in
+  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED " in
     *" $_gaai_name "*) ;;
     *) export -n "$_gaai_name" 2>/dev/null || true ;;
   esac
@@ -753,6 +834,10 @@ _pane_field() {
 
 _child_refuse() {
   local _attempt_dir="$1" _evidence="$2"
+  # A refusal reachable before the forge secret's own unlink step (:1013) must not
+  # leave a 0600 plaintext credential behind in the attempt directory; this is
+  # best-effort and safe to attempt unconditionally since the file may not exist.
+  rm -f "$_attempt_dir/forge.cred" 2>/dev/null || true
   printf 'daemon-start[child]: reason=process_authority_invalid action=operator_disposition_required evidence=%s\n' \
     "$_evidence" >&2
   _gaai_home_write_durable "$_attempt_dir/ack.child_failed" "evidence=$_evidence" 2>/dev/null || true
@@ -785,7 +870,7 @@ do_daemon_child() {
   local _manifest="$_attempt_dir/manifest"
   [[ -r "$_manifest" ]] || _child_refuse "$_attempt_dir" "manifest_absent"
 
-  local _schema _attempt _home _daemon_digest _cred_mode _release _repo_root _target_sha _forge_mode _forge_secret
+  local _schema _attempt _home _daemon_digest _cred_mode _release _repo_root _target_sha _forge_mode _forge_secret _forge_manifest_identity
   _schema="$(_owner_field "$_manifest" schema)"
   _attempt="$(_owner_field "$_manifest" attempt)"
   _home="$(_owner_field "$_manifest" home)"
@@ -794,7 +879,9 @@ do_daemon_child() {
   _release="$(_owner_field "$_manifest" release_digest)"
   _forge_mode="$(_owner_field "$_manifest" forge_mode)"
   _forge_secret="$(_owner_field "$_manifest" forge_secret)"
+  _forge_manifest_identity="$(_owner_field "$_manifest" forge_identity)"
   case "$_forge_mode" in present|absent) ;; *) _child_refuse "$_attempt_dir" "forge_role=mode_invalid" ;; esac
+  local _LIFECYCLE_ROOT_FOR_TRACE; _LIFECYCLE_ROOT_FOR_TRACE="$(dirname "$(dirname "$_attempt_dir")")"
   _repo_root="$(_owner_field "$_manifest" repo_root)"
   _target_sha="$(_owner_field "$_manifest" target_sha)"
   [[ "$_schema" == "$GAAI_HOME_SCHEMA" ]] || _child_refuse "$_attempt_dir" "manifest_schema_mismatch"
@@ -827,6 +914,7 @@ do_daemon_child() {
     || _child_refuse "$_attempt_dir" "daemon_role=fd_identity_mismatch"
   _f_digest="$(_gaai_home_digest_file "$_fd_path")" || _child_refuse "$_attempt_dir" "daemon_role=fd_digest_unavailable"
   [[ "$_f_digest" == "$_daemon_digest" ]] || _child_refuse "$_attempt_dir" "daemon_role=fd_blob_mismatch"
+  _gaai_home_trace "$_LIFECYCLE_ROOT_FOR_TRACE" "$_attempt" "daemon_digest_proven"
 
   # 2. Credential mode is explicit and immutable for the attempt.
   local _secret_ino="" _secret_dev="" _secret_bound=0 _secret_expected_word=""
@@ -888,7 +976,7 @@ do_daemon_child() {
   # The forge identity is validated and BOUND here, and consumed only after the
   # release record is matched below. Binding before the barrier is what lets the
   # file be unlinked while its bytes stay reachable through this descriptor alone.
-  local _forge_bound=0 _forge_expected_word="" _forge_ino="" _forge_dev=""
+  local _forge_bound=0 _forge_expected_identity="" _forge_expected_token_digest="" _forge_ino="" _forge_dev=""
   if [[ "$_forge_mode" == "present" ]]; then
     [[ -n "$_forge_secret" ]] || _child_refuse "$_attempt_dir" "forge_role=path_absent"
     [[ -L "$_forge_secret" ]] && _child_refuse "$_attempt_dir" "forge_role=symlink"
@@ -898,19 +986,27 @@ do_daemon_child() {
     _g_dev="$(_gaai_home_stat_field '%d' "$_forge_secret")" || _child_refuse "$_attempt_dir" "forge_role=stat_unavailable"
     _g_mode="$(_gaai_home_stat_field '%a' "$_forge_secret")" || _child_refuse "$_attempt_dir" "forge_role=stat_unavailable"
     [[ "$_g_mode" == "600" ]] || _child_refuse "$_attempt_dir" "forge_role=mode_open"
-    local _glines _gfirst
-    _glines="$(wc -l < "$_forge_secret" 2>/dev/null | tr -d ' ')"
-    [[ "$_glines" == "1" ]] || _child_refuse "$_attempt_dir" "forge_role=grammar_line_count"
-    _gfirst="$(head -1 "$_forge_secret" 2>/dev/null || echo "")"
-    case "$_gfirst" in
-      "export GH_TOKEN="?*) ;;
-      *) _child_refuse "$_attempt_dir" "forge_role=grammar_assignment" ;;
-    esac
-    case "$_gfirst" in
-      *$'\x01'*|*$'\x02'*|*$'\x1b'*|*$'\r'*) _child_refuse "$_attempt_dir" "forge_role=grammar_control_character" ;;
-    esac
-    _forge_expected_word="${_gfirst#export GH_TOKEN=}"
-    [[ -n "$_forge_expected_word" ]] || _child_refuse "$_attempt_dir" "forge_role=grammar_empty_word"
+    # Grammar/charset-validate through the PATH before binding — plain DATA, never
+    # shell, never sourced — so the bound descriptor is never read here and its
+    # offset stays at zero for the later, sole authoritative read (step 6b).
+    local _gnlines=0 _gl1="" _gl2="" _gln=""
+    while IFS= read -r _gln || [[ -n "$_gln" ]]; do
+      _gnlines=$(( _gnlines + 1 ))
+      case "$_gnlines" in 1) _gl1="$_gln" ;; 2) _gl2="$_gln" ;; esac
+      [[ "$_gnlines" -ge 3 ]] && break
+    done < "$_forge_secret" 2>/dev/null
+    [[ "$_gnlines" == "2" ]] || _child_refuse "$_attempt_dir" "forge_role=grammar_line_count"
+    case "$_gl1" in identity=*) ;; *) _child_refuse "$_attempt_dir" "forge_role=grammar_assignment" ;; esac
+    case "$_gl2" in token=*) ;; *) _child_refuse "$_attempt_dir" "forge_role=grammar_assignment" ;; esac
+    _forge_expected_identity="${_gl1#identity=}"
+    local _gtoken="${_gl2#token=}"
+    if [[ ! "$_forge_expected_identity" =~ ^[A-Za-z0-9._-]+$ || ! "$_gtoken" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      _child_refuse "$_attempt_dir" "forge_role=grammar_charset"
+    fi
+    [[ "$_forge_expected_identity" == "$_forge_manifest_identity" ]] \
+      || _child_refuse "$_attempt_dir" "forge_role=manifest_identity_mismatch"
+    _forge_expected_token_digest="$(_gaai_home_digest_string "$_gtoken")"
+    unset -v _gnlines _gl1 _gl2 _gln _gtoken
     exec 5< "$_forge_secret" || _child_refuse "$_attempt_dir" "forge_role=unopenable"
     local _gfd_path="/dev/fd/5"
     [[ -r "/proc/self/fd/5" ]] && _gfd_path="/proc/self/fd/5"
@@ -923,6 +1019,7 @@ do_daemon_child() {
     _gaai_home_fsync "$(dirname "$_forge_secret")"
     [[ -e "$_forge_secret" ]] && _child_refuse "$_attempt_dir" "forge_role=still_linked"
     _forge_ino="$_gf_ino"; _forge_dev="$_gf_dev"; _forge_bound=1
+    _gaai_home_trace "$_LIFECYCLE_ROOT_FOR_TRACE" "$_attempt" "forge_bound"
   fi
 
   exec 7< "$_attempt_dir/release.fifo" || _child_refuse "$_attempt_dir" "release_role=fifo_unopenable"
@@ -935,6 +1032,7 @@ pid=$_pid
 incarnation=$_inc
 credential_mode=$_cred_mode
 forge_mode=$_forge_mode
+forge_identity=$_forge_expected_identity
 daemon_ino=$_f_ino
 daemon_dev=$_f_dev
 daemon_digest=$_f_digest
@@ -951,7 +1049,7 @@ secret_dev=$_secret_dev" \
   # home, the forge mode or any other bound field produces a value the record cannot
   # match. The record arrives over a FIFO this controller alone writes.
   local _recomputed
-  _recomputed="$(_gaai_home_digest_string "${_schema}|${_attempt}|${_daemon_digest}|${_cred_mode}|${_forge_mode}|${_home}")" \
+  _recomputed="$(_gaai_home_digest_string "${_schema}|${_attempt}|${_daemon_digest}|${_cred_mode}|${_forge_mode}|${_home}|${_forge_expected_identity}|${_forge_expected_token_digest}")" \
     || _child_refuse "$_attempt_dir" "release_role=digest_unavailable"
   [[ "$_record" == "release attempt=$_attempt digest=$_recomputed" ]] \
     || _child_refuse "$_attempt_dir" "release_role=record_mismatch"
@@ -976,27 +1074,41 @@ secret_dev=$_secret_dev" \
   fi
 
   # 6b. The forge identity, consumed only now — past the descriptor identity proof and
-  #     past the controller's release record. Its first and only read, at offset zero.
+  #     past the controller's release record. Its first and only READ (never sourced,
+  #     never eval'd) is at offset zero. The gitconfig helper the shared entry block
+  #     already installed points at the fixed, secret-free helper script; it becomes
+  #     correct the moment these two variables are exported, with no further write.
   if [[ "$_forge_bound" -eq 1 ]]; then
     local _gfd_path="/dev/fd/5"
     [[ -r "/proc/self/fd/5" ]] && _gfd_path="/proc/self/fd/5"
-    . "$_gfd_path" || _child_refuse "$_attempt_dir" "forge_role=source_failed"
-    [[ -n "${GH_TOKEN:-}" ]] || _child_refuse "$_attempt_dir" "forge_role=source_noop"
-    if [[ "$(printf '%q' "$GH_TOKEN")" != "$_forge_expected_word" ]]; then
-      unset -v GH_TOKEN
-      _child_refuse "$_attempt_dir" "forge_role=encoder_round_trip_mismatch"
-    fi
-    export GH_TOKEN
+    local _rnlines=0 _rl1="" _rl2="" _rln=""
+    while IFS= read -r _rln || [[ -n "$_rln" ]]; do
+      _rnlines=$(( _rnlines + 1 ))
+      case "$_rnlines" in 1) _rl1="$_rln" ;; 2) _rl2="$_rln" ;; esac
+      [[ "$_rnlines" -ge 3 ]] && break
+    done < "$_gfd_path" 2>/dev/null
     exec 5<&-
-    # The private root's git configuration names the forge helper. A failure here is
-    # NOT survivable: the identity would be exported while git kept resolving whatever
-    # helper the platform's own configuration names, so two identities would be in
-    # play at once. It is written exclusively and renamed, so no pre-existing path is
-    # followed and no partial file is ever observable.
-    local _gcfg="$HOME/.gitconfig" _gtmp="$HOME/.gitconfig.$$"
-    ( set -C; umask 077; printf '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$_gtmp" ) 2>/dev/null \
-      || _child_refuse "$_attempt_dir" "forge_role=gitconfig_uncreatable"
-    mv -f "$_gtmp" "$_gcfg" 2>/dev/null || _child_refuse "$_attempt_dir" "forge_role=gitconfig_uninstallable"
+    [[ "$_rnlines" == "2" ]] || _child_refuse "$_attempt_dir" "forge_role=read_line_count"
+    case "$_rl1" in identity=*) ;; *) _child_refuse "$_attempt_dir" "forge_role=read_grammar" ;; esac
+    case "$_rl2" in token=*) ;; *) _child_refuse "$_attempt_dir" "forge_role=read_grammar" ;; esac
+    local _r_identity="${_rl1#identity=}" _r_token="${_rl2#token=}"
+    if [[ ! "$_r_identity" =~ ^[A-Za-z0-9._-]+$ || ! "$_r_token" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      _child_refuse "$_attempt_dir" "forge_role=read_charset"
+    fi
+    [[ "$_r_identity" == "$_forge_expected_identity" ]] \
+      || _child_refuse "$_attempt_dir" "forge_role=identity_mismatch"
+    # Exactly-one-assignment proof, adapted to plain data: the digest of what was
+    # actually read must match the digest computed from the pre-bind grammar pass.
+    if [[ "$(_gaai_home_digest_string "$_r_token")" != "$_forge_expected_token_digest" ]]; then
+      unset -v _r_token
+      _child_refuse "$_attempt_dir" "forge_role=token_digest_mismatch"
+    fi
+    GAAI_FORGE_IDENTITY="$_r_identity"
+    GAAI_FORGE_TOKEN="$_r_token"
+    GH_TOKEN="$_r_token"
+    export GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN GH_TOKEN
+    unset -v _r_identity _r_token _rl1 _rl2 _rln _rnlines
+    _gaai_home_trace "$_LIFECYCLE_ROOT_FOR_TRACE" "$_attempt" "forge_released"
   fi
 
   # 7. Hand the exact identities to the daemon and execute the ALREADY-BOUND
@@ -1018,6 +1130,7 @@ secret_dev=$_secret_dev" \
 
   local _bash_abs="${BASH:-/bin/bash}"
   [[ -x "$_bash_abs" ]] || _child_refuse "$_attempt_dir" "daemon_role=interpreter_unavailable"
+  _gaai_home_trace "$_LIFECYCLE_ROOT_FOR_TRACE" "$_attempt" "daemon_exec"
   exec "$_bash_abs" "$_fd_path" ${_dargs[@]+"${_dargs[@]}"}
 }
 
@@ -1219,6 +1332,26 @@ do_start() {
       _release_and_exit 1 ;;
   esac
 
+  # Forge identity gate. A launch that did not itself admit an operator identity
+  # (section 7b) is refused HERE — before tmux capability, before any home fetch,
+  # before an attempt directory, launcher, session or daemon exists — so no
+  # target-selected code ever starts and no remote operation is ever attempted
+  # without it. `absent` refuses like every other non-`ok` verdict: a host whose
+  # only forge credential is an interactive CLI login has none to admit (Story
+  # Notes — an accepted outcome, not a regression). The diagnostic carries the
+  # verdict alone, never a token, a token digest, a credential pathname or a
+  # remote URL.
+  if [[ "${_GAAI_FORGE_VERDICT:-absent}" != "ok" ]]; then
+    mkdir -p "$LIFECYCLE_ROOT" 2>/dev/null || true
+    chmod 0700 "$LIFECYCLE_ROOT" 2>/dev/null || true
+    _gaai_home_write_durable "$LIFECYCLE_ROOT/refusal" \
+"reason=forge_identity_unadmitted
+action=provision_forge_credential
+evidence=forge_role=${_GAAI_FORGE_VERDICT:-absent}" 2>/dev/null || true
+    _gaai_home_refuse forge_identity_unadmitted 0 "forge_role=${_GAAI_FORGE_VERDICT:-absent}" || true
+    _release_and_exit 1
+  fi
+
   _tmux_capability_ok || _release_and_exit 1
 
   GAAI_DAEMON_HOME="${GAAI_DAEMON_HOME:-${GAAI_WORKTREES_BASE}/__daemon-home}"
@@ -1258,26 +1391,28 @@ do_start() {
   # re-runs that section under the private home and finds nothing there by
   # construction, so the identity has to travel this attempt's own bound channel.
   #
-  # A launch that cannot establish an identity is refused HERE, before an attempt
-  # directory, a launcher copy, a session or a daemon exists: the daemon must never
-  # reach its first remote operation without the identity its launch admitted, and a
-  # refusal that leaves no process behind is the only kind this boundary can make.
-  # Absent is a legitimate, canonical mode: a target that needs no credential, or an
-  # operator who provisioned none, keeps exactly today's behaviour — no forge path,
-  # no file, no descriptor, no assignment, and the variable unset in every descendant.
-  # A missing credential is surfaced by the typed fetch failure, not by refusing to
-  # start, so a host that never needed one is never blocked by this boundary.
-  local _forge_mode="absent"
-  [[ -n "${GH_TOKEN:-}" ]] && _forge_mode="present"
+  # The gate above already refused any launch whose verdict was not `ok`, so
+  # forge identity is always present by this point — never re-derived, always
+  # the exact identity section 7b admitted for THIS launch.
+  local _forge_mode="present"
+  local _forge_identity="$_GAAI_FORGE_IDENTITY"
 
   local _attempt _attempt_dir
   _attempt="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   _attempt_dir="$LAUNCH_ROOT/$_attempt"
+  _gaai_home_trace "$LIFECYCLE_ROOT" "$_attempt" "entry_credential_admitted"
+  local _forge_token_digest
+  _forge_token_digest="$(_gaai_home_digest_string "$_GAAI_FORGE_TOKEN")"
   local _release_digest
-  # The admitted home and the forge mode join the digest: a writer of the attempt
-  # directory that rewrites either produces a value this controller's release record
-  # cannot match, and the child recomputes rather than trusting the file.
-  _release_digest="$(_gaai_home_digest_string "${GAAI_HOME_SCHEMA}|${_attempt}|${_daemon_digest}|${_cred_mode}|${_forge_mode}|${GAAI_DAEMON_HOME}")"
+  # The admitted home, forge mode, forge identity and a digest of the forge token
+  # join the digest — never the token itself. A writer of the attempt directory
+  # that rewrites the home, either forge field or the token produces a value this
+  # controller's release record cannot match, and the child recomputes rather
+  # than trusting the file. The token digest exists only in this process's
+  # memory and in the release record below — it is never written to the
+  # manifest, the owner record, an ack, the trace or a diagnostic.
+  _release_digest="$(_gaai_home_digest_string "${GAAI_HOME_SCHEMA}|${_attempt}|${_daemon_digest}|${_cred_mode}|${_forge_mode}|${GAAI_DAEMON_HOME}|${_forge_identity}|${_forge_token_digest}")"
+  _gaai_home_trace "$LIFECYCLE_ROOT" "$_attempt" "target_proven"
 
   # `pending` is durable BEFORE any launch directory, credential file or launcher
   # exists, so a controller crash here can never leave an unexplained artefact.
@@ -1318,6 +1453,7 @@ credential_mode=$_cred_mode" || { _gaai_home_refuse home_lock_failed 1 "pending_
     _gaai_home_refuse home_asset_invalid 1 "launcher_role=materialized_mismatch" || true
     _release_and_exit 1
   fi
+  _gaai_home_trace "$LIFECYCLE_ROOT" "$_attempt" "launcher_materialized"
 
   mkfifo -m 0600 "$_attempt_dir/release.fifo" 2>/dev/null \
     || { _gaai_home_refuse process_authority_invalid 1 "release_role=fifo_uncreatable" || true; _release_and_exit 1; }
@@ -1335,15 +1471,15 @@ credential_mode=$_cred_mode" || { _gaai_home_refuse home_lock_failed 1 "pending_
       || { _gaai_home_refuse process_authority_invalid 1 "secret_role=uncreatable" || true; _release_and_exit 1; }
     chmod 0600 "$_secret_path" 2>/dev/null || true
   fi
-  local _forge_path=""
-  if [[ "$_forge_mode" == "present" ]]; then
-    _forge_path="$_attempt_dir/forge.env"
-    # Same contract as the implementation-provider secret above: O_EXCL through
-    # noclobber, 0600 through umask, inside the 0700 directory just created empty.
-    ( set -C; umask 077; printf 'export GH_TOKEN=%q\n' "$GH_TOKEN" > "$_forge_path" ) 2>/dev/null \
-      || { _gaai_home_refuse process_authority_invalid 1 "forge_role=uncreatable" || true; _release_and_exit 1; }
-    chmod 0600 "$_forge_path" 2>/dev/null || true
-  fi
+  # The forge identity travels as plain, non-shell DATA — never a shell
+  # assignment, never `source`d. O_EXCL through noclobber, 0600 through umask,
+  # inside the 0700 directory just created empty.
+  local _forge_path="$_attempt_dir/forge.cred"
+  ( set -C; umask 077
+    printf 'identity=%s\ntoken=%s\n' "$_forge_identity" "$_GAAI_FORGE_TOKEN" > "$_forge_path"
+  ) 2>/dev/null \
+    || { _gaai_home_refuse process_authority_invalid 1 "forge_role=uncreatable" || true; _release_and_exit 1; }
+  chmod 0600 "$_forge_path" 2>/dev/null || true
 
   printf '%s\n' "schema=$GAAI_HOME_SCHEMA
 attempt=$_attempt
@@ -1355,6 +1491,7 @@ launcher_digest=$_launcher_digest
 credential_mode=$_cred_mode
 secret=$_secret_path
 forge_mode=$_forge_mode
+forge_identity=$_forge_identity
 forge_secret=$_forge_path
 release_digest=$_release_digest" > "$_attempt_dir/manifest"
   : > "$_attempt_dir/args"
@@ -1424,7 +1561,7 @@ launcher=$_launcher" || { _gaai_home_refuse home_lock_failed 1 "pending_enrich_u
   # member and sets its own entry-owned copies. `env` execs the launcher, so
   # pane_pid == launcher_ack.pid still holds; nothing else in the pane changes.
   if ! _tmux new-session -d -s "$TMUX_SESSION" ${tmux_env_args[@]+"${tmux_env_args[@]}"} \
-      "exec '$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED '$_launcher' --daemon-child '$_attempt_dir'" 2>/dev/null; then
+      "exec '$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u GH_HOST -u GAAI_FORGE_IDENTITY -u GAAI_FORGE_TOKEN '$_launcher' --daemon-child '$_attempt_dir'" 2>/dev/null; then
     _gaai_home_refuse process_authority_invalid 1 "tmux_role=session_uncreatable" || true
     _release_and_exit 1
   fi
@@ -1436,6 +1573,7 @@ launcher=$_launcher" || { _gaai_home_refuse home_lock_failed 1 "pending_enrich_u
     _gaai_home_refuse process_authority_invalid 1 "pane_role=identity_unavailable" || true
     _release_and_exit 1
   fi
+  _gaai_home_trace "$LIFECYCLE_ROOT" "$_attempt" "child_started"
 
   # Wait for the child's exact acknowledgement. A missing or failed ack is never
   # retried with a second spawn — the evidence is preserved for reconciliation.
@@ -1718,6 +1856,7 @@ do_stop() {
     rm -f "$_attempt_dir"/launcher.sh "$_attempt_dir"/release.fifo "$_attempt_dir"/secret.env \
           "$_attempt_dir"/manifest "$_attempt_dir"/args "$_attempt_dir"/tmux.conf \
           "$_attempt_dir"/ack.launcher "$_attempt_dir"/ack.ready "$_attempt_dir"/ack.child_failed \
+          "$_attempt_dir"/forge.cred \
           2>/dev/null || true
     if ! rmdir "$_attempt_dir" 2>/dev/null; then
       echo "  note: $_attempt_dir still holds unrecognised content and is preserved for inspection"

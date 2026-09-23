@@ -304,11 +304,12 @@ export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 #
 #     The credential path is therefore PROVISIONED INSIDE the private root rather
 #     than inherited: nothing from the environment redirects a tool's config, which
-#     is the property section 7 protects. Only a symlink is created — no token is
-#     copied, and the operator's own configuration remains the single source. Both
-#     legs are conditional and best-effort: a host without `gh`, or without an
-#     operator GitHub configuration, keeps exactly today's behaviour, and a remote
-#     that needs no credentials is unaffected.
+#     is the property section 7 protects. No symlink and no ambient `gh`
+#     configuration is trusted here: an entry-owned helper script and `$HOME/.gitconfig`
+#     are written unconditionally further below (7b), sourcing a credential only from
+#     THIS launch's own admitted identity. A host with no admitted forge credential is
+#     refused (AC4) rather than falling back to a prior launch's or the operator's own
+#     configuration; a remote that needs no credentials is unaffected either way.
 #     Preferred route: a DEDICATED forge credential the operator provisions outside
 #     the private root. It is read once here and nothing is copied to disk; the
 #     operator's own tool configuration is never made reachable, so a credential
@@ -318,25 +319,89 @@ export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 #     fails any of those is IGNORED rather than "repaired" — this entry never widens
 #     permissions on an operator's secret.
 #
-#     Any inherited forge credential is dropped first. The environment must never be
-#     able to choose the identity the daemon acts under, and this variable survives
-#     the section 8 strip precisely so the value set HERE reaches the tools.
-unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST
+#     Any inherited forge credential or forge identity is dropped first. The
+#     environment must never be able to choose the identity the daemon acts under.
+#     The verdict and any admitted identity/token are held in NON-EXPORTED
+#     variables so a later gate (do_start, before any tmux/credential/daemon
+#     effect) can refuse a launch that admitted none, while this entry's OWN
+#     fetch below may still use the exported form to prove the exact target
+#     (permitted — proving the exact target is what requires it).
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN
+_GAAI_FORGE_IDENTITY=""
+_GAAI_FORGE_TOKEN=""
+_GAAI_FORGE_VERDICT="absent"
 _gaai_forge_token_file="${GAAI_OPERATOR_HOME:-}/.gaai/forge-token"
-if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_forge_token_file" \
-      && ! -L "$_gaai_forge_token_file" ]] \
-   && _gaai_private_owner_mode "$_gaai_forge_token_file"; then
-  GH_TOKEN="$(tr -d '[:space:]' < "$_gaai_forge_token_file" 2>/dev/null || printf '')"
-  if [[ -n "$GH_TOKEN" ]]; then export GH_TOKEN; else unset GH_TOKEN; fi
+if [[ -n "${GAAI_OPERATOR_HOME:-}" && -e "$_gaai_forge_token_file" ]]; then
+  if [[ -L "$_gaai_forge_token_file" ]]; then
+    _GAAI_FORGE_VERDICT="symlink"
+  elif [[ ! -f "$_gaai_forge_token_file" ]]; then
+    _GAAI_FORGE_VERDICT="not_regular"
+  elif ! _gaai_private_owner_mode "$_gaai_forge_token_file"; then
+    _GAAI_FORGE_VERDICT="mode_or_owner_invalid"
+  else
+    _gaai_forge_size="$(stat -c '%s' "$_gaai_forge_token_file" 2>/dev/null \
+      || stat -f '%z' "$_gaai_forge_token_file" 2>/dev/null || echo "")"
+    if [[ -z "$_gaai_forge_size" ]] || (( _gaai_forge_size > 4096 )); then
+      _GAAI_FORGE_VERDICT="oversized"
+    else
+      # Grammar: either one bare-token line (identity implied as the fixed forge
+      # convention "x-access-token") or exactly "identity=<v>" / "token=<v>". No
+      # shell evaluation — a bounded read loop, never `source`. A third line, an
+      # unknown key or an unsafe scalar is refused, never guessed at.
+      _gaai_forge_nlines=0 _gaai_forge_l1="" _gaai_forge_l2="" _gaai_forge_ln=""
+      while IFS= read -r _gaai_forge_ln || [[ -n "$_gaai_forge_ln" ]]; do
+        _gaai_forge_nlines=$(( _gaai_forge_nlines + 1 ))
+        case "$_gaai_forge_nlines" in
+          1) _gaai_forge_l1="$_gaai_forge_ln" ;;
+          2) _gaai_forge_l2="$_gaai_forge_ln" ;;
+        esac
+        [[ "$_gaai_forge_nlines" -ge 3 ]] && break
+      done < "$_gaai_forge_token_file" 2>/dev/null
+      case "$_gaai_forge_nlines" in
+        0) _GAAI_FORGE_VERDICT="empty" ;;
+        1)
+          if [[ "$_gaai_forge_l1" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            _GAAI_FORGE_IDENTITY="x-access-token"
+            _GAAI_FORGE_TOKEN="$_gaai_forge_l1"
+            _GAAI_FORGE_VERDICT="ok"
+          else
+            _GAAI_FORGE_VERDICT="charset_invalid"
+          fi
+          ;;
+        2)
+          if [[ "$_gaai_forge_l1" == identity=* && "$_gaai_forge_l2" == token=* ]]; then
+            _gaai_forge_id="${_gaai_forge_l1#identity=}"
+            _gaai_forge_tok="${_gaai_forge_l2#token=}"
+            if [[ "$_gaai_forge_id" =~ ^[A-Za-z0-9._-]+$ && "$_gaai_forge_tok" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              _GAAI_FORGE_IDENTITY="$_gaai_forge_id"
+              _GAAI_FORGE_TOKEN="$_gaai_forge_tok"
+              _GAAI_FORGE_VERDICT="ok"
+            else
+              _GAAI_FORGE_VERDICT="charset_invalid"
+            fi
+          else
+            _GAAI_FORGE_VERDICT="grammar_invalid"
+          fi
+          unset -v _gaai_forge_id _gaai_forge_tok
+          ;;
+        *) _GAAI_FORGE_VERDICT="grammar_invalid" ;;
+      esac
+      unset -v _gaai_forge_nlines _gaai_forge_l1 _gaai_forge_l2 _gaai_forge_ln
+    fi
+    unset -v _gaai_forge_size
+  fi
 fi
 unset -v _gaai_forge_token_file
-#     Fallback: the previous behaviour — link the operator's tool configuration — so
-#     a host without a dedicated credential keeps working exactly as it did.
-if [[ -z "${GH_TOKEN:-}" ]] \
-   && [[ -n "$GAAI_OPERATOR_HOME" && -d "$GAAI_OPERATOR_HOME/.config/gh" \
-         && ! -e "$XDG_CONFIG_HOME/gh" ]] && command -v gh >/dev/null 2>&1; then
-  ln -s "$GAAI_OPERATOR_HOME/.config/gh" "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
+if [[ "$_GAAI_FORGE_VERDICT" == "ok" ]]; then
+  GH_TOKEN="$_GAAI_FORGE_TOKEN"
+  GAAI_FORGE_IDENTITY="$_GAAI_FORGE_IDENTITY"
+  GAAI_FORGE_TOKEN="$_GAAI_FORGE_TOKEN"
+  export GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN
 fi
+#     No ambient carrier: `gh`'s own configuration must never supply an identity
+#     this launch did not itself admit. Anything a previous launch left linked
+#     here is removed outright rather than left to rescue this one.
+rm -rf "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
 #     The delivery agent CLI's account state is the same class of problem and takes
 #     the same shape: a private HOME hides the account binding the CLI keeps in the
 #     home root, and without it the CLI reports itself logged out. Linking it is
@@ -425,15 +490,31 @@ if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_agent_cred_file" \
     && ln -s "$_gaai_agent_cred_file" "$HOME/.claude/.credentials.json" 2>/dev/null || true
 fi
 unset -v _gaai_agent_cred_file
-# The private root's git configuration is entry-owned, so it is rewritten on every
-# entry and a stale chain cannot survive. The leading empty helper resets the list
-# accumulated from higher-level files: on this platform git reads an additional
-# built-in system gitconfig that declares the platform keychain helper and that no
-# environment variable can displace, so without the reset every successful fetch also
-# runs a keychain store that cannot succeed under a private HOME.
-if [[ -n "${GH_TOKEN:-}" || -L "$XDG_CONFIG_HOME/gh" ]]; then
-  ( umask 077; printf '[credential]\n\thelper =\n\thelper = !gh auth git-credential\n' > "$HOME/.gitconfig" ) 2>/dev/null || true
-fi
+# The private root's git configuration is entry-owned and rewritten on EVERY
+# entry, unconditionally: a stale chain cannot survive, and a launch that admits
+# no identity gets no ambient rescue either. The leading empty helper resets the
+# list accumulated from higher-level files: on this platform git reads an
+# additional built-in system gitconfig that declares the platform keychain helper
+# and that no environment variable can displace, so without the reset every
+# successful fetch also runs a keychain store that cannot succeed under a private
+# HOME. The installed helper reads a credential ONLY from this process's own
+# GAAI_FORGE_IDENTITY / GAAI_FORGE_TOKEN — never from `gh`'s own configuration or
+# a platform keychain — and refuses (exit 1, no output) when either is absent, so
+# a process without this launch's identity gets no credential from it rather than
+# someone else's. The helper string itself carries no secret.
+_gaai_cred_helper="$HOME/.gaai-git-credential-helper.sh"
+( umask 077
+  cat > "$_gaai_cred_helper" <<'GAAI_HELPER_EOF'
+#!/bin/bash
+[[ "${1:-}" == "get" ]] || exit 0
+[[ -n "${GAAI_FORGE_IDENTITY:-}" && -n "${GAAI_FORGE_TOKEN:-}" ]] || exit 1
+printf 'username=%s\npassword=%s\n' "$GAAI_FORGE_IDENTITY" "$GAAI_FORGE_TOKEN"
+GAAI_HELPER_EOF
+  chmod 0700 "$_gaai_cred_helper"
+  printf '[credential]\n\thelper =\n\thelper = !%s\n' "$_gaai_cred_helper" > "$HOME/.gitconfig"
+  chmod 0600 "$HOME/.gitconfig"
+) 2>/dev/null || true
+unset -v _gaai_cred_helper
 
 # 7c. No interactive credential path, ever. The private HOME above leaves git with
 #     no helper unless 7b provisioned one, and a pane of the private tmux server IS
@@ -498,7 +579,7 @@ unset -v _gaai_key _gaai_val _GAAI_EXPORTED_SET
 # an environment value: every hostile inherited entry was refused in sections 3-5,
 # and each entry-owned survivor was assigned unconditionally above.
 for _gaai_name in $(compgen -e 2>/dev/null || true); do
-  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED " in
+  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED " in
     *" $_gaai_name "*) ;;
     *) export -n "$_gaai_name" 2>/dev/null || true ;;
   esac
@@ -732,6 +813,21 @@ if [[ -n "$COMMON_DIR" && "$FAIL" -eq 0 ]]; then
     if ! _evidence="$(_lifecycle_absent)"; then
       _gaai_home_refuse process_authority_invalid 1 "lifecycle_role=${_evidence}" || true
       fail "a daemon lifecycle is present or unsettled — stop it and dispose of the evidence first"
+    elif [[ "${_GAAI_FORGE_VERDICT:-absent}" != "ok" ]]; then
+      # Same admission invariant as the runtime entry, before this entry's own
+      # first remote operation: no forge identity, no fetch. Setup's own mandate
+      # (provisioning the home) is otherwise untouched — this only gates whether
+      # setup may reach the remote at all.
+      _setup_lifecycle_root="$COMMON_DIR/gaai-daemon-lifecycle"
+      mkdir -p "$_setup_lifecycle_root" 2>/dev/null || true
+      chmod 0700 "$_setup_lifecycle_root" 2>/dev/null || true
+      _gaai_home_write_durable "$_setup_lifecycle_root/refusal" \
+"reason=forge_identity_unadmitted
+action=provision_forge_credential
+evidence=forge_role=${_GAAI_FORGE_VERDICT:-absent}" 2>/dev/null || true
+      unset -v _setup_lifecycle_root
+      _gaai_home_refuse forge_identity_unadmitted 0 "forge_role=${_GAAI_FORGE_VERDICT:-absent}" || true
+      fail "no operator forge identity was admitted for this launch — provision \$HOME/.gaai/forge-token"
     else
       _sha="$(_gaai_home_fetch_target "$PROJECT_ROOT" "$TARGET_BRANCH")" || _sha=""
       if [[ -z "$_sha" ]]; then

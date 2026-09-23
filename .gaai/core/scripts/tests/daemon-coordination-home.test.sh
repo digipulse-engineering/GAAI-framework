@@ -251,8 +251,24 @@ if [[ -n "$ATT" ]]; then
   # would test the harness rather than the barrier.
   LAUNCHER="$(sed -n 's/^launcher=//p' "$OWNER" | head -1)"
 
+  # These fixtures probe the RELEASE BARRIER, not forge admission — but the
+  # legitimate run above already unlinked the original attempt's forge.cred,
+  # and a copied manifest still names that now-gone path. Give each copy its
+  # own working forge credential (matching manifest's forge_identity) so the
+  # child reaches the barrier check these cases actually exercise.
+  _reforge_bad_attempt() {
+    local _dir="$1" _fid
+    _fid="$(sed -n 's/^forge_identity=//p' "$_dir/manifest" | head -1)"
+    ( umask 077; printf 'identity=%s\ntoken=fixture-default-token\n' "$_fid" > "$_dir/forge.cred" )
+    chmod 0600 "$_dir/forge.cred"
+    grep -v '^forge_secret=' "$_dir/manifest" > "$_dir/manifest.new"
+    printf 'forge_secret=%s\n' "$_dir/forge.cred" >> "$_dir/manifest.new"
+    mv "$_dir/manifest.new" "$_dir/manifest"
+  }
+
   BAD="$ROOT/badattempt"; mkdir -p "$BAD"; chmod 0700 "$BAD"
   cp "$ATT/manifest" "$BAD/manifest"
+  _reforge_bad_attempt "$BAD"
   mkfifo -m 0600 "$BAD/release.fifo"
   OUT="$(run_child_with_record "$BAD" "release attempt=$ATTEMPT_ID digest=wrongdigest
 ")" || fail "harness: the child under test for BAD did not finish within the bound"
@@ -264,6 +280,7 @@ if [[ -n "$ATT" ]]; then
 
   BAD2="$ROOT/badattempt2"; mkdir -p "$BAD2"; chmod 0700 "$BAD2"
   cp "$ATT/manifest" "$BAD2/manifest"
+  _reforge_bad_attempt "$BAD2"
   mkfifo -m 0600 "$BAD2/release.fifo"
   OUT="$(run_child_with_record "$BAD2" "release attempt=$ATTEMPT_ID digest=$RELEASE_DIGEST-truncated")" || fail "harness: the child under test for BAD2 did not finish within the bound"
   if echo "$OUT" | grep -qE 'release_role=(read_failed_or_eof|record_mismatch)'; then
@@ -274,6 +291,7 @@ if [[ -n "$ATT" ]]; then
 
   BAD3="$ROOT/badattempt3"; mkdir -p "$BAD3"; chmod 0700 "$BAD3"
   cp "$ATT/manifest" "$BAD3/manifest"
+  _reforge_bad_attempt "$BAD3"
   mkfifo -m 0600 "$BAD3/release.fifo"
   OUT="$(run_child_with_record "$BAD3" "release attempt=someone-elses digest=$RELEASE_DIGEST
 ")" || fail "harness: the child under test for BAD3 did not finish within the bound"

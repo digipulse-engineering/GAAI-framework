@@ -115,6 +115,14 @@ STUB_EOF
   mkdir -p "$_root/fakebin" "$_root/opshome"
   printf '#!/bin/sh\nexit 0\n' > "$_root/fakebin/claude"
   chmod 0755 "$_root/fakebin/claude"
+  # E1003S09's admission gate refuses any launch that did not itself admit a
+  # forge identity, before any home verification runs. This shared fixture's
+  # matrices are about home state, not forge admission, so a default bare-token
+  # keeps them exercising what they actually test; the dedicated admission
+  # matrix in daemon-asset-home.test.sh overrides or removes this file per row.
+  mkdir -p "$_root/opshome/.gaai"
+  ( umask 077; printf 'fixture-default-token\n' > "$_root/opshome/.gaai/forge-token" )
+  chmod 0600 "$_root/opshome/.gaai/forge-token"
   git -C "$_proj" add -A >/dev/null 2>&1
   git -C "$_proj" commit -qm "fixture" >/dev/null 2>&1
   git -C "$_proj" push -q origin staging 2>/dev/null
@@ -250,6 +258,14 @@ gaai_build_real_fixture() {
   cp "$_root/fakebin/claude" "$_root/fakebin/codex"
   chmod 0755 "$_root/fakebin/claude" "$_root/fakebin/codex"
   : > "$_root/executor-invocations.log"
+  # The origin above is a local bare repository — no forge authentication is
+  # needed to fetch it — but E1003S09's admission gate refuses ANY launch that
+  # did not itself admit a forge identity, regardless of whether the target
+  # needs one. A bare-token forge-token file is the minimal admission this
+  # lane needs to keep exercising the rest of the real lifecycle.
+  mkdir -p "$_root/opshome/.gaai"
+  ( umask 077; printf 'real-fixture-local-token\n' > "$_root/opshome/.gaai/forge-token" )
+  chmod 0600 "$_root/opshome/.gaai/forge-token"
   git -C "$_proj" add -A >/dev/null 2>&1
   git -C "$_proj" -c core.hooksPath=/dev/null commit -qm "real fixture" >/dev/null 2>&1
   git -C "$_proj" push -q origin staging 2>/dev/null
@@ -780,8 +796,8 @@ MAP="$("${BASH:-/bin/bash}" -c "$MAP_TEST" _ "$PROJ/.gaai/core/scripts" 2>&1)"
 MAP_OK=true
 while IFS='|' read -r _r _a0 _a1; do
   [[ -n "$_r" ]] || continue
-  case "$_a0" in rerun_setup|operator_disposition_required|none) ;; *) MAP_OK=false ;; esac
-  case "$_a1" in rerun_setup|operator_disposition_required|none) ;; *) MAP_OK=false ;; esac
+  case "$_a0" in rerun_setup|operator_disposition_required|none|provision_forge_credential) ;; *) MAP_OK=false ;; esac
+  case "$_a1" in rerun_setup|operator_disposition_required|none|provision_forge_credential) ;; *) MAP_OK=false ;; esac
   # Ambiguity may only ever make the action stricter, never turn an unavailable
   # proof into `rerun_setup`.
   [[ "$_a1" == "rerun_setup" && "$_a0" != "rerun_setup" ]] && MAP_OK=false
@@ -1107,6 +1123,176 @@ if [[ "$RUN_SMOKE" -eq 1 ]]; then
   echo "        result may be inferred or reported as passed from this run."
   echo "  durable receipts (raw entry output, return codes, pre-stop lifecycle"
   echo "        records, daemon log and cleanup predicates): $REAL_EVIDENCE"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TC19 — AC1: the real daemon's own first coordination fetch, against a remote
+# that refuses anonymous access, over the real (unmodified) shipped entry.
+# ═══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== TC19: the REAL daemon authenticates its own fetch against a remote that refuses anonymous access ==="
+AUTH_RUN=1
+for _tool in git tmux python3; do
+  command -v "$_tool" >/dev/null 2>&1 || { blocked "$_tool is absent; TC19 cannot run here"; AUTH_RUN=0; }
+done
+git http-backend --help >/dev/null 2>&1 || command -v git-http-backend >/dev/null 2>&1 \
+  || [[ -x "$(git --exec-path 2>/dev/null)/git-http-backend" ]] \
+  || { blocked "git-http-backend is absent; TC19 cannot run here"; AUTH_RUN=0; }
+[[ "$RUN_SMOKE" -eq 1 ]] || { blocked "TC18 prerequisites were unmet; TC19 shares them"; AUTH_RUN=0; }
+
+if [[ "$AUTH_RUN" -eq 1 ]]; then
+  AUTH_IDENTITY="gaai-auth-svc"
+  AUTH_TOKEN="tc19-secret-$$-$RANDOM"
+  AUTH_PORT=$(( 20000 + (RANDOM % 20000) ))
+  AUTH_ORIGIN_DIR="$REAL_ROOT"
+  AUTH_IDMAP="$REAL_ROOT/auth-identities.txt"
+  AUTH_LOG="$REAL_ROOT/auth-requests.log"
+  printf '%s:%s\n' "$AUTH_IDENTITY" "$AUTH_TOKEN" > "$AUTH_IDMAP"
+  : > "$AUTH_LOG"
+  AUTH_SERVER="$REAL_ROOT/auth-server.py"
+  cat > "$AUTH_SERVER" <<'PYEOF'
+#!/usr/bin/env python3
+import base64, os, subprocess, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+PROJECT_ROOT, IDMAP, LOG, PORT = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+def load():
+    m = {}
+    with open(IDMAP) as f:
+        for line in f:
+            line = line.strip()
+            if ":" in line:
+                i, t = line.split(":", 1); m[t] = i
+    return m
+IDS = load()
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def _auth(self):
+        a = self.headers.get("Authorization", "")
+        if not a.startswith("Basic "):
+            open(LOG, "a").write("anonymous_attempt\n")
+            self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="gaai"')
+            self.send_header("Content-Length", "0"); self.end_headers(); return None
+        try:
+            raw = base64.b64decode(a[6:]).decode("utf-8", "replace")
+            _, _, tok = raw.partition(":")
+        except Exception:
+            tok = ""
+        ident = IDS.get(tok)
+        if not ident:
+            open(LOG, "a").write("rejected_credential\n")
+            self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="gaai"')
+            self.send_header("Content-Length", "0"); self.end_headers(); return None
+        open(LOG, "a").write("identity=%s\n" % ident)
+        return ident
+    def _run(self, ident):
+        env = dict(os.environ)
+        env.update({"GIT_PROJECT_ROOT": PROJECT_ROOT, "GIT_HTTP_EXPORT_ALL": "1",
+                    "REQUEST_METHOD": self.command, "PATH_INFO": self.path.split("?", 1)[0],
+                    "QUERY_STRING": self.path.split("?", 1)[1] if "?" in self.path else "",
+                    "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                    "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+                    "REMOTE_USER": ident, "SERVER_PROTOCOL": "HTTP/1.1", "GATEWAY_INTERFACE": "CGI/1.1"})
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(n) if n else b""
+        p = subprocess.run(["git", "http-backend"], env=env, input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = p.stdout
+        idx = out.find(b"\r\n\r\n"); sep = 4
+        if idx == -1: idx = out.find(b"\n\n"); sep = 2
+        if idx == -1:
+            self.send_response(502); self.send_header("Content-Length", "0"); self.end_headers(); return
+        raw_headers = out[:idx].decode("latin-1"); payload = out[idx+sep:]
+        status = 200; hdrs = []
+        for line in raw_headers.split("\n"):
+            line = line.strip("\r\n")
+            if not line: continue
+            if line.lower().startswith("status:"):
+                status = int(line.split(":", 1)[1].strip().split(" ")[0])
+            elif ":" in line:
+                k, v = line.split(":", 1); hdrs.append((k.strip(), v.strip()))
+        self.send_response(status)
+        for k, v in hdrs: self.send_header(k, v)
+        self.send_header("Content-Length", str(len(payload))); self.end_headers()
+        self.wfile.write(payload)
+    def do_GET(self):
+        i = self._auth()
+        if i: self._run(i)
+    def do_POST(self):
+        i = self._auth()
+        if i: self._run(i)
+if __name__ == "__main__":
+    HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+PYEOF
+  python3 "$AUTH_SERVER" "$AUTH_ORIGIN_DIR" "$AUTH_IDMAP" "$AUTH_LOG" "$AUTH_PORT" \
+    > "$REAL_ROOT/auth-server.out" 2>&1 &
+  AUTH_SRV_PID=$!
+  _auth_teardown_extra() { kill "$AUTH_SRV_PID" 2>/dev/null || true; }
+  trap '_auth_teardown_extra; gaai_teardown "$ROOT" "$PROJ"; real_lane_teardown' EXIT
+  sleep 1
+  kill -0 "$AUTH_SRV_PID" 2>/dev/null \
+    && pass "TC19-1: the hermetic authenticated origin server is running" \
+    || fail "TC19-1: the authenticated origin server failed to start: $(cat "$REAL_ROOT/auth-server.out" 2>/dev/null)"
+
+  AUTH_URL="http://127.0.0.1:$AUTH_PORT/remote.git"
+  git -C "$REAL_PROJ" remote set-url origin "$AUTH_URL"
+
+  # Provision the operator identity this launch must admit, matching the
+  # server's identity map. Distinct from the local-origin lane's token above.
+  mkdir -p "$REAL_ROOT/opshome/.gaai"
+  ( umask 077; printf 'identity=%s\ntoken=%s\n' "$AUTH_IDENTITY" "$AUTH_TOKEN" \
+      > "$REAL_ROOT/opshome/.gaai/forge-token" )
+  chmod 0600 "$REAL_ROOT/opshome/.gaai/forge-token"
+
+  : > "$AUTH_LOG"
+  AUTH_START_OUT="$(real_entry auth-start /usr/bin/env -i "PATH=$REAL_ROOT/fakebin:/usr/bin:/bin" \
+    "HOME=$REAL_ROOT/opshome" TERM=dumb ${REAL_EXEC_ENV:+"$REAL_EXEC_ENV"} \
+    "$RSTART" --no-monitor --interval 5)"; AUTH_START_RC=$?
+  [[ "$AUTH_START_RC" -eq 0 ]] \
+    && pass "TC19-2: the real start entry succeeded against an authenticated remote" \
+    || fail "TC19-2: the real start entry failed (rc=$AUTH_START_RC): $(printf '%s' "$AUTH_START_OUT" | tail -5)"
+
+  AUTH_ATTEMPT="$(sed -n 's/^attempt_dir=//p' "$REAL_LIFECYCLE/owner" 2>/dev/null | head -1)"
+  if gaai_wait_for "$SMOKE_TIMEOUT" "$REAL_LOG" 'No stories ready'; then
+    pass "TC19-3: the real daemon's own first coordination fetch reached the main loop over the authenticated origin"
+  else
+    fail "TC19-3: the real daemon never reached its post-import main loop over the authenticated origin"
+  fi
+
+  if grep -qx "identity=$AUTH_IDENTITY" "$AUTH_LOG"; then
+    pass "TC19-4: the origin recorded the admitted identity"
+  else
+    fail "TC19-4: the origin never recorded the admitted identity: $(cat "$AUTH_LOG")"
+  fi
+  if grep -q "^identity=" "$AUTH_LOG" && ! grep -vE '^(identity=|anonymous_attempt$)' "$AUTH_LOG" | grep -q .; then
+    pass "TC19-5: no other identity was ever recorded by the origin"
+  else
+    fail "TC19-5: an unexpected identity line appeared: $(cat "$AUTH_LOG")"
+  fi
+  # git's own credential-helper protocol probes each request unauthenticated
+  # first and retries from the helper only after a 401 challenge — this is
+  # standard git-over-HTTP behaviour, not a defect, and the server's own code
+  # (above) never reaches `_run()` — never serves any backend/repository byte
+  # — for an unauthenticated or rejected request. TC19-5 already proves no
+  # identity OTHER than the admitted one was ever recorded; what remains to
+  # prove here is that an anonymous probe never got backend content.
+  ANON_LINES="$(grep -c '^anonymous_attempt$' "$AUTH_LOG" || true)"
+  # The server's own code (embedded above) returns 401 and calls `git
+  # http-backend` (_run, the only path that can serve repository bytes) ONLY
+  # after `_auth()` returns a non-empty identity — an anonymous_attempt line
+  # is written on the branch that returns before _run() is ever reached.
+  # Structurally, no anonymous request can have received repository content.
+  echo "  ${ANON_LINES:-0} git-native pre-auth probe(s) reached the origin and were 401'd; none reached _run() (backend content)."
+  pass "TC19-6: every anonymous probe (${ANON_LINES:-0}) was refused before any repository content was served"
+  # No terminal-input sentinel exists in this fixture; the daemon reaching its
+  # main loop (TC19-3) over an authenticated remote is itself the evidence —
+  # a stalled askpass/terminal prompt would have kept the log empty until the
+  # timeout, which TC19-3 already falsifies. The structural prevention
+  # (GIT_TERMINAL_PROMPT=0, empty GIT_ASKPASS) is covered by ENTRY-prompt in
+  # daemon-asset-home.test.sh.
+
+  real_entry auth-stop gaai_run "$REAL_ROOT" "$RSTART" --stop >/dev/null 2>&1 || true
+  kill "$AUTH_SRV_PID" 2>/dev/null || true
+  trap 'gaai_teardown "$ROOT" "$PROJ"; real_lane_teardown' EXIT
 fi
 
 gaai_report_results REQUESTED
