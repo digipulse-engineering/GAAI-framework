@@ -3053,6 +3053,163 @@ _ensure_worktree_deps_fresh() {
   return 0
 }
 
+# ── Corepack package-manager cache preflight ───────────────────────────────
+# A repository that pins its package manager through the root package.json
+# `packageManager` field runs every `pnpm` (the dependency install above, and
+# the repository's own git hooks during the exact-SHA push) through a Corepack
+# shim. Corepack treats an existing <cache>/v1/pnpm/<version>/ directory as an
+# installed release and never downloads it again. A half-extracted one — the
+# directory present, its entry file absent — therefore fails every later
+# invocation with MODULE_NOT_FOUND, forever. The push hook's typecheck then
+# refuses every push of a candidate that is itself fine, and the commit phase
+# retries into the same wall on each cycle.
+#
+# The cache that matters is the one this process's children read, not the one
+# an operator's shell reads: the daemon runs under a private HOME and
+# XDG_CACHE_HOME, so a hand reproduction from an ordinary shell resolves a
+# different, intact cache and passes. This preflight inspects the cache the
+# phase's own children will resolve, repairs the one broken shape it can
+# recognise, and keeps the broken directory as evidence.
+
+# Corepack's own resolution order (getCorepackHomeFolder): COREPACK_HOME, else
+# $XDG_CACHE_HOME/node/corepack, else $LOCALAPPDATA/node/corepack, else
+# <home>/.cache/node/corepack. Node's `??` treats an empty string as set, so
+# presence, not non-emptiness, decides; an empty value yields a relative root,
+# which the caller refuses to act on. Values are read through printenv, i.e.
+# from the environment a child inherits: a same-named shell variable that is
+# not exported never reaches Corepack and must not steer this check elsewhere.
+_corepack_cache_root() {
+  local v
+  if v=$(printenv COREPACK_HOME); then
+    printf '%s\n' "$v"; return 0
+  fi
+  if v=$(printenv XDG_CACHE_HOME) || v=$(printenv LOCALAPPDATA); then
+    if [[ -n "$v" ]]; then printf '%s/node/corepack\n' "${v%/}"; else printf 'node/corepack\n'; fi
+    return 0
+  fi
+  v=$(printenv HOME) || v=""
+  [[ -n "$v" ]] || v=$(cd ~ 2>/dev/null && pwd) || return 1
+  printf '%s/.cache/node/corepack\n' "${v%/}"
+}
+
+# The file Corepack will `require` for pnpm inside an install directory. The
+# install record Corepack writes next to the release (`.corepack`, JSON) names
+# it exactly; when that record is absent or unreadable, fall back to Corepack's
+# built-in per-range table (<6: bin/pnpm.js, 6-10: bin/pnpm.cjs, >=11:
+# bin/pnpm.mjs). Prints a path relative to the install directory.
+_corepack_pnpm_entry_rel() {
+  local version="$1" install_dir="$2" rel="" major
+  if [[ -f "${install_dir}/.corepack" ]]; then
+    rel=$(LC_ALL=C sed -n 's/.*"bin":{[^}]*"pnpm":"\([^"]*\)".*/\1/p' \
+      "${install_dir}/.corepack" 2>/dev/null | head -1)
+    rel="${rel#./}"
+    case "$rel" in *..*|/*) rel="" ;; esac
+  fi
+  if [[ -z "$rel" ]]; then
+    major="${version%%.*}"
+    if (( major < 6 )); then rel="bin/pnpm.js"
+    elif (( major <= 10 )); then rel="bin/pnpm.cjs"
+    else rel="bin/pnpm.mjs"
+    fi
+  fi
+  printf '%s\n' "$rel"
+}
+
+# Returns 0 when the pinned pnpm is usable, not yet installed (Corepack installs
+# it on first use), not pinned at all, or was repaired here. Returns 1 — failure
+# class corepack_cache_unusable — when a broken install could not be repaired;
+# the caller keeps that retryable. Exactly one log line per pinned outcome.
+# GAAI_COREPACK_REPRIME_TIMEOUT_SEC bounds the unattended re-download
+# (default 120s, the same order as the plan-phase dependency install).
+_ensure_corepack_pnpm_intact() {
+  local story_id="$1" worktree_path="$2"
+  local tag="[COMMIT-PHASE] ${story_id} : corepack-cache"
+  local manifest spec version root ver_dir rel evidence timeout_s timeout_cmd
+  local out_file rc=0 first_out
+  local semver_re='^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$'
+
+  manifest="${worktree_path}/package.json"
+  [[ -f "$manifest" ]] || return 0
+  spec=$(LC_ALL=C sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$manifest" 2>/dev/null | head -1)
+  [[ "$spec" == pnpm@* ]] || return 0
+  version="${spec#pnpm@}"
+  version="${version%%+*}"
+  if [[ ! "$version" =~ $semver_re ]]; then
+    echo "${tag} skipped: packageManager '${spec:0:60}' is not a plain pnpm version"
+    return 0
+  fi
+
+  root=$(_corepack_cache_root) || root=""
+  if [[ "$root" != /* ]]; then
+    echo "${tag} skipped: Corepack cache root '${root}' is not an absolute path"
+    return 0
+  fi
+  # v1 is Corepack's install-folder layout version (INSTALL_FOLDER_VERSION).
+  ver_dir="${root}/v1/pnpm/${version}"
+  if [[ ! -d "$ver_dir" ]]; then
+    echo "${tag} pnpm@${version} not yet installed under ${root} — Corepack installs it on first use"
+    return 0
+  fi
+  rel=$(_corepack_pnpm_entry_rel "$version" "$ver_dir")
+  if [[ -f "${ver_dir}/${rel}" ]]; then
+    echo "${tag} pnpm@${version} intact (${ver_dir}/${rel})"
+    return 0
+  fi
+
+  # Half-extracted. Move it aside — never delete it, it is the only evidence of
+  # how the install broke — so Corepack sees the version as absent again.
+  evidence="${ver_dir}.broken-$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+  if [[ -e "$evidence" ]] || ! mv -- "$ver_dir" "$evidence" 2>/dev/null; then
+    # A concurrent slot may have moved it first. Corepack installs through a
+    # temporary directory renamed into place, so the version directory is
+    # either absent or complete unless it is still the broken one.
+    if [[ -d "$ver_dir" && ! -f "${ver_dir}/${rel}" ]]; then
+      echo "${tag} UNUSABLE pnpm@${version}: half-extracted ${ver_dir} (no ${rel}) could not be moved aside [class=corepack_cache_unusable]"
+      return 1
+    fi
+    evidence="(moved aside concurrently)"
+  fi
+
+  timeout_s="${GAAI_COREPACK_REPRIME_TIMEOUT_SEC:-120}"
+  [[ "$timeout_s" =~ ^[1-9][0-9]*$ ]] || timeout_s=120
+  out_file=$(mktemp "${TMPDIR:-/tmp}/gaai-corepack-reprime.XXXXXX" 2>/dev/null) || out_file=/dev/null
+  timeout_cmd=$(_resolve_timeout_cmd)
+  if [[ -n "$timeout_cmd" ]]; then
+    (cd "$worktree_path" && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 "$timeout_cmd" "$timeout_s" pnpm --version) \
+      >"$out_file" 2>&1 || rc=$?
+  else
+    (cd "$worktree_path" && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version) >"$out_file" 2>&1 &
+    local reprime_pid=$! waited=0
+    while kill -0 "$reprime_pid" 2>/dev/null; do
+      if (( waited >= timeout_s )); then
+        kill "$reprime_pid" 2>/dev/null || true
+        wait "$reprime_pid" 2>/dev/null || true
+        rc=124
+        break
+      fi
+      sleep 1
+      (( waited++ )) || true
+    done
+    if [[ $rc -eq 0 ]]; then
+      wait "$reprime_pid" 2>/dev/null || rc=$?
+    fi
+  fi
+
+  rel=$(_corepack_pnpm_entry_rel "$version" "$ver_dir")
+  if [[ "$rc" -eq 0 && -f "${ver_dir}/${rel}" ]]; then
+    [[ "$out_file" != /dev/null ]] && rm -f "$out_file"
+    echo "${tag} REPAIRED pnpm@${version}: half-extracted install moved aside to ${evidence}, re-primed ${ver_dir}/${rel}"
+    return 0
+  fi
+  first_out=""
+  [[ "$out_file" != /dev/null ]] && \
+    first_out=$(grep -v '^[[:space:]]*$' "$out_file" 2>/dev/null | head -1 | cut -c1-200)
+  [[ "$out_file" != /dev/null ]] && rm -f "$out_file"
+  echo "${tag} UNUSABLE pnpm@${version}: re-prime exit=${rc}, ${ver_dir}/${rel} still missing, broken install kept at ${evidence}; first output: ${first_out:-none} [class=corepack_cache_unusable]"
+  return 1
+}
+
 # ── Phase handlers ────────────────────────────────────────────────────────
 
 # Re-pin the target object carried by the daemon wrapper before any phase can
@@ -5847,6 +6004,21 @@ handle_commit_phase() {
         echo "[INFO] ${story_id} handle_commit_phase: recreated worktree has populated node_modules — marker seeded (hash=${_wt_hash:0:8})"
       fi
     fi
+  fi
+
+  # ── Package-manager cache preflight, before anything here runs pnpm ─────
+  # The install below and the push hooks further down both go through the
+  # Corepack shim; a half-extracted cached release fails every one of them.
+  # Same retry contract as the dependency failure below: qa_passed stays, the
+  # next scan retries COMMIT.
+  if ! _ensure_corepack_pnpm_intact "$story_id" "$worktree_path"; then
+    _emit_commit_routing_record "$story_id" "$trace_id" "error" "corepack_cache_unusable" "0" "" "false"
+    if declare -F notify_escalation_inline >/dev/null 2>&1; then
+      notify_escalation_inline "$story_id" \
+        "corepack_cache_unusable" \
+        "cd ${worktree_path} && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version  (under the daemon's HOME/XDG_CACHE_HOME)"
+    fi
+    return 1
   fi
 
   # ── Ensure worktree deps are fresh before git push ──────────────

@@ -811,6 +811,29 @@ else
   fail "T14: dependency failure changed retry class or reached publication"
 fi
 
+echo "--- T14b: package-manager cache failure remains retryable ---"
+SID14B="TST-PCS14B"
+setup_story "$SID14B"
+write_backlog "$SID14B"
+_T14B_REAL_PREFLIGHT=$(declare -f _ensure_corepack_pnpm_intact)
+T14B_DEPS_CALLED=false
+_ensure_corepack_pnpm_intact() { return 1; }
+_ensure_worktree_deps_fresh() { T14B_DEPS_CALLED=true; return 0; }
+: > "$GH_CALL_LOG"; : > "$ROUTING_CAPTURE"
+set +e
+handle_commit_phase "$SID14B" "trace-t14b"
+T14B_RC=$?
+set -e
+eval "$_T14B_REAL_PREFLIGHT"
+T14B_PHASE=$(grep -A 10 "id: ${SID14B}" "$BACKLOG_FILE" | grep "phase_status:" | head -1 | awk '{print $2}')
+if [[ "$T14B_RC" -ne 0 && "$T14B_PHASE" == qa_passed && "$T14B_DEPS_CALLED" == false ]] \
+    && grep -q "^${SID14B}|trace-t14b|error|corepack_cache_unusable|" "$ROUTING_CAPTURE" \
+    && ! grep -qE 'gh pr create|gh api --method PUT .*pulls/[0-9]+/merge' "$GH_CALL_LOG"; then
+  pass "T14b: cache failure routes corepack_cache_unusable, preserves qa_passed, publishes nothing"
+else
+  fail "T14b: cache failure changed retry class, ran pnpm or reached publication (rc=$T14B_RC phase=$T14B_PHASE deps=$T14B_DEPS_CALLED)"
+fi
+
 echo "--- T15: worktree integrity failure remains retryable ---"
 SID15="TST-PCS15"
 setup_story "$SID15"
