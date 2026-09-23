@@ -472,9 +472,14 @@ _out="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$ROOT/opshome" 
 printf '%s' "$_out" | grep -q 'reason=entry_authority_invalid' \
   && fail "ENTRY-child-strip: the entry still refused after the env -u strip (strip insufficient): $(printf '%s' "$_out" | head -1)" \
   || pass "ENTRY-child-strip: after the env -u strip the entry admits the child (strip sufficient)"
-grep -q "exec '\$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED '\$_launcher' --daemon-child" "$START" \
+grep -q "exec '\$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u GH_HOST -u GAAI_FORGE_IDENTITY -u GAAI_FORGE_TOKEN '\$_launcher' --daemon-child" "$START" \
   && pass "ENTRY-child-strip: the fixed pane command performs exactly that strip through the attested env" \
   || fail "ENTRY-child-strip: the fixed pane command does not strip the entry-owned GIT_*/GH_ values before the child"
+# E1003S09: the forge identity/token must never reach the child's inherited pane
+# environment either — only via the bound forge.cred channel (AC2/AC3).
+grep -q "exec '\$GAAI_ENV_CMD' .*-u GAAI_FORGE_IDENTITY -u GAAI_FORGE_TOKEN" "$START" \
+  && pass "ENTRY-child-strip: the fixed pane command also strips the forge identity/token" \
+  || fail "ENTRY-child-strip: the fixed pane command does not strip GAAI_FORGE_IDENTITY/GAAI_FORGE_TOKEN"
 
 echo ""
 echo "=== Entry authority: unsupported and degraded entries ==="
@@ -1188,6 +1193,316 @@ if ! gaai_bash32_available; then
   echo "  NOTE: no Bash 3.2 interpreter on this host — the 3.2 column of the real-daemon"
   echo "        matrix above is UNPROVEN here and must be executed on the macOS lane."
 fi
+
+echo ""
+echo "=== Forge identity admission — gate refusal matrix (AC3/AC4) ==="
+
+FROOT="$(mktemp -d "${TMPDIR:-/tmp}/gaai-forge-XXXXXX")"
+FROOT="$(cd "$FROOT" && pwd -P)"
+FORGE_FAIL_BASE="$FAIL_COUNT"
+forge_teardown() {
+  if [[ "$FAIL_COUNT" -eq "$FORGE_FAIL_BASE" ]]; then
+    rm -rf "$FROOT" 2>/dev/null || true
+  else
+    echo "  EVIDENCE PRESERVED (forge admission matrix): $FROOT"
+  fi
+}
+trap 'gaai_teardown "$ROOT" "$PROJ"; real_probe_teardown; forge_teardown' EXIT
+gaai_build_fixture "$FROOT" "$SCRIPTS_DIR"
+FSTART="$FROOT/proj/.gaai/core/scripts/daemon-start.sh"
+FSETUP="$FROOT/proj/.gaai/core/scripts/daemon-setup.sh"
+FLIFECYCLE="$(gaai_lifecycle_root "$FROOT/proj")"
+
+# A valid forge-token admits setup too, so the home exists before the
+# admission-matrix rows that expect a successful start.
+mkdir -p "$FROOT/opshome/.gaai"
+( umask 077; printf 'a-valid-token-123\n' > "$FROOT/opshome/.gaai/forge-token" )
+chmod 0600 "$FROOT/opshome/.gaai/forge-token"
+gaai_run "$FROOT" "$FSETUP" >/dev/null 2>&1
+
+# _forge_provision <kind> — shapes $FROOT/opshome/.gaai/forge-token per row.
+_forge_provision() {
+  local _kind="$1" _tf="$FROOT/opshome/.gaai/forge-token"
+  rm -rf "$_tf" 2>/dev/null
+  mkdir -p "$FROOT/opshome/.gaai"
+  case "$_kind" in
+    absent) : ;;
+    bare_ok) ( umask 077; printf 'a-valid-token-123\n' > "$_tf" ); chmod 0600 "$_tf" ;;
+    identity_ok) ( umask 077; printf 'identity=svc-bot\ntoken=a-valid-token-123\n' > "$_tf" ); chmod 0600 "$_tf" ;;
+    symlink) ( umask 077; printf 'a-valid-token-123\n' > "$FROOT/opshome/.gaai/real-token" ); ln -s "$FROOT/opshome/.gaai/real-token" "$_tf" ;;
+    not_regular) mkdir -p "$_tf" ;;
+    wide_mode) ( umask 077; printf 'a-valid-token-123\n' > "$_tf" ); chmod 0644 "$_tf" ;;
+    oversized) ( umask 077; head -c 5000 /dev/zero | tr '\0' 'a' > "$_tf" ); chmod 0600 "$_tf" ;;
+    empty) ( umask 077; : > "$_tf" ); chmod 0600 "$_tf" ;;
+    third_line) ( umask 077; printf 'identity=svc-bot\ntoken=a-valid-token-123\nextra=1\n' > "$_tf" ); chmod 0600 "$_tf" ;;
+    unknown_key) ( umask 077; printf 'user=svc-bot\ntoken=a-valid-token-123\n' > "$_tf" ); chmod 0600 "$_tf" ;;
+    bad_charset) ( umask 077; printf 'not a valid token!\n' > "$_tf" ); chmod 0600 "$_tf" ;;
+  esac
+}
+
+FORGE_ROWS="absent bare_ok identity_ok symlink not_regular wide_mode oversized empty third_line unknown_key bad_charset"
+for _row in $FORGE_ROWS; do
+  _forge_provision "$_row"
+  rm -f "$FLIFECYCLE/refusal" 2>/dev/null
+  _fout="$(gaai_run "$FROOT" "$FSTART" --no-monitor 2>&1)"; _frc=$?
+  case "$_row" in
+    bare_ok|identity_ok)
+      if [[ "$_frc" -eq 0 ]] && ! printf '%s' "$_fout" | grep -q 'forge_identity_unadmitted'; then
+        pass "FORGE-ADMIT[$_row]: a valid forge-token admits the launch"
+      else
+        fail "FORGE-ADMIT[$_row]: a valid forge-token was refused (rc=$_frc): $(printf '%s' "$_fout" | tail -3)"
+      fi
+      gaai_run "$FROOT" "$FSTART" --stop >/dev/null 2>&1
+      ;;
+    *)
+      if [[ "$_frc" -ne 0 ]] && printf '%s' "$_fout" | grep -q 'reason=forge_identity_unadmitted action=provision_forge_credential'; then
+        pass "FORGE-ADMIT[$_row]: refused with the typed reason and action"
+      else
+        fail "FORGE-ADMIT[$_row]: not refused as expected (rc=$_frc): $(printf '%s' "$_fout" | tail -3)"
+      fi
+      [[ ! -e "$FLIFECYCLE/owner" ]] \
+        && pass "FORGE-ADMIT[$_row]: no lifecycle owner was created" \
+        || fail "FORGE-ADMIT[$_row]: a lifecycle owner was created despite the refusal"
+      if [[ -f "$FLIFECYCLE/refusal" ]] \
+         && grep -q '^reason=forge_identity_unadmitted$' "$FLIFECYCLE/refusal" \
+         && grep -q '^action=provision_forge_credential$' "$FLIFECYCLE/refusal" \
+         && ! grep -qE 'token|password|Authorization' "$FLIFECYCLE/refusal"; then
+        pass "FORGE-ADMIT[$_row]: exactly one durable diagnostic, no secret in it"
+      else
+        fail "FORGE-ADMIT[$_row]: diagnostic missing or malformed: $(cat "$FLIFECYCLE/refusal" 2>/dev/null)"
+      fi
+      ;;
+  esac
+done
+
+# Setup mirrors the same gate, before its own first remote operation.
+_forge_provision absent
+SETUP_OUT="$(gaai_run "$FROOT" "$FSETUP" 2>&1)"; SETUP_RC=$?
+if [[ "$SETUP_RC" -ne 0 ]] && printf '%s' "$SETUP_OUT" | grep -q 'reason=forge_identity_unadmitted'; then
+  pass "FORGE-SETUP: daemon-setup.sh refuses the same unadmitted launch before its own fetch"
+else
+  fail "FORGE-SETUP: daemon-setup.sh did not refuse an unadmitted launch (rc=$SETUP_RC)"
+fi
+
+echo ""
+echo "=== Forge lifecycle trace ordering (AC2) ==="
+_forge_provision bare_ok
+gaai_run "$FROOT" "$FSTART" --no-monitor >/dev/null 2>&1
+TRACE="$FLIFECYCLE/trace"
+OWNER="$FLIFECYCLE/owner"
+if [[ -f "$TRACE" ]]; then
+  # The trace is append-only and never truncated (a deliberate AC2 evidence-
+  # preservation property), so a prior launch's events can still be present. Scope
+  # the ordering check to THIS launch's own attempt id, read from the owner record,
+  # rather than the whole accumulated file — otherwise the assertion would still
+  # pass even if this launch's own trace were incomplete or out of order.
+  CURRENT_ATTEMPT="$(sed -n 's/^attempt=//p' "$OWNER" 2>/dev/null | head -1)"
+  if [[ -z "$CURRENT_ATTEMPT" ]]; then
+    fail "FORGE-TRACE: no owner attempt id recorded to scope the trace check to"
+  else
+    EXPECTED="entry_credential_admitted target_proven launcher_materialized child_started daemon_digest_proven forge_bound forge_released daemon_exec"
+    TRACE_ORDER="$(grep -F -- "attempt=$CURRENT_ATTEMPT event=" "$TRACE" \
+      | sed -n 's/^attempt=[^ ]* event=//p' | tr '\n' ' ')"
+    _ok=true; _rest="$TRACE_ORDER"
+    for _ev in $EXPECTED; do
+      case "$_rest" in
+        *"$_ev"*) _rest="${_rest#*"$_ev"}" ;;
+        *) _ok=false ;;
+      esac
+    done
+    $_ok && pass "FORGE-TRACE: all 8 lifecycle events are present in the required relative order, scoped to this launch's own attempt" \
+          || fail "FORGE-TRACE: trace order violated for attempt=$CURRENT_ATTEMPT: $TRACE_ORDER"
+  fi
+  ! grep -qE 'a-valid-token-123|identity=' "$TRACE" \
+    && pass "FORGE-TRACE: the trace carries no identity value or secret" \
+    || fail "FORGE-TRACE: the trace leaked a value: $(cat "$TRACE")"
+else
+  fail "FORGE-TRACE: no trace file was produced by a successful launch"
+fi
+gaai_run "$FROOT" "$FSTART" --stop >/dev/null 2>&1
+
+echo ""
+echo "=== Pre-proof canary: a non-exact home leaves no forge material or admission trace (AC2) ==="
+
+# Forge admission is checked before target exactness (Step 5), so a valid forge-token
+# alone must not be enough to reach forge.cred: the launch must still refuse on the
+# stale home before any target-selected material — forge or otherwise — is written.
+_forge_provision bare_ok
+gaai_advance_target "$FROOT/proj"
+rm -f "$FLIFECYCLE/refusal" "$FLIFECYCLE/trace" "$FLIFECYCLE/owner" 2>/dev/null
+CANARY_OUT="$(gaai_run "$FROOT" "$FSTART" --no-monitor 2>&1)"; CANARY_RC=$?
+CANARY_CRED_COUNT="$(find "$FLIFECYCLE" -name forge.cred 2>/dev/null | wc -l | tr -d ' ')"
+if [[ "$CANARY_RC" -ne 0 && "$CANARY_CRED_COUNT" -eq 0 ]]; then
+  pass "FORGE-CANARY: a deliberately non-exact home is refused before any forge material is written"
+else
+  fail "FORGE-CANARY: non-exact home did not refuse cleanly (rc=$CANARY_RC, forge.cred count=$CANARY_CRED_COUNT): $(printf '%s' "$CANARY_OUT" | tail -3)"
+fi
+if [[ ! -e "$FLIFECYCLE/owner" ]]; then
+  pass "FORGE-CANARY: no lifecycle owner was created for the non-exact home"
+else
+  fail "FORGE-CANARY: a lifecycle owner was created despite the non-exact home"
+fi
+if [[ -f "$FLIFECYCLE/trace" ]] && grep -qE 'event=(forge_bound|child_started|daemon_exec)' "$FLIFECYCLE/trace"; then
+  fail "FORGE-CANARY: the trace shows a target-selected or credential-bound event despite the non-exact home: $(cat "$FLIFECYCLE/trace")"
+else
+  pass "FORGE-CANARY: the trace carries no forge_bound, child_started or daemon_exec event"
+fi
+
+echo ""
+echo "=== forge.cred tamper and cross-launch replay (child-level, real launcher) ==="
+
+FCHILD="$FROOT/child-probe"
+mkdir -p "$FCHILD/opshome"
+FORGE_HOME="$FCHILD/home"
+mkdir -p "$FORGE_HOME/.gaai/core/scripts/lib"
+cp "$SCRIPTS_DIR/lib/daemon-home.sh" "$SCRIPTS_DIR/lib/home-branch-guard.sh" "$FORGE_HOME/.gaai/core/scripts/lib/"
+cat > "$FORGE_HOME/.gaai/core/scripts/delivery-daemon.sh" <<'FSTUB'
+#!/usr/bin/env bash
+set -uo pipefail
+A="${GAAI_DAEMON_LAUNCH_ATTEMPT:-}"
+if [[ -n "$A" ]]; then
+  INC="$(sed -n 's/^incarnation=//p' "$A/ack.launcher" 2>/dev/null | head -1)"
+  {
+    printf 'schema=gaai-daemon-lifecycle/v1\npid=%s\nincarnation=%s\ncredential_mode=%s\n' \
+      "$$" "$INC" "${GAAI_DAEMON_CREDENTIAL_MODE:-}"
+  } > "$A/ack.ready"
+  {
+    printf 'forge_identity=%s\n' "${GAAI_FORGE_IDENTITY:-<unset>}"
+    printf 'forge_token_set=%s\n' "${GAAI_FORGE_TOKEN:+yes}"
+    printf 'gh_token_set=%s\n' "${GH_TOKEN:+yes}"
+  } > "$A.observed"
+fi
+while :; do sleep 5; done
+FSTUB
+chmod 0755 "$FORGE_HOME/.gaai/core/scripts/delivery-daemon.sh"
+FDIGEST="$(shasum -a 256 < "$FORGE_HOME/.gaai/core/scripts/delivery-daemon.sh" 2>/dev/null | awk '{print $1}')"
+[[ -n "$FDIGEST" ]] || FDIGEST="$(sha256sum < "$FORGE_HOME/.gaai/core/scripts/delivery-daemon.sh" | awk '{print $1}')"
+FSCHEMA="$(gaai_home_schema "$FROOT/proj/.gaai/core/scripts")"
+FTARGET_SHA="0000000000000000000000000000000000000000"
+
+_forge_release_digest() {
+  "${BASH:-/bin/bash}" -c '
+    source "'"$FROOT"'/proj/.gaai/core/scripts/lib/daemon-home.sh"
+    tokdig="$(_gaai_home_digest_string "$8")"
+    _gaai_home_digest_string "$1|$2|$3|$4|$5|$6|$7|$tokdig"
+  ' _ "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+}
+
+# _mk_forge_attempt <attempt_id> <identity> <token> -> prints attempt dir
+#
+# NOTE on PC-1 (QA cycle 4): the manifest and forge.cred built here are synthetic,
+# not sourced from a real controller run. A real launch cannot supply them instead:
+# forge.cred is read AND unlinked inside the single `--daemon-child` invocation
+# (daemon-start.sh's daemon-role/forge-role checks), before it ever hands off to
+# delivery-daemon.sh — there is no window between a real controller writing
+# forge.cred and that same invocation's child logic consuming it, short of adding a
+# test-only pause hook to production code (out of this Story's scope). What IS made
+# real below is the launcher artefact itself: `$_dir/launcher.sh` is materialized
+# the same way the real controller materializes it (daemon-start.sh:1438-1444 — a
+# verbatim copy of the shipped entry, mode 0500), and invoked by that path rather
+# than by calling the working-copy script directly, so the child-side parsing and
+# digest-recomputation logic exercised here runs from the same on-disk artefact
+# shape a real launch produces. The controller<->child agreement itself — that a
+# synthetic manifest structurally cannot vouch for — is independently proven by the
+# real end-to-end launches elsewhere in this matrix (FORGE-ADMIT's admitting rows,
+# FORGE-TRACE, FORGE-CANARY) and by TC19 in daemon-home-provision.test.sh.
+_mk_forge_attempt() {
+  local _id="$1" _identity="$2" _token="$3" _rel
+  local _dir="$FCHILD/$_id"
+  mkdir -p "$_dir"; chmod 0700 "$_dir"
+  cp "$SCRIPTS_DIR/daemon-start.sh" "$_dir/launcher.sh"
+  chmod 0500 "$_dir/launcher.sh"
+  _rel="$(_forge_release_digest "$FSCHEMA" "$_id" "$FDIGEST" absent present "$FORGE_HOME" "$_identity" "$_token")"
+  printf 'schema=%s\nattempt=%s\nhome=%s\nrepo_root=%s\ntarget_sha=%s\ndaemon_digest=%s\nlauncher_digest=%s\ncredential_mode=absent\nsecret=\nforge_mode=present\nforge_identity=%s\nforge_secret=%s\nrelease_digest=%s\n' \
+    "$FSCHEMA" "$_id" "$FORGE_HOME" "$FORGE_HOME" "$FTARGET_SHA" "$FDIGEST" "$FDIGEST" \
+    "$_identity" "$_dir/forge.cred" "$_rel" > "$_dir/manifest"
+  ( umask 077; printf 'identity=%s\ntoken=%s\n' "$_identity" "$_token" > "$_dir/forge.cred" )
+  chmod 0600 "$_dir/forge.cred"
+  mkfifo -m 0600 "$_dir/release.fifo"
+  printf '%s' "$_dir"
+}
+
+# _forge_child_run <dir> — real materialized launcher copy, real barrier, bounded.
+_forge_child_run() {
+  local _dir="$1" _rel
+  _rel="$(sed -n 's/^release_digest=//p' "$_dir/manifest" | head -1)"
+  local _att; _att="$(sed -n 's/^attempt=//p' "$_dir/manifest" | head -1)"
+  exec 9<> "$_dir/release.fifo" || return 1
+  /usr/bin/env -i "PATH=$PROBE_PATH" "HOME=$FCHILD/opshome" TERM=dumb \
+    "$_dir/launcher.sh" --daemon-child "$_dir" > "$_dir/child.out" 2>&1 &
+  local _pid=$!
+  local _waited=0
+  while [[ ! -e "$_dir/ack.launcher" && ! -e "$_dir/ack.child_failed" ]] && kill -0 "$_pid" 2>/dev/null; do
+    sleep 0.2; _waited=$(( _waited + 1 )); [[ "$_waited" -ge 100 ]] && break
+  done
+  printf 'release attempt=%s digest=%s\n' "$_att" "$_rel" >&9
+  exec 9>&-
+  _waited=0
+  while [[ ! -f "$_dir.observed" && ! -f "$_dir/ack.child_failed" ]] && kill -0 "$_pid" 2>/dev/null; do
+    sleep 0.2; _waited=$(( _waited + 1 )); [[ "$_waited" -ge 100 ]] && break
+  done
+  kill "$_pid" 2>/dev/null; wait "$_pid" 2>/dev/null
+  cat "$_dir/child.out" 2>/dev/null
+}
+
+# Baseline: correct manifest + correct forge.cred must be admitted and exported.
+A1="$(_mk_forge_attempt attempt-a svc-bot token-alpha-111)"
+OUT1="$(_forge_child_run "$A1")"
+if [[ -f "$A1.observed" ]] && grep -q '^forge_identity=svc-bot$' "$A1.observed" \
+   && grep -q '^forge_token_set=yes$' "$A1.observed" && grep -q '^gh_token_set=yes$' "$A1.observed"; then
+  pass "FORGE-CHILD-baseline: a correctly bound forge.cred is exported as GAAI_FORGE_IDENTITY/TOKEN/GH_TOKEN"
+else
+  fail "FORGE-CHILD-baseline: the baseline row did not export the admitted identity: $OUT1"
+fi
+
+# Tamper: token altered in place after the manifest's digest was computed for the
+# original value.
+A2="$(_mk_forge_attempt attempt-b svc-bot token-beta-222)"
+printf 'identity=svc-bot\ntoken=token-TAMPERED-999\n' > "$A2/forge.cred"
+OUT2="$(_forge_child_run "$A2")"
+# Tampered before the child's pre-bind read: the child consistently reads the
+# tampered bytes both times, so its OWN token-digest round-trip matches — the
+# mismatch surfaces one level up, against the controller's release record,
+# which still reflects the value the attempt was ORIGINALLY admitted with.
+[[ ! -f "$A2.observed" ]] && printf '%s' "$OUT2" | grep -qE 'forge_role=token_digest_mismatch|release_role=record_mismatch' \
+  && pass "FORGE-CHILD-tamper-token: an altered token is refused (recomputed digest or release record)" \
+  || fail "FORGE-CHILD-tamper-token: an altered token was not refused: $OUT2"
+
+# Tamper: identity altered in place.
+A3="$(_mk_forge_attempt attempt-c svc-bot token-gamma-333)"
+printf 'identity=someone-else\ntoken=token-gamma-333\n' > "$A3/forge.cred"
+OUT3="$(_forge_child_run "$A3")"
+[[ ! -f "$A3.observed" ]] && printf '%s' "$OUT3" | grep -qE 'forge_role=(manifest_identity_mismatch|identity_mismatch)' \
+  && pass "FORGE-CHILD-tamper-identity: an altered identity is refused" \
+  || fail "FORGE-CHILD-tamper-identity: an altered identity was not refused: $OUT3"
+
+# Tamper: a third line appended.
+A4="$(_mk_forge_attempt attempt-d svc-bot token-delta-444)"
+printf 'identity=svc-bot\ntoken=token-delta-444\nextra=1\n' > "$A4/forge.cred"
+OUT4="$(_forge_child_run "$A4")"
+[[ ! -f "$A4.observed" ]] && printf '%s' "$OUT4" | grep -q 'forge_role=grammar_line_count' \
+  && pass "FORGE-CHILD-tamper-3rdline: a third line is refused before binding" \
+  || fail "FORGE-CHILD-tamper-3rdline: a third line was not refused: $OUT4"
+
+# Cross-launch replay: attempt E's own manifest/digest, but attempt A's bytes.
+A5="$(_mk_forge_attempt attempt-e svc-bot token-epsilon-555)"
+cp "$A1/forge.cred" "$A5/forge.cred" 2>/dev/null || printf 'identity=svc-bot\ntoken=token-alpha-111\n' > "$A5/forge.cred"
+chmod 0600 "$A5/forge.cred"
+OUT5="$(_forge_child_run "$A5")"
+[[ ! -f "$A5.observed" ]] && printf '%s' "$OUT5" | grep -qE 'forge_role=token_digest_mismatch|release_role=record_mismatch' \
+  && pass "FORGE-CHILD-replay: another launch's forge material is refused, not accepted" \
+  || fail "FORGE-CHILD-replay: cross-launch replay was accepted: $OUT5"
+
+# Residue check: every refusal above (tamper-token, tamper-identity, tamper-3rdline,
+# replay) must not leave the 0600 plaintext forge.cred behind in its attempt
+# directory — _child_refuse unlinks it before writing ack.child_failed.
+_residue_count=0
+for _rd in "$A2" "$A3" "$A4" "$A5"; do
+  [[ -f "$_rd/forge.cred" ]] && _residue_count=$(( _residue_count + 1 ))
+done
+[[ "$_residue_count" -eq 0 ]] \
+  && pass "FORGE-CHILD-residue: no refused attempt leaves forge.cred behind" \
+  || fail "FORGE-CHILD-residue: $_residue_count refused attempt(s) still have forge.cred on disk"
 
 echo ""
 echo "════════════════════════════════════════"

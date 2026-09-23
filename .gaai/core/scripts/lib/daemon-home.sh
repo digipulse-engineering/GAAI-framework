@@ -30,7 +30,7 @@ GAAI_HOME_SCHEMA="gaai-daemon-lifecycle/v1"
 GAAI_HOME_BRANCH="gaai-daemon-home"
 
 # Closed reason set (AC5). Order is the diagnostic order, not a precedence.
-GAAI_HOME_REASONS="entry_authority_invalid target_fetch_failed target_advanced home_lock_failed already_running home_identity_invalid home_dirty home_registration_invalid home_update_failed home_asset_invalid process_authority_invalid"
+GAAI_HOME_REASONS="entry_authority_invalid target_fetch_failed target_advanced home_lock_failed already_running home_identity_invalid home_dirty home_registration_invalid home_update_failed home_asset_invalid process_authority_invalid forge_identity_unadmitted"
 
 # Last typed refusal — reason, canonical action, non-secret evidence.
 GAAI_HOME_REASON=""
@@ -74,6 +74,9 @@ _gaai_home_action_for() {
     target_advanced|home_identity_invalid|home_registration_invalid|home_asset_invalid) printf 'rerun_setup' ;;
     # Never auto-resolvable: preserve the evidence for an operator.
     home_dirty|home_lock_failed|home_update_failed|process_authority_invalid) printf 'operator_disposition_required' ;;
+    # No identity was admitted for this launch — an operator action, not a setup
+    # rerun (setup provisions the home, not the operator's forge credential).
+    forge_identity_unadmitted) printf 'provision_forge_credential' ;;
     *) printf 'operator_disposition_required' ;;
   esac
 }
@@ -189,6 +192,18 @@ _gaai_home_write_durable() {
   local _back
   _back="$(cat "$_path" 2>/dev/null)" || return 1
   [[ "$_back" == "$_content" ]]
+}
+
+# Append-only, best-effort, non-secret lifecycle trace (AC2 ordering evidence).
+# Fixed event vocabulary only — never an identity value, a digest, a pathname or
+# a remote URL. Missing directory or write failure is never fatal: the trace is
+# diagnostic evidence, not lifecycle authority.
+_gaai_home_trace() {
+  local _root="$1" _attempt="$2" _event="$3"
+  [[ -n "$_root" ]] || return 0
+  mkdir -p "$_root" 2>/dev/null || return 0
+  chmod 0700 "$_root" 2>/dev/null || true
+  printf 'attempt=%s event=%s\n' "$_attempt" "$_event" >> "$_root/trace" 2>/dev/null || true
 }
 
 # ── Lifecycle lock ──────────────────────────────────────────────────────────
