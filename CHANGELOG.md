@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+-: A settled lifecycle can be disposed of without hand-editing
 - fix: contain the inherited GIT_CONFIG_GLOBAL across corpus suites
 - fix: phase agents cannot publish or self-certify through the story branch
 - fix: --stop reaps the phase agent a killed wrapper leaves behind
