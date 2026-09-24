@@ -20,6 +20,13 @@ _GAAI_DISPATCH_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
   && source "${_GAAI_DISPATCH_LIB_DIR}/delivery-routing.sh"
 # shellcheck source=lib/commit-retry-containment.sh
 source "${_GAAI_DISPATCH_LIB_DIR}/commit-retry-containment.sh"
+# Process incarnation stamps for the phase-agent record (_phase_agent_record).
+# Definitions only, idempotent; the delivery wrapper sources this library
+# directly, so it cannot rely on the daemon having loaded it. Absent, the record
+# is written without a stamp and nothing ever signals it.
+# shellcheck source=lib/daemon-home.sh
+[[ -f "${_GAAI_DISPATCH_LIB_DIR}/daemon-home.sh" ]] \
+  && source "${_GAAI_DISPATCH_LIB_DIR}/daemon-home.sh"
 # The PLAN target guard is owned by this library and must remain available in
 # the fresh wrapper shell, which sources daemon-dispatch directly rather than
 # inheriting delivery-daemon functions.
@@ -1390,6 +1397,12 @@ PY
     return 1
   fi
   chmod 644 "$snapshot" 2>/dev/null || { _lifecycle_cleanup; return 1; }
+  # The local copy now carries the target's bytes while the project checkout's
+  # branch stays where it was: the projection is published through a private
+  # index, never through this checkout. When that checkout is the daemon's
+  # coordination home, the daemon's per-cycle check settles this redundant
+  # difference by advancing the home's branch to the tree it already holds
+  # (`_settle_redundant_self_projection` in delivery-daemon.sh).
   mv "$snapshot" "$BACKLOG_FILE" 2>/dev/null || { _lifecycle_cleanup; return 1; }
   _lifecycle_write_run_state "$state_file" remove || { _lifecycle_cleanup; return 1; }
   echo "[LIFECYCLE-JOURNAL] story=$story_id writer=$writer outcome=applied reason=none" >&2
@@ -1512,6 +1525,53 @@ _reap_worktree_orphans() {
   local pattern="${1:-}"
   [[ -n "$pattern" && "$pattern" == *-workspace ]] || return 0
   pkill -9 -f "$pattern" 2>/dev/null || true
+}
+
+# ── Phase-agent identity record ───────────────────────────────────────────
+# `<storyId>.agent.pid` in the marker directory names the process at the head
+# of a running phase agent. Line 1 is the bare pid, which the hang detector
+# reads. The `incarnation=` line is that process's start stamp: a pid alone is
+# reusable, so anything that later signals the agent from this record — the hang
+# detector, or `daemon-start.sh --stop` reaping what a killed wrapper left
+# behind — must first prove the live pid still carries the recorded stamp.
+#
+# Why the record is needed at all: the agent does not share the wrapper's fate.
+# `timeout` moves itself into a process group of its own, the node spawner
+# starts the model CLI in a new session, and a wrapper that is killed takes
+# neither with it. Its children are reparented to init and keep running in the
+# worktree. The record is how they stay findable by exact identity rather than
+# by a command-line match.
+#
+# An empty stamp is written when it cannot be read; readers treat that record as
+# unprovable and never signal it.
+_phase_agent_record() {
+  local story_id="$1" pid="$2" stamp="" file
+  [[ -n "$story_id" && "$pid" =~ ^[1-9][0-9]*$ ]] || return 0
+  file="$(_marker_dir)/${story_id}.agent.pid"
+  if declare -F _gaai_home_incarnation_fixed >/dev/null 2>&1; then
+    stamp=$(_gaai_home_incarnation_fixed "$pid" 2>/dev/null) || stamp=""
+  fi
+  printf '%s\nincarnation=%s\n' "$pid" "$stamp" > "${file}.tmp" 2>/dev/null \
+    && mv -f "${file}.tmp" "$file" 2>/dev/null
+  return 0
+}
+
+_phase_agent_clear() {
+  [[ -n "${1:-}" ]] || return 0
+  rm -f "$(_marker_dir)/${1}.agent.pid" 2>/dev/null || true
+}
+
+# Records the calling (sub)shell as the phase agent, then replaces it with the
+# agent command. Only meaningful as the last command of a subshell or a command
+# substitution: after `exec` the recorded pid and start stamp belong to the
+# agent command itself (exec keeps both), so the record is exact from the first
+# instruction the agent runs. Bash 3.2 has no BASHPID; there the pid comes from
+# a child whose parent is, by `exec`, this very subshell.
+_phase_agent_exec() {
+  local story_id="$1"
+  shift
+  _phase_agent_record "$story_id" "${BASHPID:-$(exec sh -c 'echo "$PPID"')}"
+  exec "$@"
 }
 
 # ── Orphaned-worktree reaper (OSS — disk-leak guard) ──────────────────────
@@ -2180,12 +2240,13 @@ _run_claude_with_loop_breaker() {
     local _to_cmd
     _to_cmd=$(_resolve_timeout_cmd)
     if [[ -n "$_to_cmd" ]]; then
-      ( cd "$worktree_path" && exec "$_to_cmd" --kill-after=10s "${timeout_sec}s" "${agent_cmd[@]}" < "$prompt_file" 2>&1 ) | tee -a "$log_path"
+      ( cd "$worktree_path" && _phase_agent_exec "$story_id" "$_to_cmd" --kill-after=10s "${timeout_sec}s" "${agent_cmd[@]}" < "$prompt_file" 2>&1 ) | tee -a "$log_path"
     else
-      ( cd "$worktree_path" && exec "${agent_cmd[@]}" < "$prompt_file" 2>&1 ) | tee -a "$log_path"
+      ( cd "$worktree_path" && _phase_agent_exec "$story_id" "${agent_cmd[@]}" < "$prompt_file" 2>&1 ) | tee -a "$log_path"
     fi
     local rc=${PIPESTATUS[0]}
     set +o pipefail
+    _phase_agent_clear "$story_id"
     _shared_home_restore "$_home_snapshot" "$story_id" "$phase"
     # `timeout` exits 124 on SIGTERM, 137 on SIGKILL — translate both to our
     # canonical wall-clock RC. 124 collides with the loop-breaker code, but
@@ -2205,9 +2266,10 @@ _run_claude_with_loop_breaker() {
   if ! mkfifo "$fifo" 2>/dev/null; then
     echo "[WARN] ${story_id} _run_claude_with_loop_breaker: mkfifo failed; falling back to plain pipeline"
     set -o pipefail
-    ( cd "$worktree_path" && exec "${agent_cmd[@]}" < "$prompt_file" 2>&1 ) | tee -a "$log_path"
+    ( cd "$worktree_path" && _phase_agent_exec "$story_id" "${agent_cmd[@]}" < "$prompt_file" 2>&1 ) | tee -a "$log_path"
     local rc=${PIPESTATUS[0]}
     set +o pipefail
+    _phase_agent_clear "$story_id"
     _shared_home_restore "$_home_snapshot" "$story_id" "$phase"
     return "$rc"
   fi
@@ -2220,9 +2282,10 @@ _run_claude_with_loop_breaker() {
 
   # Write agent subprocess PID sidecar so the daemon hang-detector can kill the
   # agent instead of the wrapper, letting the wrapper's EXIT trap run cleanly.
+  # The record also carries the agent's start stamp (see _phase_agent_record).
   local _agent_pid_file
   _agent_pid_file="$(_marker_dir)/${story_id}.agent.pid"
-  echo "$agent_pid" > "$_agent_pid_file" 2>/dev/null || true
+  _phase_agent_record "$story_id" "$agent_pid"
 
   # Wall-clock watchdog: send SIGTERM after $timeout_sec, then SIGKILL after
   # an additional 10s grace. Decoupled from the loop-breaker — handles silent
@@ -4433,6 +4496,11 @@ handle_impl_phase() {
   # before anything durable is attempted.
   local _impl_home_snapshot=""
   _impl_home_snapshot=$(_shared_home_snapshot 2>/dev/null) || _impl_home_snapshot=""
+  # The agent is recorded by exact identity (pid + start stamp) before it runs.
+  # `timeout` leads a process group of its own, so a wrapper killed while this
+  # substitution is pending does not take the agent with it; the record is what
+  # lets `daemon-start.sh --stop` end it — TERM first, so this handler still sees
+  # the executor exit and preserves the interrupted work.
   local spawn_output spawn_rc
   spawn_output=$(
     GAAI_STORY_ID="$story_id" \
@@ -4441,6 +4509,7 @@ handle_impl_phase() {
     GAAI_WORKSPACE_ID="${GAAI_WORKSPACE_ID:-}" \
     GAAI_ORG_ID="${GAAI_ORG_ID:-}" \
     GAAI_IMPL_PRIMARY_MODEL="${_impl_primary_model:-${GAAI_IMPL_PRIMARY_MODEL:-}}" \
+      _phase_agent_exec "$story_id" \
       ${_impl_to_prefix[@]+"${_impl_to_prefix[@]}"} node "$spawn_script" \
         --story-id       "$story_id" \
         --report-path    "$impl_report_path" \
@@ -4453,6 +4522,7 @@ handle_impl_phase() {
         2>>"$log_path"
   )
   spawn_rc=$?
+  _phase_agent_clear "$story_id"
   _shared_home_restore "$_impl_home_snapshot" "$story_id" "impl"
   if [[ "$spawn_rc" == "124" || "$spawn_rc" == "137" ]]; then
     echo "[TIMEOUT] ${story_id} handle_impl_phase: nested-claude-spawn wall-clock timeout after ${GAAI_TIMEOUT_IMPL_SEC}s"

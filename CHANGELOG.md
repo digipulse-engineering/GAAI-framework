@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: --stop reaps the phase agent a killed wrapper leaves behind
 -: A live daemon's identity survives a second launch, a status
 - fix: repair a half-extracted Corepack pnpm release before the commit phase runs pnpm
 - fix: never take a PR merged for an earlier cycle as this candidate's landing

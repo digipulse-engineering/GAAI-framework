@@ -1588,13 +1588,158 @@ _clear_drift_marker_if_clean() {
   fi
 }
 
+# ── Settle this daemon's own redundant backlog projection in the home ─────
+# The lifecycle journal publishes a backlog transition to the target through a
+# private index and pushes it, then writes the verified target backlog into the
+# home's working tree so every later local read agrees with the target. It never
+# advances the home's branch. The home is therefore left with one modified file
+# whose bytes already exist on the target, and the next per-cycle check refuses
+# it as `home_dirty`. The self-claim rebind cannot clear that state — it demands a
+# clean home — and it only runs after a claim, which the refusal itself prevents,
+# so a single phase transition halted delivery until an authorized restart.
+#
+# Settling is admissible only where the dirt is provably this daemon's own
+# redundant projection, the same evidence standard the self-claim rebind uses:
+#   - the home's HEAD is exactly the bound target, and the index is clean and no
+#     untracked file exists;
+#   - the backlog is the one and only modified path, a regular file whose exact
+#     bytes (no filters) are the freshly fetched target's backlog blob, mode kept;
+#   - the bound target is an ancestor of the fetched tip, and every commit in
+#     between is a non-merge write stamped by one of this daemon's two writers
+#     (`[daemon]`, `[dispatch]`) that changes nothing but the backlog.
+# Then the home's branch is compare-and-swapped from the bound commit to the tip
+# and the index follows it. No working-tree file is written: the tree on disk is
+# already the tip's tree, so this moves the ref to what the files say, and the
+# launch binding follows it exactly as the self-claim rebind does. Any other dirt,
+# any byte difference and any foreign or non-backlog commit leaves the home
+# untouched and the cycle refused, as before; the cause is named once.
+#
+# Holds the shared staging lock so no journal projection or claim can move the
+# home or the target between the proof and the swap. Returns 0 when settled.
+_settle_redundant_self_projection() {
+  _GAAI_SETTLE_REFUSED_BY=""
+  if [[ -z "${GAAI_DAEMON_HOME:-}" || -z "${GAAI_TARGET_SHA:-}" \
+        || -z "${BACKLOG_REL:-}" || -z "${TARGET_BRANCH:-}" ]]; then
+    _GAAI_SETTLE_REFUSED_BY="binding_unavailable"
+    return 1
+  fi
+  if ! declare -F _lifecycle_with_staging_lock >/dev/null 2>&1; then
+    _GAAI_SETTLE_REFUSED_BY="staging_lock_unavailable"
+    return 1
+  fi
+  if ! _lifecycle_with_staging_lock _settle_redundant_self_projection_locked \
+      "$GAAI_DAEMON_HOME" "$GAAI_TARGET_SHA"; then
+    _GAAI_SETTLE_REFUSED_BY="${_GAAI_SETTLE_REFUSED_BY:-staging_lock_unavailable}"
+    return 1
+  fi
+  return 0
+}
+
+_settle_redundant_self_projection_locked() {
+  local home="$1" bound="$2" rel="$BACKLOG_REL"
+  local head remote branch_ref changed raw line sha parents subject paths
+  local disk_blob remote_blob remote_mode foreign=""
+  _refuse_settle() { _GAAI_SETTLE_REFUSED_BY="$1"; return 1; }
+
+  head=$(git -C "$home" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null) \
+    || { _refuse_settle head_unresolved; return 1; }
+  [[ "$head" == "$bound" ]] || { _refuse_settle head_not_bound; return 1; }
+  branch_ref=$(git -C "$home" symbolic-ref -q HEAD 2>/dev/null) \
+    || { _refuse_settle branch_unresolved; return 1; }
+  [[ "$branch_ref" == "refs/heads/${GAAI_HOME_BRANCH:-gaai-daemon-home}" ]] \
+    || { _refuse_settle wrong_branch; return 1; }
+  git -C "$home" diff --cached --quiet 2>/dev/null \
+    || { _refuse_settle index_dirty; return 1; }
+  [[ -z "$(git -C "$home" ls-files --others --exclude-standard 2>/dev/null | head -1)" ]] \
+    || { _refuse_settle untracked_present; return 1; }
+
+  # Exactly one modified path, the backlog, as a plain content modification.
+  changed=$(git -C "$home" diff --no-renames --name-only -z HEAD 2>/dev/null | tr '\0' '\n') \
+    || { _refuse_settle diff_unavailable; return 1; }
+  [[ "$changed" == "$rel" ]] || { _refuse_settle other_path_modified; return 1; }
+  raw=$(git -C "$home" diff --no-renames --raw HEAD -- "$rel" 2>/dev/null) \
+    || { _refuse_settle diff_unavailable; return 1; }
+  [[ "$raw" == ":100644 100644 "*" M"$'\t'"$rel" ]] \
+    || { _refuse_settle backlog_not_a_content_edit; return 1; }
+  [[ -f "$home/$rel" && ! -L "$home/$rel" ]] \
+    || { _refuse_settle backlog_not_regular; return 1; }
+
+  git -C "$home" fetch origin "$TARGET_BRANCH" --quiet 2>/dev/null \
+    || { _refuse_settle target_fetch_failed; return 1; }
+  remote=$(git -C "$home" rev-parse --verify --quiet "origin/${TARGET_BRANCH}^{commit}" 2>/dev/null) \
+    || { _refuse_settle target_unresolved; return 1; }
+  [[ "$remote" != "$head" ]] || { _refuse_settle backlog_differs_from_target; return 1; }
+  git -C "$home" merge-base --is-ancestor "$head" "$remote" 2>/dev/null \
+    || { _refuse_settle target_not_descendant; return 1; }
+
+  # The bytes on disk must be the target's backlog blob exactly.
+  disk_blob=$(git -C "$home" hash-object --no-filters -- "$home/$rel" 2>/dev/null) \
+    || { _refuse_settle backlog_unreadable; return 1; }
+  remote_blob=$(git -C "$home" rev-parse --verify --quiet "${remote}:${rel}" 2>/dev/null) \
+    || { _refuse_settle backlog_absent_at_target; return 1; }
+  [[ "$disk_blob" == "$remote_blob" ]] \
+    || { _refuse_settle backlog_differs_from_target; return 1; }
+  remote_mode=$(git -C "$home" ls-tree "$remote" -- "$rel" 2>/dev/null | awk '{print $1}')
+  [[ "$remote_mode" == "100644" ]] || { _refuse_settle backlog_mode_changed; return 1; }
+
+  # The advance must be this daemon's own backlog writes and nothing else. The
+  # tree check is the invariant the swap relies on; the per-commit checks are
+  # the provenance the self-claim rebind already requires, plus the path bound.
+  paths=$(git -C "$home" diff-tree -r --no-renames --name-only -z "$head" "$remote" 2>/dev/null \
+    | tr '\0' '\n') || { _refuse_settle diff_unavailable; return 1; }
+  [[ "$paths" == "$rel" ]] || { _refuse_settle target_changed_other_paths; return 1; }
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    read -r sha parents <<< "$line"
+    if [[ -z "$parents" || "$parents" == *" "* ]]; then
+      foreign="${foreign:+$foreign; }merge_or_root:${sha:0:12}"
+      continue
+    fi
+    subject=$(git -C "$home" log -1 --format='%s' "$sha" 2>/dev/null)
+    if [[ "$subject" != chore\(*\):*\[daemon\] && "$subject" != chore\(*\):*\[dispatch\] ]]; then
+      foreign="${foreign:+$foreign; }${subject}"
+      continue
+    fi
+    changed=$(git -C "$home" diff-tree -r --no-renames --no-commit-id --name-only -z "$sha" 2>/dev/null \
+      | tr '\0' '\n')
+    if [[ -n "$changed" && "$changed" != "$rel" ]]; then
+      foreign="${foreign:+$foreign; }non_backlog_write:${sha:0:12}"
+    fi
+  done < <(git -C "$home" rev-list --parents "${head}..${remote}" 2>/dev/null)
+  if [[ -n "$foreign" ]]; then
+    _refuse_settle "advance_not_own_projection: ${foreign}"
+    return 1
+  fi
+
+  # Compare-and-swap the branch, then let the index follow. The working tree is
+  # not written by either step.
+  git -C "$home" update-ref -m "daemon: settle own backlog projection" \
+    "$branch_ref" "$remote" "$head" 2>/dev/null \
+    || { _refuse_settle ref_swap_refused; return 1; }
+  GAAI_TARGET_SHA="$remote"
+  export GAAI_TARGET_SHA
+  git -C "$home" read-tree "$remote" 2>/dev/null \
+    || { _refuse_settle index_update_failed; return 1; }
+  git -C "$home" update-index -q --refresh >/dev/null 2>&1 || true
+  if ! git -C "$home" diff --quiet 2>/dev/null \
+      || ! git -C "$home" diff --cached --quiet 2>/dev/null; then
+    _refuse_settle not_clean_after_swap
+    return 1
+  fi
+  log "[HOME-REBIND] settled this daemon's own backlog projection in the home — rebound to ${remote:0:12}"
+  return 0
+}
+
 # Per-cycle home verification (exact-current startup contract). VERIFY-ONLY: the live daemon proves the
 # pre-provisioned home is still the exact-current, clean, registered tree its launch
 # tuple named, and fails closed before any coordination git-state operation. It never
 # creates, moves, removes, prunes, resets, cleans or repairs the home — that authority
 # belongs to the explicit offline `daemon-setup.sh` alone, and only while no lifecycle
 # owner exists. A cycle that cannot prove the home stops the cycle; it never converts
-# missing evidence into permission to continue.
+# missing evidence into permission to continue. The single exception is the settle
+# above: a working tree that is provably this daemon's own redundant backlog
+# projection has its branch advanced to the tree it already holds; no file is
+# written and every other refusal stands.
 #
 # Returns 0 to continue the cycle, 1 to skip it.
 _per_cycle_home_check() {
@@ -1618,7 +1763,22 @@ _per_cycle_home_check() {
 
   local _repo_root
   _repo_root="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null || echo "$REPO_ROOT")"
+  local _home_ok=true
   if ! _gaai_home_verify "$GAAI_DAEMON_HOME" "$TARGET_BRANCH" "$_repo_root" "$_expected"; then
+    _home_ok=false
+    _GAAI_SETTLE_REFUSED_BY=""
+    # A working tree that is only this daemon's own redundant backlog projection
+    # is settled, then proved again from scratch; everything else refuses below.
+    if [[ "$GAAI_HOME_REASON" == "home_dirty" \
+          && "$GAAI_HOME_EVIDENCE" == "home_role=worktree_dirty" \
+          && -n "${GAAI_TARGET_SHA:-}" && "$_expected" == "$GAAI_TARGET_SHA" ]] \
+        && _settle_redundant_self_projection; then
+      _expected="$GAAI_TARGET_SHA"
+      _gaai_home_verify "$GAAI_DAEMON_HOME" "$TARGET_BRANCH" "$_repo_root" "$_expected" \
+        && _home_ok=true
+    fi
+  fi
+  if [[ "$_home_ok" != true ]]; then
     local _home_head="" _pair=""
     _home_head="$(git -C "$GAAI_DAEMON_HOME" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || echo "")"
     _pair="${GAAI_HOME_REASON}:${GAAI_HOME_EVIDENCE}:${_expected}:${_home_head}"
@@ -1627,6 +1787,11 @@ _per_cycle_home_check() {
       _GAAI_HOME_REFUSAL_POLLS=0
       log "${RED}[HOME-INTEGRITY] reason=${GAAI_HOME_REASON} action=${GAAI_HOME_ACTION} evidence=${GAAI_HOME_EVIDENCE}${NC}"
       log "${RED}[HOME-INTEGRITY] the home is preserved unchanged; this cycle is skipped${NC}"
+      if [[ -n "${_GAAI_SETTLE_REFUSED_BY:-}" ]]; then
+        # Name why the dirt is not the daemon's own redundant projection, so the
+        # operator's disposition starts from the cause, not from a bare refusal.
+        log "${RED}[HOME-INTEGRITY] the dirt is not provably this daemon's own redundant backlog projection: ${_GAAI_SETTLE_REFUSED_BY}${NC}"
+      fi
       if [[ "$GAAI_HOME_EVIDENCE" == *stale_head* ]]; then
         # The launch tuple is immutable for the life of this process, so a target
         # that advanced past it halts every cycle until an authorized restart.

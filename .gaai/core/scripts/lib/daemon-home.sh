@@ -172,6 +172,15 @@ _gaai_home_incarnation() {
   esac
 }
 
+# The same stamp in one fixed rendering, for identities that are written by one
+# process and verified by another. `ps -o lstart=` prints local time in the
+# caller's locale, so a writer and a reader with different TZ or LC_* settings
+# would render one start instant as two different strings — and a mismatch reads
+# as "pid reused". Pinning both makes the stamp comparable across processes.
+_gaai_home_incarnation_fixed() {
+  TZ=UTC LC_ALL=C _gaai_home_incarnation "$1"
+}
+
 # Best-effort durability. Bash has no fsync builtin; `sync <file>` (GNU) is exact,
 # plain `sync` is the portable superset. Neither is claimed to survive power loss.
 _gaai_home_fsync() {
