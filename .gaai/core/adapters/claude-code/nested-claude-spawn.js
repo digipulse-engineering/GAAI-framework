@@ -305,6 +305,35 @@ function buildPrimaryChildEnv() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase-agent tool denials (defence in depth, NOT a security boundary)
+// ---------------------------------------------------------------------------
+
+/**
+ * Commands an implementation agent must not run: pushing, and opening, editing,
+ * merging, closing or commenting on a pull request. Publication and lifecycle
+ * state belong to the daemon alone.
+ *
+ * Claude Code enforces deny rules even under --dangerously-skip-permissions, but
+ * a Bash rule matches the command text only: `git -C . push`, `bash -c "..."`,
+ * an alias, a script or a direct API call are not caught. This is a belt that
+ * stops the usual form, not the boundary; the boundary is that the agent should
+ * not hold forge write credentials. Read-only queries (gh pr view/checks/list,
+ * gh run, gh api) stay allowed.
+ *
+ * Mirrors GAAI_PHASE_DENIED_TOOLS in scripts/daemon-dispatch.sh, which applies
+ * the same list to the plan and QA invocations; a test keeps the two equal.
+ */
+export const PHASE_DENIED_TOOLS = Object.freeze([
+  'Bash(git push *)',
+  'Bash(gh pr create *)',
+  'Bash(gh pr merge *)',
+  'Bash(gh pr edit *)',
+  'Bash(gh pr close *)',
+  'Bash(gh pr ready *)',
+  'Bash(gh pr comment *)',
+]);
+
+// ---------------------------------------------------------------------------
 // Private helper: buildSpawnArgs
 // ---------------------------------------------------------------------------
 
@@ -340,6 +369,9 @@ function buildSpawnArgs(prompt, extraArgs, model = 'opus', includeFallbackModel 
   return [
     '-p', prompt,
     '--no-session-persistence',
+    // Deny rules still apply under --dangerously-skip-permissions. The list is
+    // variadic and ends at the next option, which the line below guarantees.
+    '--disallowedTools', ...PHASE_DENIED_TOOLS,
     '--dangerously-skip-permissions',  // nested child cannot answer permission prompts; would hang forever
     '--output-format', 'stream-json',
     '--verbose',

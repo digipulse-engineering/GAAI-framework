@@ -308,6 +308,16 @@ skill name alone.
 - MUST NOT infer PASS on `state_of_the_art_conformance` when retrieval is unavailable and no fresh governed record exists — ESCALATE instead
 - `consistency-check` is mandatory for every delivery regardless of provider (E94 D-12 unconditional)
 
+## Lifecycle and publication boundary
+
+Publication and lifecycle state belong to the delivery daemon alone. Your verdict reaches the Story only through the handoff artefacts above. This phase:
+
+- MUST NOT push any branch or tag, in any form
+- MUST NOT open, edit, merge, close, mark ready or comment on a pull request, or call any GitHub write API — reading CI and pull-request state (`gh pr view`, `gh pr checks`, `gh run`, read-only `gh api`) is allowed
+- MUST NOT edit the backlog (`active.backlog.yaml`), committed or not — not a status, a `phase_status`, a `pr_status` or a `pr_url`
+
+Any such edit is reverted by the daemon and reported to the operator.
+
 ## Worktree scope
 
 All Write/Edit operations and Bash commands with side effects (file writes,

@@ -67,7 +67,11 @@ setup_story() {
   git -C "$PROJ" checkout -q staging
   git -C "$PROJ" checkout -q -b "story/$sid"
   echo "$sid" > "$PROJ/${sid}.txt"
-  git -C "$PROJ" add -A
+  # Only the story's own file. The shared checkout's backlog is dirty from the
+  # previous case's lifecycle writes; `add -A` swept it into the story branch,
+  # which the commit phase now (correctly) reverts as a committed governance
+  # edit — moving the head these cases pin.
+  git -C "$PROJ" add -- "${sid}.txt"
   git -C "$PROJ" commit -q -m "impl($sid): work"
   git -C "$PROJ" push -q origin "story/$sid"
   git -C "$PROJ" checkout -q staging

@@ -197,6 +197,16 @@ discipline upstream is the durable solution.
 - MUST terminate after writing the handoff artefact
 - MUST write to `$GAAI_PLAN_PATH` (not to any other path)
 
+## Lifecycle and publication boundary
+
+Publication and lifecycle state belong to the delivery daemon alone. This phase:
+
+- MUST NOT push any branch or tag, in any form
+- MUST NOT open, edit, merge, close, mark ready or comment on a pull request, or call any GitHub write API
+- MUST NOT edit the backlog (`active.backlog.yaml`), committed or not
+
+Any such edit is reverted by the daemon and reported to the operator.
+
 ## Worktree scope
 
 All Write/Edit operations and Bash commands with side effects (file writes,

@@ -369,6 +369,33 @@ Therefore :
 
 ONESHOT_MODE
 
+# ── Section 1c: lifecycle and publication boundary ───────────────────────
+# Publication and lifecycle state belong to the daemon. An implementation agent
+# holding forge credentials once pushed its branch, opened a pull request before
+# QA and committed a backlog edit marking its own row QA-passed. The daemon now
+# reverts committed governance edits at both admission boundaries and reports an
+# early pull request; this block states the rule so the agent does not try.
+# Emitted unconditionally, next to the execution-mode block, before any input.
+cat <<PUBLICATION_BOUNDARY
+=== LIFECYCLE AND PUBLICATION BOUNDARY (read before acting) ===
+
+Publication and lifecycle state belong to the delivery daemon alone. In this
+phase you MUST NOT:
+  - push any branch or tag (no git push, in any form);
+  - open, edit, merge, close, mark ready or comment on a pull request, or call
+    any GitHub write API (gh pr create/edit/merge/close/ready/comment, gh api
+    with a write method);
+  - edit the backlog (active.backlog.yaml), committed or not — not your own
+    row, not a status, not a phase_status, not a pr_status, not a pr_url.
+
+Commit your work locally on the current branch; the daemon seals, verifies,
+publishes and records it. Any such edit is reverted and reported to the
+operator, and does not advance this Story.
+
+=== END LIFECYCLE AND PUBLICATION BOUNDARY ===
+
+PUBLICATION_BOUNDARY
+
 if [[ "$SECONDARY_ROUTE" == "true" ]]; then
   cat <<INPUT_REFS
 === INPUT ARTEFACTS — READ THESE FIRST (chunked, per R4) ===

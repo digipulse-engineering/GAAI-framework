@@ -1165,6 +1165,14 @@ if grep -q -- '--model claude-fallback-exact' "$GAAI_TEST_PLAN_MODEL_CALL_LOG" \
 else
   fail "PLAN-AUTH-H2a: explicit Claude fallback identity or FD isolation drifted (call=$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG" 2>/dev/null | tr '\n' ' '); ledger=$(grep 'concrete_model' "$PLAN_PROVENANCE_PATH" 2>/dev/null | tr '\n' ' '); routing=$(head -1 "$ROUTING_LOG" 2>/dev/null))"
 fi
+# The PLAN agent is denied forge-write commands (defence in depth; the daemon
+# owns publication). The whole ordered list, terminated by the next option.
+PHASE_DENY_ARGV='--disallowedTools Bash(git push *) Bash(gh pr create *) Bash(gh pr merge *) Bash(gh pr edit *) Bash(gh pr close *) Bash(gh pr ready *) Bash(gh pr comment *) --dangerously-skip-permissions'
+if grep -qF -- "$PHASE_DENY_ARGV" "$GAAI_TEST_PLAN_MODEL_CALL_LOG"; then
+  pass "PLAN-DENY: the PLAN claude invocation carries the forge-write deny list"
+else
+  fail "PLAN-DENY: deny list missing from PLAN argv (call=$(cat "$GAAI_TEST_PLAN_MODEL_CALL_LOG" 2>/dev/null | tr '\n' ' '))"
+fi
 PLAN_LOCK_PARENT_MODE=$(python3 - "$LOCK_DIR" <<'PY'
 import os
 import stat
@@ -2275,6 +2283,7 @@ make_qa_claude_shim() {
   esac
   cat > "$QA_SHIM_DIR/claude" << QASHIM_EOF
 #!/usr/bin/env bash
+[[ -n "\${GAAI_TEST_QA_ARGV_LOG:-}" ]] && printf '%s\n' "\$*" >> "\$GAAI_TEST_QA_ARGV_LOG"
 if [[ -n "\${GAAI_QA_VERDICT_PATH:-}" ]]; then
   printf '{"schema_version":1,"story_id":"%s","evaluated_as_of":"2026-08-07T00:00:00Z","state_of_the_art_conformance":"$verdict","plan_conformance":"$verdict","changed_surface_inventory":[],"findings":[],"evidence":[],"verdict":"$verdict","remediation_route":$route,"replan_required":$replan,"report_path":"qa-reports/%s.qa-report.md"}' "\${GAAI_STORY_ID:-}" "\${GAAI_STORY_ID:-}" > "\$GAAI_QA_VERDICT_PATH"
 fi
@@ -2339,6 +2348,8 @@ make_qa_claude_shim "PASS"
 "$SCHEDULER" --set-phase-status "TST-QA-PASS" implemented "$FIXTURE" 2>/dev/null || true
 > "$ROUTING_LOG"
 TRACE="test-trace-$(date +%s)-022"
+export GAAI_TEST_QA_ARGV_LOG="$QA_FIXTURE_DIR/qa-argv.log"
+: > "$GAAI_TEST_QA_ARGV_LOG"
 
 if handle_qa_phase "TST-QA-PASS" "$TRACE" 2>/dev/null; then
   new_ps=$(get_phase_status "TST-QA-PASS")
@@ -2367,6 +2378,15 @@ else
   fail "T22b: (skipped — T22a failed)"
   fail "T22c: (skipped — T22a failed)"
 fi
+# The QA agent is denied forge-write commands (defence in depth); read-only CI
+# queries stay available to it.
+if grep -qF -- "$PHASE_DENY_ARGV" "$GAAI_TEST_QA_ARGV_LOG" 2>/dev/null \
+    && ! grep -qE 'Bash\(gh (pr (view|checks|list)|run|api)' "$GAAI_TEST_QA_ARGV_LOG"; then
+  pass "T22d: the QA claude invocation carries the forge-write deny list, and only it"
+else
+  fail "T22d: QA argv deny list drifted (argv=$(cat "$GAAI_TEST_QA_ARGV_LOG" 2>/dev/null | tr '\n' ' '))"
+fi
+unset GAAI_TEST_QA_ARGV_LOG
 
 # ── T23: QA FAIL verdict → qa_failed ─────────────────────────
 echo "T23: handle_qa_phase — FAIL verdict → qa_failed"
