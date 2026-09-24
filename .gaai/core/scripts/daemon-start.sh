@@ -633,7 +633,7 @@ export GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED
 # 8. Positive allowlist: every other exported configuration entry is dropped and
 #    the survivors are rebuilt from validated scalar values. A value that is not a
 #    single safe scalar is not "sanitised" — it is refused.
-_GAAI_CONFIG_ALLOW='GAAI_TARGET_BRANCH GAAI_DAEMON_HOME GAAI_REPO_ROOT GAAI_STOP_DRAIN_TIMEOUT
+_GAAI_CONFIG_ALLOW='GAAI_TARGET_BRANCH GAAI_DAEMON_HOME GAAI_REPO_ROOT GAAI_STOP_DRAIN_TIMEOUT GAAI_STOP_AGENT_GRACE
 GAAI_DAEMON_NO_MONITOR GAAI_CLAUDE_PROXY_BASE_URL GAAI_IMPL_BASE_URL GAAI_IMPL_MODEL
 GAAI_IMPL_MODEL_FALLBACK GAAI_AUTO_MERGE_POLICY GAAI_AUTO_MERGE_ADMIN_FALLBACK
 GAAI_DAEMON_EXECUTOR GAAI_CODEX_MODEL GAAI_CODEX_SANDBOX GAAI_CODEX_EPHEMERAL
@@ -747,6 +747,13 @@ MONITOR_TAIL="$SCRIPT_DIR/daemon-monitor-tail.sh"
 # Drain timeout for --stop. Wrappers may be mid-phase; the drain is a grace period
 # after which we escalate to an exact, persisted-identity tmux kill.
 STOP_DRAIN_TIMEOUT="${GAAI_STOP_DRAIN_TIMEOUT:-600}"
+# Grace a TERMed phase agent gets before SIGKILL, and again for its wrapper to
+# finish handling that exit (preserving the interrupted work) before the wrapper
+# itself is escalated. 30s covers the agent chain's own TERM->KILL windows (the
+# impl `timeout --kill-after` is 15s, the loop-breaker watchdog 10s) with margin
+# for a final commit. A containment bound, not a quality gate: configurable.
+STOP_AGENT_GRACE="${GAAI_STOP_AGENT_GRACE:-30}"
+[[ "$STOP_AGENT_GRACE" =~ ^[0-9]+$ ]] || STOP_AGENT_GRACE=30
 TARGET_BRANCH="${GAAI_TARGET_BRANCH:-staging}"
 DAEMON_REL=".gaai/core/scripts/delivery-daemon.sh"
 START_REL=".gaai/core/scripts/daemon-start.sh"
@@ -1281,11 +1288,98 @@ _list_live_wrappers() {
   done
 }
 
+# ── Phase-agent reaping ────────────────────────────────────────────────────
+#
+# A wrapper's phase agent does not die with the wrapper. `timeout` leads a
+# process group of its own and the node spawner starts the model CLI in a new
+# session, so neither the pane hangup of `tmux kill-session` nor a SIGKILL of the
+# wrapper pid reaches it: the chain is reparented to init and keeps writing to
+# the Story worktree after the stop has reported success.
+#
+# The dispatch library records each agent as `<sid>.agent.pid` (pid + start
+# stamp). That record is the only way an agent is found here — never a command
+# line pattern — and the stamp is re-proven immediately before every signal, so
+# a reused pid is never signalled. A record that cannot be proven (no stamp, or
+# the live stamp unreadable) is left in place and not acted on.
+
+# Prints `sid|pid|stamp` for each recorded agent whose identity still holds.
+# Records whose process provably ended (pid gone, or pid reused under another
+# start stamp) are settled and removed.
+_list_live_agents() {
+  local rec sid apid astamp now
+  [[ -d "$LOCK_DIR" ]] || return 0
+  for rec in "$LOCK_DIR"/*.agent.pid; do
+    [[ -f "$rec" ]] || continue
+    sid=$(basename "$rec" .agent.pid)
+    apid=$(head -1 "$rec" 2>/dev/null || echo "")
+    astamp=$(sed -n 's/^incarnation=//p' "$rec" 2>/dev/null | head -1) || astamp=""
+    [[ "$apid" =~ ^[1-9][0-9]*$ && "$apid" -gt 1 && "$apid" != "$$" ]] || continue
+    if ! kill -0 "$apid" 2>/dev/null; then
+      rm -f "$rec" 2>/dev/null || true
+      continue
+    fi
+    [[ -n "$astamp" ]] || continue
+    now=$(_gaai_home_incarnation_fixed "$apid" 2>/dev/null || echo "")
+    [[ -n "$now" ]] || continue
+    if [[ "$now" != "$astamp" ]]; then
+      rm -f "$rec" 2>/dev/null || true
+      continue
+    fi
+    printf '%s|%s|%s\n' "$sid" "$apid" "$astamp"
+  done
+  return 0
+}
+
+# _signal_agent <SIG> <pid> <stamp> — signal one recorded agent after re-proving
+# its identity. An agent that leads its own process group (`timeout` does) is
+# signalled as a group, which is exactly its own subtree; otherwise the pid alone
+# is signalled, so a group shared with a wrapper is never hit.
+_signal_agent() {
+  local sig="$1" apid="$2" astamp="$3" now pgid
+  now=$(_gaai_home_incarnation_fixed "$apid" 2>/dev/null || echo "")
+  [[ -n "$now" && "$now" == "$astamp" ]] || return 1
+  pgid=$(ps -o pgid= -p "$apid" 2>/dev/null | tr -d ' ') || pgid=""
+  if [[ "$pgid" == "$apid" ]]; then
+    kill -"$sig" -- "-$apid" 2>/dev/null || true
+  else
+    kill -"$sig" "$apid" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# TERM every live recorded agent, give them STOP_AGENT_GRACE to exit on their
+# own (the TERM path lets an agent finish its last write and lets its wrapper
+# observe the executor exit), then SIGKILL whatever is still proven live.
+_reap_phase_agents() {
+  local entries sid apid astamp waited=0
+  entries=$(_list_live_agents)
+  [[ -n "$entries" ]] || return 0
+  while IFS='|' read -r sid apid astamp; do
+    [[ -n "$sid" && -n "$apid" ]] || continue
+    echo "  SIGTERM phase agent of $sid (PID $apid)"
+    _signal_agent TERM "$apid" "$astamp" || true
+  done <<< "$entries"
+  while (( waited < STOP_AGENT_GRACE )); do
+    [[ -z "$(_list_live_agents)" ]] && { echo "  Phase agents exited after ${waited}s."; return 0; }
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  entries=$(_list_live_agents)
+  while IFS='|' read -r sid apid astamp; do
+    [[ -n "$sid" && -n "$apid" ]] || continue
+    echo "  SIGKILL phase agent of $sid (PID $apid) — no exit within ${STOP_AGENT_GRACE}s"
+    _signal_agent KILL "$apid" "$astamp" || true
+  done <<< "$entries"
+}
+
 _drain_wrappers() {
   local entries
   entries=$(_list_live_wrappers)
   if [[ -z "$entries" ]]; then
     echo "  No live wrappers to drain."
+    # A wrapper that already died (crash, earlier kill) can have left its agent
+    # running; with no wrapper left to wait for, it is reaped now.
+    _reap_phase_agents
     return 0
   fi
   local count
@@ -1298,11 +1392,25 @@ _drain_wrappers() {
   done <<< "$entries"
   local waited=0 step=5
   while (( waited < STOP_DRAIN_TIMEOUT )); do
-    [[ -z "$(_list_live_wrappers)" ]] && { echo "  All wrappers exited cleanly after ${waited}s."; return 0; }
+    [[ -z "$(_list_live_wrappers)" ]] && { echo "  All wrappers exited cleanly after ${waited}s."; _reap_phase_agents; return 0; }
     sleep "$step"
     waited=$(( waited + step ))
   done
-  echo "  Drain timeout (${STOP_DRAIN_TIMEOUT}s) reached. Escalating to exact tmux kill-session..."
+  # A wrapper's SIGTERM only asks it to stop after the current phase, and Bash
+  # defers the trap until the phase's foreground command returns — a phase can
+  # outlast the drain by hours. End the phase agents first, while their wrappers
+  # are still alive: each wrapper then sees its executor exit and runs its normal
+  # failure handling, which commits the interrupted work, and exits at the next
+  # loop boundary because its interrupt flag is already set.
+  echo "  Drain timeout (${STOP_DRAIN_TIMEOUT}s) reached. Ending in-flight phase agents first..."
+  _reap_phase_agents
+  waited=0
+  while (( waited < STOP_AGENT_GRACE )); do
+    [[ -z "$(_list_live_wrappers)" ]] && { echo "  All wrappers exited after their phase agent ended."; _reap_phase_agents; return 0; }
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  echo "  Wrappers still live after ${STOP_AGENT_GRACE}s. Escalating to exact tmux kill-session..."
   local stragglers
   stragglers=$(_list_live_wrappers)
   while IFS='|' read -r sid pid; do
@@ -1325,6 +1433,9 @@ _drain_wrappers() {
       kill -KILL "$pid" 2>/dev/null || true
     done <<< "$final"
   fi
+  # Anything a straggler launched after the first reap, or that survived it,
+  # would otherwise outlive the wrapper that owned it.
+  _reap_phase_agents
 }
 
 # ── Shared bootstrap: identity, lock, socket ──────────────────────────────

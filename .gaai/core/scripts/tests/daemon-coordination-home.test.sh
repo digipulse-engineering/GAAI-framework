@@ -525,26 +525,33 @@ else
   fail "TC19-1: the rebind still refuses without recording a cause"
 fi
 
-if sed -n '/^_rebind_target_after_self_claim()/,/^}/p' "$DD" | grep -q 'foreign='; then
+# Extract each body once and search the captured text. Piping `sed` straight into
+# `grep -q` is unsound under pipefail: grep exits on its first match, and GNU sed,
+# which writes to a pipe in 4 KiB blocks, then takes SIGPIPE on its next block and
+# fails the pipeline — so a body longer than one block reads as "marker absent".
+_rebind_body=$(sed -n '/^_rebind_target_after_self_claim()/,/^}/p' "$DD")
+_home_check_body=$(sed -n '/^_per_cycle_home_check()/,/^}/p' "$DD")
+
+if grep -q 'foreign=' <<<"$_rebind_body"; then
   pass "TC19-2: the rebind separates foreign commits from this daemon's own projection"
 else
   fail "TC19-2: the rebind does not identify the foreign commits"
 fi
 
-if sed -n '/^_per_cycle_home_check()/,/^}/p' "$DD" | grep -q '_GAAI_HOME_REFUSAL_REPORTED'; then
+if grep -q '_GAAI_HOME_REFUSAL_REPORTED' <<<"$_home_check_body"; then
   pass "TC19-3: the per-cycle refusal is reported per distinct advance, not per poll"
 else
   fail "TC19-3: the per-cycle refusal still repeats on every poll"
 fi
 
-if sed -n '/^_per_cycle_home_check()/,/^}/p' "$DD" | grep -q 'an authorized restart'; then
+if grep -q 'an authorized restart' <<<"$_home_check_body"; then
   pass "TC19-4: the refusal names the remedy"
 else
   fail "TC19-4: the refusal does not name the remedy"
 fi
 
 # The refusal must still be fail-closed: no rebind, no repair, no continuation.
-if sed -n '/^_per_cycle_home_check()/,/^}/p' "$DD" | grep -q 'return 1'; then
+if grep -q 'return 1' <<<"$_home_check_body"; then
   pass "TC19-5: a refused home still stops the cycle"
 else
   fail "TC19-5: a refused home no longer stops the cycle"
