@@ -614,3 +614,73 @@ describe('source scans — no retired Cloud execution metadata', () => {
   });
 
 });
+
+// ===========================================================================
+// Phase-agent tool denials — the impl child is denied forge-write commands
+// ===========================================================================
+//
+// A defence-in-depth belt, not a security boundary (see PHASE_DENIED_TOOLS in
+// the adapter). The expected list is spelled out here rather than imported, so
+// the test states the contract instead of echoing the implementation.
+
+const EXPECTED_DENIED_TOOLS = [
+  'Bash(git push *)',
+  'Bash(gh pr create *)',
+  'Bash(gh pr merge *)',
+  'Bash(gh pr edit *)',
+  'Bash(gh pr close *)',
+  'Bash(gh pr ready *)',
+  'Bash(gh pr comment *)',
+];
+const DISPATCH_SRC_PATH = join(__dirnameHere, '..', '..', '..', 'scripts', 'daemon-dispatch.sh');
+
+function deniedToolsFromArgv(args) {
+  const i = args.indexOf('--disallowedTools');
+  if (i < 0) return null;
+  const values = [];
+  for (let j = i + 1; j < args.length && !args[j].startsWith('-'); j++) values.push(args[j]);
+  return { values, next: args[i + 1 + values.length] };
+}
+
+describe('phase-agent tool denials — impl child argv', () => {
+
+  for (const [label, run] of [['primary', runImplPrimary], ['secondary', runImplSecondary]]) {
+    test(`${label} route passes --disallowedTools with the full forge-write list`, async () => {
+      if (label === 'secondary') setImplEnv();
+      const calls = setupSpawnCapture();
+      await run();
+      assert.ok(calls.length >= 1, 'the child must have been spawned');
+      for (const call of calls) {
+        const denied = deniedToolsFromArgv(call.args);
+        assert.ok(denied, '--disallowedTools must be present on every impl spawn');
+        assert.deepEqual(denied.values, EXPECTED_DENIED_TOOLS);
+        assert.ok(typeof denied.next === 'string' && denied.next.startsWith('-'),
+          'the variadic list must be terminated by an option, never by a positional');
+        assert.ok(call.args.includes('--dangerously-skip-permissions'));
+      }
+    });
+  }
+
+  test('read-only forge queries stay allowed (QA and impl may read CI)', async () => {
+    const calls = setupSpawnCapture();
+    await runImplPrimary();
+    const denied = deniedToolsFromArgv(calls[0].args);
+    assert.ok(denied, '--disallowedTools must be present');
+    const joined = denied.values.join('\n');
+    for (const readOnly of ['gh pr view', 'gh pr checks', 'gh pr list', 'gh run', 'gh api']) {
+      assert.ok(!joined.includes(readOnly), `${readOnly} must not be denied`);
+    }
+  });
+
+  test('daemon-dispatch.sh applies the same list to the plan and QA invocations', () => {
+    const src = readFileSync(DISPATCH_SRC_PATH, 'utf8');
+    const m = src.match(/^GAAI_PHASE_DENIED_TOOLS=\(\n([\s\S]*?)\n\)$/m);
+    assert.ok(m, 'GAAI_PHASE_DENIED_TOOLS array must exist in daemon-dispatch.sh');
+    const shellList = m[1].split('\n').map(l => l.trim()).filter(Boolean)
+      .map(l => l.replace(/^"|"$/g, ''));
+    assert.deepEqual(shellList, EXPECTED_DENIED_TOOLS);
+    const uses = src.match(/--disallowedTools "\$\{GAAI_PHASE_DENIED_TOOLS\[@\]\}"/g) || [];
+    assert.equal(uses.length, 2, 'exactly the plan and QA invocations carry the list');
+  });
+
+});

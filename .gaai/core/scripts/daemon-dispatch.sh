@@ -2852,6 +2852,115 @@ _restore_delivery_governance() {
   done
 }
 
+# ── Committed governance edits are neutralized at both admission boundaries ──
+# _restore_delivery_governance above only reverts what a phase left UNcommitted.
+# A phase agent that commits an edit to the backlog (for example, marking its own
+# row as QA-passed with a PR URL) gets that edit past the restore, onto the story branch, and — unless the reconcile merge happens to
+# conflict — into the admitted candidate. Lifecycle state has exactly one writer,
+# the daemon, so any difference the branch carries in the backlog against
+# its merge-base with the target is reverted here, in the working tree and index,
+# and lands in the next commit the caller makes (the pre-QA seal or the final
+# commit-phase commit). Deterministic and independent of the executor: it judges
+# the committed tree, not what the agent was told or which tool it used.
+#
+# Only the backlog is neutralized. The skills indexes that
+# _restore_delivery_governance also names are deliberately excluded: a Story that
+# adds or changes a skill legitimately ships its index edit from the story branch
+# (nothing regenerates the index after a squash merge), so reverting a committed
+# index edit would silently drop a deliverable. Nothing else is ever touched. Returns non-zero when the repository or its merge-base cannot
+# be read (before anything is changed) or a restore fails; callers fail closed.
+# Every command is guarded so the function is safe under both the daemon's
+# `set -e` and the wrapper's `set +e`. The [GOVERNANCE-NEUTRALIZED] log line is
+# the operator contract; notify_escalation_inline is called only where it is
+# defined (daemon context), since the phase wrapper does not load it.
+_neutralize_committed_governance() {
+  local repo="$1" story_id="$2" boundary="${3:-pre_qa}" base="${TARGET_BRANCH:-staging}"
+  local merge_base path head_blob base_blob
+  local changed=()
+  [[ -n "$repo" && -d "$repo" ]] || return 1
+  git -C "$repo" rev-parse --verify -q HEAD >/dev/null 2>&1 || return 1
+  merge_base=$(git -C "$repo" merge-base HEAD "origin/${base}" 2>/dev/null) || return 1
+  [[ "$merge_base" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || return 1
+  for path in .gaai/project/contexts/backlog/active.backlog.yaml; do
+    head_blob=$(git -C "$repo" rev-parse -q --verify "HEAD:${path}" 2>/dev/null) || head_blob=""
+    base_blob=$(git -C "$repo" rev-parse -q --verify "${merge_base}:${path}" 2>/dev/null) || base_blob=""
+    [[ "$head_blob" == "$base_blob" ]] && continue
+    if [[ -n "$base_blob" ]]; then
+      git -C "$repo" restore --source="$merge_base" --staged --worktree -- "$path" \
+        >/dev/null 2>&1 || return 1
+    else
+      git -C "$repo" rm -q --cached --ignore-unmatch -- "$path" >/dev/null 2>&1 || return 1
+      rm -f -- "${repo}/${path}" 2>/dev/null || return 1
+    fi
+    changed+=("$path")
+  done
+  (( ${#changed[@]} > 0 )) || return 0
+  local _c paths_csv="" commits_csv=""
+  for _c in "${changed[@]}"; do paths_csv="${paths_csv:+${paths_csv},}${_c}"; done
+  while IFS= read -r _c; do
+    if [[ -n "$_c" ]]; then commits_csv="${commits_csv:+${commits_csv},}${_c}"; fi
+  done < <(git -C "$repo" log --format=%h "${merge_base}..HEAD" -- "${changed[@]}" 2>/dev/null || true)
+  echo "[GOVERNANCE-NEUTRALIZED] story=${story_id} boundary=${boundary} paths=${paths_csv} commits=${commits_csv:-none}"
+  if declare -F notify_escalation_inline >/dev/null 2>&1; then
+    notify_escalation_inline "$story_id" "governance_neutralized" \
+      "A phase committed daemon-owned governance edits (${paths_csv}; commits ${commits_csv:-none}); they were reverted at the ${boundary} boundary" \
+      || true
+  fi
+  return 0
+}
+
+# ── Early publication by a phase agent (observation only) ────────────────────
+# Publication belongs to the commit phase. An open pull request for the story
+# branch at the pre-QA boundary was therefore opened by something else — in
+# practice, a phase agent holding the operator's forge credentials. This only
+# reports it: one bounded, read-only query; no close, comment or label; every
+# failure of the query itself is ignored. The operator decides what to do. The
+# probe is advisory, so without a bounded executor (no timeout/gtimeout) it is
+# skipped rather than risk stalling admission on a hung forge call.
+#
+# Signal: the [PHASE-PUBLICATION] log line is the contract. notify_escalation_inline
+# is a daemon-context helper that the phase wrapper does not load; it is called
+# only where it is defined, so inside a phase the log line is the operator signal.
+_detect_phase_publication() {
+  local repo="$1" story_id="$2" pr_url="" to_cmd
+  local to_prefix=()
+  command -v gh >/dev/null 2>&1 || return 0
+  to_cmd=$(_resolve_timeout_cmd 2>/dev/null) || to_cmd=""
+  [[ -n "$to_cmd" ]] || return 0
+  to_prefix=("$to_cmd" "${GAAI_PUBLICATION_PROBE_TIMEOUT_SEC:-20}s")
+  pr_url=$(cd "$repo" 2>/dev/null && GH_PROMPT_DISABLED=1 "${to_prefix[@]}" gh pr list \
+    --head "story/${story_id}" --state open --json url --jq '.[0].url' 2>/dev/null) || pr_url=""
+  pr_url=$(printf '%s' "$pr_url" | head -1)
+  [[ -n "$pr_url" && "$pr_url" != "null" ]] || return 0
+  echo "[PHASE-PUBLICATION] story=${story_id} pr=${pr_url} — a pull request exists before the commit phase; it was not opened by the daemon's publication and must not be merged before QA"
+  if declare -F notify_escalation_inline >/dev/null 2>&1; then
+    notify_escalation_inline "$story_id" "phase_publication" \
+      "Pull request ${pr_url} was opened before the commit phase; do not merge it before QA" || true
+  fi
+  return 0
+}
+
+# ── Claude phase-agent tool denials (defence in depth, NOT a security boundary) ──
+# Claude Code enforces deny rules even under --dangerously-skip-permissions, so
+# these stop the forms a phase agent usually writes: pushing, and opening,
+# editing, merging, closing or commenting on a pull request. They match the
+# command text only. `git -C . push`, `bash -c "…"`, an alias, a script or a
+# direct API call are not caught, so they are a belt, not the boundary. The
+# boundary is that the agent should not hold forge write credentials at all.
+# Read-only forge queries (gh pr view/checks/list, gh run, gh api) stay allowed:
+# QA reads CI. The impl spawner carries the same list; a test keeps them equal.
+# Only the claude harness reads these arguments; the codex branch of
+# _run_claude_with_loop_breaker builds its own argv and ignores them.
+GAAI_PHASE_DENIED_TOOLS=(
+  "Bash(git push *)"
+  "Bash(gh pr create *)"
+  "Bash(gh pr merge *)"
+  "Bash(gh pr edit *)"
+  "Bash(gh pr close *)"
+  "Bash(gh pr ready *)"
+  "Bash(gh pr comment *)"
+)
+
 _reconcile_admission_base() {
   local repo="$1" base="${TARGET_BRANCH:-staging}"
   git -C "$repo" fetch origin "$base" --quiet 2>/dev/null || return 1
@@ -2910,11 +3019,16 @@ _prepare_pre_qa_admission() {
     ":(exclude,top,literal).gaai/project/contexts/artefacts/qa-reports/${story_id}.qa-report.md" \
     ":(exclude,top,literal).gaai/project/contexts/artefacts/qa-reports/${story_id}.qa-verdict.json" \
     ":(exclude,top,literal).gaai/project/contexts/artefacts/memory-deltas/${story_id}.memory-delta.md")
+  _detect_phase_publication "$repo" "$story_id" || true
   _restore_delivery_governance "$repo"
-  git -C "$repo" add -A 2>/dev/null || {
-    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_stage_failed; return 1; }
+  # Fetched first so the merge-base neutralization reverts to is computed
+  # against the current target.
   git -C "$repo" fetch origin "$base" --quiet 2>/dev/null || {
     _route_admission_block "$story_id" "$trace_id" pre_qa blocked:base_fetch_failed; return 1; }
+  _neutralize_committed_governance "$repo" "$story_id" pre_qa || {
+    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:governance_neutralize_failed; return 1; }
+  git -C "$repo" add -A 2>/dev/null || {
+    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_stage_failed; return 1; }
   if git -C "$repo" diff --cached --quiet "origin/${base}" -- "${candidate_paths[@]}"; then
     _route_admission_block "$story_id" "$trace_id" pre_qa blocked:empty_candidate_diff
     return 1
@@ -3947,6 +4061,7 @@ Justify each marker in one line. Err toward REVISE over KEEP when uncertain.'
         --max-turns "$GAAI_PLAN_MAX_TURNS" \
         --output-format stream-json \
         --verbose \
+        --disallowedTools "${GAAI_PHASE_DENIED_TOOLS[@]}" \
         --dangerously-skip-permissions \
         ${_plan_mcp_args[@]+"${_plan_mcp_args[@]}"}
   )
@@ -5047,6 +5162,7 @@ handle_qa_phase() {
       --max-turns "$GAAI_QA_MAX_TURNS" \
       --output-format stream-json \
       --verbose \
+      --disallowedTools "${GAAI_PHASE_DENIED_TOOLS[@]}" \
       --dangerously-skip-permissions \
       ${_qa_mcp_args[@]+"${_qa_mcp_args[@]}"}
   claude_exit=$?
@@ -6193,6 +6309,18 @@ ${qa_snippet}"
   # git restore --source=HEAD --staged --worktree clobbers both index and WD.
   # Non-fatal if a path is absent/untracked at HEAD (AC4).
   _restore_delivery_governance "$worktree_path"
+
+  # ── Neutralize governance edits a phase COMMITTED (QA included) ───────────
+  # The restore above reaches only uncommitted edits, of all three paths. A
+  # committed edit to the backlog alone (the skills indexes are legitimate Story
+  # deliverables and are kept) is reverted here, so the revert is part of the
+  # commit below and therefore of the exact SHA the final
+  # admission seals and the publication loop pushes.
+  if ! _neutralize_committed_governance "$worktree_path" "$story_id" final; then
+    echo "[ERROR] ${story_id} handle_commit_phase: committed governance edits could not be neutralized [class=COMMIT_FAILED]"
+    _route_admission_block "$story_id" "$trace_id" final blocked:governance_neutralize_failed
+    return 1
+  fi
 
   # ── Publish provenance (daemon-authored, post-agent) ─────────────────────
   # The authoritative record lives in daemon state precisely so no phase agent
