@@ -37,6 +37,10 @@ trap cleanup EXIT
 unset GIT_EDITOR GAAI_PLAN_MODEL GAAI_QA_MODEL GAAI_IMPL_MODEL
 export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
 export HOME="$SANDBOX/home"; mkdir -p "$HOME"
+# GIT_CONFIG_GLOBAL, when inherited (the daemon exports a per-launch one), wins
+# over HOME: without this, the --global writes below land in the caller's live
+# config — core.hooksPath=/dev/null would disable every later suite's hooks.
+export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"
 git config --global user.email test@example.com
 git config --global user.name "GAAI Test"
 git config --global init.defaultBranch staging
