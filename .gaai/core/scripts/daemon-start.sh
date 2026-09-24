@@ -1458,15 +1458,51 @@ _release_and_exit() { _gaai_home_lock_release; exit "${1:-1}"; }
 # side of the same invariant the entry-block trap enforces on a clean exit. Bounded
 # to a path this repository's own record actually names, under this process's own
 # private scope root; never a guess, never another lifecycle's directory.
+#
+# With an <expected_pid> argument, this is the ownership-gated form: a scope
+# under the account-wide "$GAAI_PRIVATE_ROOT/scope/" is only ever removed when
+# it is provably named by that expected invocation (see _owner_scope_state).
+# With no argument, behavior is byte-identical to before — every existing
+# unconditional caller is unaffected.
 _gaai_reclaim_owner_scope() {
+  local _expected_pid="${1:-}"
   [[ -r "$OWNER_FILE" ]] || return 0
   local _rec_scope
   _rec_scope="$(_owner_field "$OWNER_FILE" launch_scope 2>/dev/null || true)"
+  if [[ -n "$_expected_pid" ]]; then
+    case "$(_owner_scope_state "$_expected_pid" "$_rec_scope")" in
+      owned) rm -rf "$_rec_scope" 2>/dev/null || true; return 0 ;;
+      absent) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
   if [[ -n "$_rec_scope" && -d "$_rec_scope" && ! -L "$_rec_scope" \
         && "$_rec_scope" == "$GAAI_PRIVATE_ROOT/scope/"* ]]; then
     rm -rf "$_rec_scope" 2>/dev/null || true
   fi
   return 0
+}
+
+# Read-only scope-ownership prover. The account-wide scope root ($GAAI_PRIVATE_ROOT/scope, shared by every invocation on
+# this UID) makes a bare textual-prefix test insufficient: a recorded launch_scope
+# could name a directory another live invocation is using. The scope's own naming
+# contract (`l.$$.$RANDOM`, entry block :323) is the ownership evidence — for a
+# launched daemon, that $$ IS the recorded child_pid (proven at bind time, :1827).
+#
+# Prints exactly one of: absent | foreign | owned. Never mutates anything.
+_owner_scope_state() {
+  local _expected_pid="$1" _scope="$2"
+  [[ -n "$_scope" ]] || { printf 'absent'; return 0; }
+  [[ -d "$_scope" && ! -L "$_scope" ]] || { printf 'absent'; return 0; }
+  case "$_scope" in
+    "$GAAI_PRIVATE_ROOT/scope/"*) ;;
+    *) printf 'foreign'; return 0 ;;
+  esac
+  local _base="${_scope##*/}"
+  case "$_base" in
+    l."$_expected_pid".*) printf 'owned' ;;
+    *) printf 'foreign' ;;
+  esac
 }
 
 # Revalidate a recorded owner from durable evidence alone. Prints the verdict:
@@ -1530,6 +1566,98 @@ _owner_verdict() {
     [[ -n "$_now_pane" && "$_now_pane" == "$_pane_inc" ]] || { printf 'ambiguous'; return 0; }
   fi
   printf 'live'
+}
+
+# Read-only Phase-A prover for a settlement disposal decision. `_owner_verdict` above stays
+# the single liveness prover `do_start`/`do_status` consume — this does NOT re-derive
+# liveness, byte-identical, untouched. It proves only what a `settled` verdict does
+# not: the recorded child is provably dead, the observed private server IS the
+# recorded server (PID + incarnation, closing the two gaps `_owner_verdict` leaves —
+# no server_pid comparison, incarnation checked only when recorded), and the
+# attempt directory + launch scope are provably owned by the recorded attempt/child
+# — never a guess, never another lifecycle's or another sibling attempt's evidence.
+#
+# Caller-guaranteed precondition (A0): called only when `_owner_state` is one of
+# pending|bound|running AND `_owner_verdict` already returned `settled` — `none`
+# (settled before any evidence is read) and `corrupt` never reach this function.
+#
+# Performs NO destructive action: the only `kill` is `kill -0`. Prints exactly one
+# of `proven` or a failure token; every failure token is AC1/AC5(e) evidence that
+# the caller passes to `_gaai_home_refuse process_authority_invalid` — no new
+# refusal reason, no new action (always `operator_disposition_required`).
+_settled_disposal_verdict() {
+  local _sock _sess _child_pid _srv_pid_rec _srv_inc_rec _attempt _attempt_dir
+  local _observed_pid _observed_inc _rec_scope
+
+  # A1 — identity already proven equal by _owner_verdict's own settled path, but
+  # re-checked here directly from evidence rather than trusting a string result.
+  _sock="$(_owner_field "$OWNER_FILE" socket)"
+  _sess="$(_owner_field "$OWNER_FILE" session)"
+  [[ "$_sock" == "$TMUX_SOCKET" && "$_sess" == "$TMUX_SESSION" ]] \
+    || { printf 'owner_role=identity_drift_at_stop'; return 0; }
+
+  # A2 — recorded child_pid must be present and well-formed. A `pending` record
+  # carries no child_pid at all (written only at the `bound` transition, :1879), so
+  # this is what makes a pending-with-empty-server input refuse (founder F16).
+  _child_pid="$(_owner_field "$OWNER_FILE" child_pid)"
+  if [[ -z "$_child_pid" ]]; then
+    printf 'settlement_role=child_evidence_absent'; return 0
+  fi
+  if [[ ! "$_child_pid" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'settlement_role=child_evidence_malformed'; return 0
+  fi
+
+  # A3 — the recorded child must be provably dead before anything is disposed of.
+  if kill -0 "$_child_pid" 2>/dev/null; then
+    printf 'settlement_role=child_persisted'; return 0
+  fi
+
+  # A4 — recorded server identity must be complete. Startup itself permits an empty
+  # incarnation (:1764 in the pre-patch numbering), so this conjunct is what makes
+  # that historical gap non-authorizing for disposal specifically.
+  _srv_pid_rec="$(_owner_field "$OWNER_FILE" server_pid)"
+  _srv_inc_rec="$(_owner_field "$OWNER_FILE" server_incarnation)"
+  if [[ -z "$_srv_pid_rec" || ! "$_srv_pid_rec" =~ ^[1-9][0-9]*$ || -z "$_srv_inc_rec" ]]; then
+    printf 'settlement_role=server_evidence_incomplete'; return 0
+  fi
+
+  # A5 — the observed server on the recorded socket must BE the recorded server.
+  # `_owner_verdict` never makes this comparison; this closes that gap without
+  # touching `_owner_verdict` itself.
+  _observed_pid="$(_server_pid 2>/dev/null || echo "")"
+  [[ -n "$_observed_pid" ]] || { printf 'settlement_role=server_unobservable'; return 0; }
+  [[ "$_observed_pid" == "$_srv_pid_rec" ]] \
+    || { printf 'settlement_role=server_identity_drift'; return 0; }
+
+  # A6 — and its incarnation must match, unconditionally (not "only if recorded").
+  _observed_inc="$(_gaai_home_incarnation "$_observed_pid" 2>/dev/null || echo "")"
+  [[ -n "$_observed_inc" && "$_observed_inc" == "$_srv_inc_rec" ]] \
+    || { printf 'settlement_role=server_identity_drift'; return 0; }
+
+  # A7 — the attempt directory must be provably the exact one this record names,
+  # never a sibling's. A bare textual-prefix test cannot distinguish a sibling
+  # attempt under the same $LAUNCH_ROOT; exact-name equality can.
+  _attempt="$(_owner_field "$OWNER_FILE" attempt)"
+  _attempt_dir="$(_owner_field "$OWNER_FILE" attempt_dir)"
+  if [[ -z "$_attempt" || "$_attempt" == *"/"* || "$_attempt" == "." || "$_attempt" == ".." ]]; then
+    printf 'attempt_role=ownership_unproven'; return 0
+  fi
+  if [[ "$_attempt_dir" != "$LAUNCH_ROOT/$_attempt" ]]; then
+    printf 'attempt_role=ownership_unproven'; return 0
+  fi
+  if [[ -e "$_attempt_dir" ]] && { [[ -L "$_attempt_dir" ]] || [[ ! -d "$_attempt_dir" ]]; }; then
+    printf 'attempt_role=ownership_unproven'; return 0
+  fi
+
+  # A8 — the launch scope, if any, must be owned by the recorded child (never a
+  # guess over the account-wide scope root shared by every invocation on this UID).
+  _rec_scope="$(_owner_field "$OWNER_FILE" launch_scope)"
+  case "$(_owner_scope_state "$_child_pid" "$_rec_scope")" in
+    owned|absent) ;;
+    *) printf 'scope_role=ownership_unproven'; return 0 ;;
+  esac
+
+  printf 'proven'
 }
 
 # ── Start ─────────────────────────────────────────────────────────────────
@@ -2034,6 +2162,59 @@ do_status() {
 # settlement uncertainty preserves the owner record, the session and the evidence,
 # and blocks another launch rather than guessing.
 
+# Phase B — acts ONLY after `_settled_disposal_verdict` has already
+# returned `proven`; never re-derives any of its conjuncts. Mirrors the full
+# live-stop path's own disposal ordering below (attempt artefacts by name -> rmdir
+# proof -> scope reclaim -> owner/pid removal -> kill-server -> exact socket unlink
+# -> rmdir LAUNCH_ROOT), with one deliberate omission: it never truncates
+# $LOG_FILE (AC5d) — that would destroy the incident evidence that makes a
+# settled-but-undisposed lifecycle diagnosable. Prints its own success/incomplete
+# report and returns 0 (complete) or 1 (incomplete — evidence preserved, not a
+# claim of success).
+_dispose_settled_lifecycle() {
+  local _sock _child_pid _attempt_dir _incomplete=0
+
+  $NO_DRAIN || _drain_wrappers
+
+  _attempt_dir="$(_owner_field "$OWNER_FILE" attempt_dir)"
+  # Identical by-name artefact list to the full path below — never recursive; the
+  # `rmdir` is the proof nothing unexplained was left behind (AC5f).
+  if [[ -n "$_attempt_dir" && "$_attempt_dir" == "$LAUNCH_ROOT/"* && -d "$_attempt_dir" && ! -L "$_attempt_dir" ]]; then
+    rm -f "$_attempt_dir"/launcher.sh "$_attempt_dir"/release.fifo "$_attempt_dir"/secret.env \
+          "$_attempt_dir"/manifest "$_attempt_dir"/args "$_attempt_dir"/tmux.conf \
+          "$_attempt_dir"/ack.launcher "$_attempt_dir"/ack.ready "$_attempt_dir"/ack.child_failed \
+          "$_attempt_dir"/forge.cred \
+          2>/dev/null || true
+    if ! rmdir "$_attempt_dir" 2>/dev/null; then
+      echo "  note: $_attempt_dir still holds unrecognised content and is preserved for inspection"
+      _incomplete=1
+    fi
+  fi
+
+  # Ownership-gated reclaim (the step-1 optional-argument form) — never the bare,
+  # unconditional form the full path below still uses for ITS OWN distinct scope.
+  _child_pid="$(_owner_field "$OWNER_FILE" child_pid)"
+  _gaai_reclaim_owner_scope "$_child_pid"
+
+  _sock="$(_owner_field "$OWNER_FILE" socket)"
+  rm -f "$OWNER_FILE" 2>/dev/null || true
+  rm -f "$PID_FILE" 2>/dev/null || true
+  _tmux kill-server 2>/dev/null || true
+  if [[ -n "$_sock" && "$_sock" == "$TMUX_SOCKET" && -e "$_sock" && ! -d "$_sock" ]]; then
+    rm -f "$_sock" 2>/dev/null || true
+  fi
+  rmdir "$LAUNCH_ROOT" 2>/dev/null || true
+  # $LOG_FILE is deliberately left alone on this path (AC5d) — no truncation here.
+
+  if [[ "$_incomplete" -eq 1 ]]; then
+    echo "  Settled lifecycle disposed of; attempt directory preserved for inspection. Log preserved."
+    _gaai_home_refuse process_authority_invalid 1 "settlement_role=attempt_residual" || true
+    return 1
+  fi
+  echo "✅ Settled lifecycle disposed of. Log preserved."
+  return 0
+}
+
 do_stop() {
   _bootstrap_identity
   _gaai_home_lock_acquire "$COMMON_DIR" || exit 1
@@ -2051,12 +2232,34 @@ do_stop() {
     _release_and_exit 1
   fi
 
-  if [[ "$_state" == "none" || "$_verdict" == "settled" ]]; then
+  # `state=none`: `_owner_verdict` returns `settled` here before reading anything
+  # (socket/session/identity/options), so it proves nothing about a lifecycle ever
+  # having existed. This path is untouched, byte-for-byte, by the disposal below.
+  if [[ "$_state" == "none" ]]; then
     echo "No daemon running."
     rm -f "$PID_FILE" 2>/dev/null || true
     $NO_DRAIN || _drain_wrappers
     _gaai_home_lock_release; trap '_gaai_launch_scope_cleanup' EXIT INT TERM
     return 0
+  fi
+
+  # `state` is pending|bound|running (state=corrupt already returned above) and
+  # `_owner_verdict` returned `settled` — a lifecycle that provably ended. Dispose
+  # of it only once `_settled_disposal_verdict` has proven every conjunct
+  # `_owner_verdict` does not cover; any other input preserves everything with a
+  # typed `operator_disposition_required` refusal instead of the prior
+  # "No daemon running." — a settled-but-undisposed lifecycle is not "no daemon".
+  if [[ "$_verdict" == "settled" ]]; then
+    local _dv
+    _dv="$(_settled_disposal_verdict)"
+    if [[ "$_dv" != "proven" ]]; then
+      _gaai_home_refuse process_authority_invalid 1 "$_dv" || true
+      _release_and_exit 1
+    fi
+    local _rc=0
+    _dispose_settled_lifecycle || _rc=$?
+    _gaai_home_lock_release; trap '_gaai_launch_scope_cleanup' EXIT INT TERM
+    return "$_rc"
   fi
 
   local _sock _sess _pid

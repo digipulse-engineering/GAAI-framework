@@ -596,6 +596,256 @@ esac
 
 echo ""
 echo "════════════════════════════════════════"
+echo "=== Settled-lifecycle disposal (--stop finishes its own disposal) ==="
+echo "════════════════════════════════════════"
+
+# s11_settled_fixture — leaves: owner state=running, a live but EMPTY private tmux
+# server on the recorded socket (exit-empty=off + remain-on-exit=on keep it alive
+# with no sessions), the exact socket present, and the recorded child_pid provably
+# dead. This is the exact production shape the Story observed (owner record + an
+# empty live server + a dead recorded child), and is what makes `_owner_verdict`
+# return `settled` on the empty-sessions branch — reachable regardless of the
+# child_pid field's value, which `_owner_verdict` never inspects.
+S11_SOCK=""; S11_SESS=""; S11_ATT=""; S11_CHILD=""
+s11_settled_fixture() {
+  fresh_home
+  gaai_run "$ROOT" "$START" >/dev/null 2>&1
+  S11_SOCK="$(socket_of)"; S11_SESS="$(session_of)"; S11_ATT="$(attempt_of)"
+  S11_CHILD="$(sed -n 's/^child_pid=//p' "$OWNER" | head -1)"
+  tmux -f /dev/null -S "$S11_SOCK" kill-session -t "=$S11_SESS" 2>/dev/null
+  local _w=0
+  while [[ "$_w" -lt 15 ]] && kill -0 "$S11_CHILD" 2>/dev/null; do sleep 1; _w=$(( _w + 1 )); done
+}
+
+# Every arm below EXCEPT the happy-path disposal (TC-S11-1, TC-S11-3) leaves the
+# real lifecycle undisposed by design (that is what "preserved" means) — so the
+# private tmux server this fixture started would otherwise survive into the next
+# arm's `fresh_home` and make its `daemon-setup.sh` refuse with `private_server_live`.
+# This force-teardown is test scaffolding only, bounded to the exact socket this
+# fixture itself started; it never sweeps ambient state.
+s11_force_teardown() {
+  [[ -n "$S11_SOCK" && -S "$S11_SOCK" ]] && tmux -f /dev/null -S "$S11_SOCK" kill-server 2>/dev/null
+  [[ -n "$S11_SOCK" ]] && rm -f "$S11_SOCK" 2>/dev/null
+  rm -rf "$LIFECYCLE" 2>/dev/null
+}
+
+# Shared assertion for every preservation control: the typed refusal action, and
+# every persisted path (owner, socket, attempt directory) still exactly in place.
+s11_assert_preserved() {
+  local _label="$1" _out="$2"
+  echo "$_out" | grep -q 'action=operator_disposition_required' \
+    && pass "$_label: action=operator_disposition_required" \
+    || fail "$_label: no operator_disposition_required action: $_out"
+  [[ -e "$OWNER" ]] && pass "$_label: the owner record survives" \
+                    || fail "$_label: the owner record was removed"
+  [[ -e "$S11_SOCK" ]] && pass "$_label: the socket survives" \
+                       || fail "$_label: the socket was removed"
+  [[ -d "$S11_ATT" ]] && pass "$_label: the attempt directory survives" \
+                      || fail "$_label: the attempt directory was removed"
+}
+
+echo ""
+echo "=== TC-S11-1: a proven-settled lifecycle is disposed of; setup then reaches and passes the gate (AC1, AC4, AC5a) ==="
+s11_settled_fixture
+S11_SCOPE="$(sed -n 's/^launch_scope=//p' "$OWNER" | head -1)"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"; RC=$?
+[[ "$RC" -eq 0 ]] && pass "TC-S11-1a: --stop exits 0 on a proven-settled lifecycle" \
+                  || fail "TC-S11-1a: --stop exited $RC: $OUT"
+[[ ! -e "$OWNER" ]] && pass "TC-S11-1b: the owner record is gone" || fail "TC-S11-1b: the owner record survives"
+[[ ! -d "$S11_ATT" ]] && pass "TC-S11-1c: the attempt directory is gone" || fail "TC-S11-1c: the attempt directory survives"
+[[ ! -e "$S11_SOCK" ]] && pass "TC-S11-1d: the socket is gone" || fail "TC-S11-1d: the socket survives"
+! tmux -f /dev/null -S "$S11_SOCK" list-sessions >/dev/null 2>&1 \
+  && pass "TC-S11-1e: no server answers on the recorded socket" || fail "TC-S11-1e: a server still answers"
+if find "$LIFECYCLE" "$PROJ" -name 'forge.cred' 2>/dev/null | grep -q .; then
+  fail "TC-S11-1f: forge.cred remains under the lifecycle/project tree"
+else
+  pass "TC-S11-1f: no forge.cred remains"
+fi
+[[ -z "$S11_SCOPE" || ! -e "$S11_SCOPE" ]] \
+  && pass "TC-S11-1g: the recorded launch scope directory is gone" || fail "TC-S11-1g: the launch scope survives"
+SETUP_OUT="$(gaai_run "$ROOT" "$SETUP" 2>&1)"
+echo "$SETUP_OUT" | grep -q 'lifecycle_role=' \
+  && fail "TC-S11-1h: daemon-setup.sh still refuses at the lifecycle gate: $SETUP_OUT" \
+  || pass "TC-S11-1h: daemon-setup.sh emits no lifecycle_role= refusal"
+tail -1 "$LIFECYCLE/trace" 2>/dev/null | grep -q 'event=forge_admitted' \
+  && pass "TC-S11-1i: setup's post-disposal run positively reached and passed the lifecycle gate (forge_admitted is the last traced event)" \
+  || fail "TC-S11-1i: the last trace event is not forge_admitted — the gate was not proven entered/passed: $(tail -1 "$LIFECYCLE/trace" 2>/dev/null)"
+# Unconditional safety-net teardown: on a patched daemon-start.sh this is a no-op
+# (disposal already killed the server and removed the socket); it exists so this
+# arm can never leave a real leftover private tmux server to contaminate every
+# later arm's `fresh_home` (observed against the unpatched script in the
+# checkpoint-5 falsification run: a surviving server made `daemon-setup.sh`
+# refuse `private_server_live`, which then broke every subsequent real start).
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-2: a live non-pane process recorded as child_pid preserves everything (AC1, AC2, AC5b) ==="
+s11_settled_fixture
+sleep 600 &
+S11_DECOY_PID=$!
+cp "$OWNER" "$ROOT/owner.bak"
+sed "s/^child_pid=.*/child_pid=$S11_DECOY_PID/" "$ROOT/owner.bak" > "$OWNER"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"; RC=$?
+[[ "$RC" -ne 0 ]] && pass "TC-S11-2a: --stop exits non-zero" || fail "TC-S11-2a: --stop exited 0: $OUT"
+echo "$OUT" | grep -q 'settlement_role=child_persisted' \
+  && pass "TC-S11-2b: settlement_role=child_persisted is reported" || fail "TC-S11-2b: $OUT"
+s11_assert_preserved "TC-S11-2c" "$OUT"
+kill "$S11_DECOY_PID" 2>/dev/null; wait "$S11_DECOY_PID" 2>/dev/null
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-3: --stop never reaches an unrelated tmux server on a different socket (AC3, AC5c) ==="
+s11_settled_fixture
+# The decoy lives under a short directory: a Unix socket path is capped (104
+# bytes on macOS), and a CI TMPDIR nested a few levels deep can push
+# "$ROOT/decoy.sock" past it. The decoy must also provably be running before
+# --stop, or a decoy that never started would read as "reached".
+S11_DECOY_DIR="$(mktemp -d /tmp/s11.XXXXXX)"
+S11_DECOY_SOCK="$S11_DECOY_DIR/decoy.sock"
+S11_DECOY_ERR="$(tmux -f /dev/null -S "$S11_DECOY_SOCK" new-session -d -s decoy 'exec /bin/sh -c "sleep 600"' 2>&1)"
+if tmux -f /dev/null -S "$S11_DECOY_SOCK" list-sessions >/dev/null 2>&1; then
+  pass "TC-S11-3-pre: the unrelated decoy server is running before --stop"
+else
+  fail "TC-S11-3-pre: the decoy server could not be started, so TC-S11-3b proves nothing: ${S11_DECOY_ERR:-no error text}"
+fi
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"; RC=$?
+[[ "$RC" -eq 0 ]] && pass "TC-S11-3a: the happy-path disposal still succeeds with an unrelated decoy server present" \
+                  || fail "TC-S11-3a: $OUT"
+tmux -f /dev/null -S "$S11_DECOY_SOCK" list-sessions >/dev/null 2>&1 \
+  && pass "TC-S11-3b: the unrelated decoy server on a different socket is untouched" \
+  || fail "TC-S11-3b: the decoy server was reached"
+tmux -f /dev/null -S "$S11_DECOY_SOCK" kill-server 2>/dev/null
+rm -rf "$S11_DECOY_DIR" 2>/dev/null
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-4: the disposal path never truncates the daemon log (AC5d) ==="
+s11_settled_fixture
+S11_LOG="$PROJ/.gaai/project/contexts/backlog/.delivery-daemon.log"
+mkdir -p "$(dirname "$S11_LOG")"
+printf 's11-log-sentinel\n' >> "$S11_LOG"
+gaai_run "$ROOT" "$START" --stop >/dev/null 2>&1
+[[ ! -e "$OWNER" ]] && pass "TC-S11-4a: the disposal actually happened (owner record gone)" \
+                    || fail "TC-S11-4a: the owner record survives — disposal did not run"
+grep -q 's11-log-sentinel' "$S11_LOG" 2>/dev/null \
+  && pass "TC-S11-4b: the sentinel survives the disposal — the log was not truncated" \
+  || fail "TC-S11-4b: the log was truncated on the disposal path"
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-5a: an empty recorded server_incarnation preserves everything (AC1, AC5e) ==="
+s11_settled_fixture
+cp "$OWNER" "$ROOT/owner.bak"
+sed 's/^server_incarnation=.*/server_incarnation=/' "$ROOT/owner.bak" > "$OWNER"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"
+echo "$OUT" | grep -q 'settlement_role=server_evidence_incomplete' \
+  && pass "TC-S11-5a-1: an empty server_incarnation names server_evidence_incomplete" || fail "TC-S11-5a-1: $OUT"
+s11_assert_preserved "TC-S11-5a-2" "$OUT"
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-5b: an observed server PID that differs from the record preserves everything (AC1, AC5e) ==="
+s11_settled_fixture
+cp "$OWNER" "$ROOT/owner.bak"
+sed "s/^server_pid=.*/server_pid=$$/" "$ROOT/owner.bak" > "$OWNER"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"
+echo "$OUT" | grep -q 'settlement_role=server_identity_drift' \
+  && pass "TC-S11-5b-1: a mismatched server_pid names server_identity_drift" || fail "TC-S11-5b-1: $OUT"
+s11_assert_preserved "TC-S11-5b-2" "$OUT"
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-5c: a malformed child_pid preserves everything (AC1, AC5e) ==="
+s11_settled_fixture
+cp "$OWNER" "$ROOT/owner.bak"
+sed 's/^child_pid=.*/child_pid=not-a-pid/' "$ROOT/owner.bak" > "$OWNER"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"
+echo "$OUT" | grep -q 'settlement_role=child_evidence_malformed' \
+  && pass "TC-S11-5c-1: a malformed child_pid names child_evidence_malformed" || fail "TC-S11-5c-1: $OUT"
+s11_assert_preserved "TC-S11-5c-2" "$OUT"
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-5d: a pending record with no child_pid refuses explicitly, never as 'No daemon running.' (AC1, AC2, AC5e) ==="
+fresh_home
+mkdir -p "$LIFECYCLE"
+printf 'schema=gaai-daemon-lifecycle/v1\nstate=pending\nattempt=orphan\nsocket=%s\nsession=%s\n' \
+  "$(gaai_run "$ROOT" "$START" --status 2>/dev/null | sed -n 's/^  socket: *//p')" \
+  "$(gaai_run "$ROOT" "$START" --status 2>/dev/null | sed -n 's/^  session: *//p')" > "$OWNER"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"
+echo "$OUT" | grep -q 'settlement_role=child_evidence_absent' \
+  && pass "TC-S11-5d-1: a pending record with no child_pid names child_evidence_absent" || fail "TC-S11-5d-1: $OUT"
+if echo "$OUT" | grep -q 'No daemon running'; then
+  fail "TC-S11-5d-2: --stop printed 'No daemon running.' despite a preserved lifecycle: $OUT"
+else
+  pass "TC-S11-5d-2: --stop did not print 'No daemon running.'"
+fi
+[[ -e "$OWNER" ]] && pass "TC-S11-5d-3: the owner record survives" || fail "TC-S11-5d-3: the owner record was removed"
+rm -f "$OWNER" 2>/dev/null
+
+echo ""
+echo "=== TC-S11-5e: a record naming a sibling attempt directory preserves everything; the sibling is untouched (AC1, AC5e) ==="
+s11_settled_fixture
+S11_SIBLING="$LIFECYCLE/launch/sibling-$$"
+mkdir -p "$S11_SIBLING"
+printf 'marker\n' > "$S11_SIBLING/marker.txt"
+cp "$OWNER" "$ROOT/owner.bak"
+sed "s#^attempt_dir=.*#attempt_dir=$S11_SIBLING#" "$ROOT/owner.bak" > "$OWNER"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"
+echo "$OUT" | grep -q 'attempt_role=ownership_unproven' \
+  && pass "TC-S11-5e-1: a sibling-pointing attempt_dir is refused" || fail "TC-S11-5e-1: $OUT"
+[[ -f "$S11_SIBLING/marker.txt" ]] \
+  && pass "TC-S11-5e-2: the sibling attempt directory and its marker are untouched" \
+  || fail "TC-S11-5e-2: the sibling was touched"
+s11_assert_preserved "TC-S11-5e-3" "$OUT"
+rm -rf "$S11_SIBLING" 2>/dev/null
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-5f: a record naming another live invocation's launch scope preserves everything; that scope is untouched (AC1, AC5e) ==="
+s11_settled_fixture
+sleep 600 &
+S11_OTHER_PID=$!
+S11_PRIV_ROOT="/tmp/.gaai-p-${UID:-0}"
+mkdir -p "$S11_PRIV_ROOT/scope"
+S11_OTHER_SCOPE="$S11_PRIV_ROOT/scope/l.$S11_OTHER_PID.s11test"
+mkdir -p "$S11_OTHER_SCOPE"
+printf 'marker\n' > "$S11_OTHER_SCOPE/marker.txt"
+cp "$OWNER" "$ROOT/owner.bak"
+sed "s#^launch_scope=.*#launch_scope=$S11_OTHER_SCOPE#" "$ROOT/owner.bak" > "$OWNER"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"
+echo "$OUT" | grep -q 'scope_role=ownership_unproven' \
+  && pass "TC-S11-5f-1: a foreign-owned launch scope is refused" || fail "TC-S11-5f-1: $OUT"
+[[ -f "$S11_OTHER_SCOPE/marker.txt" ]] \
+  && pass "TC-S11-5f-2: the other invocation's scope is untouched" || fail "TC-S11-5f-2: the other scope was touched"
+s11_assert_preserved "TC-S11-5f-3" "$OUT"
+kill "$S11_OTHER_PID" 2>/dev/null; wait "$S11_OTHER_PID" 2>/dev/null
+rm -rf "$S11_OTHER_SCOPE" 2>/dev/null
+s11_force_teardown
+
+echo ""
+echo "=== TC-S11-6: an unrecognised file in the attempt directory reports the disposition as incomplete, not success (AC1, AC5f) ==="
+s11_settled_fixture
+printf 'stray\n' > "$S11_ATT/manifest.tmp.999"
+OUT="$(gaai_run "$ROOT" "$START" --stop 2>&1)"; RC=$?
+[[ "$RC" -ne 0 ]] && pass "TC-S11-6a: --stop exits non-zero (incomplete, not success)" || fail "TC-S11-6a: $OUT"
+[[ ! -e "$OWNER" ]] && pass "TC-S11-6b: the owner record is gone" || fail "TC-S11-6b: the owner record survives"
+! tmux -f /dev/null -S "$S11_SOCK" list-sessions >/dev/null 2>&1 \
+  && pass "TC-S11-6c: the server is gone" || fail "TC-S11-6c: a server still answers"
+[[ ! -e "$S11_SOCK" ]] && pass "TC-S11-6d: the socket is gone" || fail "TC-S11-6d: the socket survives"
+[[ -d "$S11_ATT" && -f "$S11_ATT/manifest.tmp.999" ]] \
+  && pass "TC-S11-6e: the attempt directory and its unrecognised content are preserved" \
+  || fail "TC-S11-6e: the attempt directory or its unrecognised content was lost"
+echo "$OUT" | grep -q 'settlement_role=attempt_residual' \
+  && pass "TC-S11-6f: the incomplete disposition names settlement_role=attempt_residual" || fail "TC-S11-6f: $OUT"
+SETUP_OUT="$(gaai_run "$ROOT" "$SETUP" 2>&1)"
+echo "$SETUP_OUT" | grep -q 'lifecycle_role=launch_evidence' \
+  && pass "TC-S11-6g: daemon-setup.sh refuses on launch_evidence with the residual attempt still present" \
+  || fail "TC-S11-6g: $SETUP_OUT"
+s11_force_teardown
+
+echo ""
+echo "════════════════════════════════════════"
 echo "=== Cross-launch, status and setup identity isolation (AC1-AC5) ==="
 echo "════════════════════════════════════════"
 
