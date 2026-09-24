@@ -589,6 +589,447 @@ esac
 
 echo ""
 echo "════════════════════════════════════════"
+echo "=== Cross-launch, status and setup identity isolation (AC1-AC5) ==="
+echo "════════════════════════════════════════"
+
+S10_RUN=1
+command -v python3 >/dev/null 2>&1 || { echo "  BLOCKED: python3 absent; AC1-AC5 identity matrix cannot run here"; S10_RUN=0; }
+if [[ "$S10_RUN" -eq 1 ]]; then
+  git http-backend --help >/dev/null 2>&1 || command -v git-http-backend >/dev/null 2>&1 \
+    || [[ -x "$(git --exec-path 2>/dev/null)/git-http-backend" ]] \
+    || { echo "  BLOCKED: git-http-backend absent; AC1-AC5 identity matrix cannot run here"; S10_RUN=0; }
+fi
+
+if [[ "$S10_RUN" -eq 1 ]]; then
+
+s10_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+# Account-shared private root (same expression daemon-start.sh uses) — the
+# set-difference snapshot below is what lets teardown reclaim only the scope
+# directories THIS block created, never a concurrent invocation's.
+S10_PRIVATE_ROOT="/tmp/.gaai-p-${UID:-0}"
+S10_SCOPE_BEFORE_BLOCK="$(ls -1 "$S10_PRIVATE_ROOT/scope" 2>/dev/null || true)"
+
+# s10_poll_pause/resume <proj_dir> — deterministic marker-gated quiescence for
+# the pollable stub daemon (never a bare sleep): pause waits for its state file
+# to read idle, resume waits for it to read polling, so a zero-line assertion
+# and an overlap assertion are both grounded in an observed state, not timing.
+s10_poll_pause() {
+  rm -f "$1/.gaai-poll.marker"
+  gaai_wait_for 10 "$1/.gaai-poll.state" '^idle$' || true
+}
+s10_poll_resume() {
+  : > "$1/.gaai-poll.marker"
+  gaai_wait_for 10 "$1/.gaai-poll.state" '^polling$' || true
+}
+
+# s10_overlap_begin/end <origin_root> — the hold gate already built into
+# gaai_build_auth_origin, promoted to a helper. begin blocks (bounded) until
+# the origin reports a request is actually held inside it — i.e. the
+# incumbent's own operation is provably in flight, not merely started; a
+# timeout is the caller's to fail, never to proceed past silently.
+s10_overlap_begin() {
+  : > "$1/hold"
+  gaai_wait_for 15 "$1/holding"
+}
+s10_overlap_end() {
+  rm -f "$1/hold"
+}
+
+# Second sandbox repository — distinct Git common directory, distinct identity,
+# distinct bare remote — so AC1/AC5 exercise genuine cross-repository isolation
+# on one account rather than two runs against the same fixture.
+S10_ROOT_B="$(mktemp -d "${TMPDIR:-/tmp}/gaai-coord-b-XXXXXX")"
+S10_ROOT_B="$(cd "$S10_ROOT_B" && pwd -P)"
+S10_PROJ_B="$S10_ROOT_B/proj"
+gaai_build_fixture "$S10_ROOT_B" "$SCRIPTS_DIR"
+S10_START_B="$S10_PROJ_B/.gaai/core/scripts/daemon-start.sh"
+S10_SETUP_B="$S10_PROJ_B/.gaai/core/scripts/daemon-setup.sh"
+S10_HOME_B="$(gaai_home_path "$S10_PROJ_B")"
+S10_LIFECYCLE_B="$(gaai_lifecycle_root "$S10_PROJ_B")"
+S10_OWNER_B="$S10_LIFECYCLE_B/owner"
+
+S10_PORT_A=$(( 24000 + (RANDOM % 8000) ))
+S10_PORT_B=$(( 32000 + (RANDOM % 8000) ))
+S10_IDMAP_A="$ROOT/s10-idmap.txt"
+S10_IDMAP_B="$S10_ROOT_B/s10-idmap.txt"
+S10_LOG_A="$ROOT/s10-auth.log"
+S10_LOG_B="$S10_ROOT_B/s10-auth.log"
+printf 'svc-a:%s\n' "tok-a-$$-$RANDOM" > "$S10_IDMAP_A"
+S10_TOKEN_A="$(sed -n 's/^svc-a://p' "$S10_IDMAP_A")"
+printf 'svc-b:%s\n' "tok-b-$$-$RANDOM" > "$S10_IDMAP_B"
+S10_TOKEN_B="$(sed -n 's/^svc-b://p' "$S10_IDMAP_B")"
+
+S10_SRV_A_PID="$(gaai_build_auth_origin "$ROOT" "$S10_IDMAP_A" "$S10_LOG_A" "$S10_PORT_A")"
+S10_SRV_B_PID="$(gaai_build_auth_origin "$S10_ROOT_B" "$S10_IDMAP_B" "$S10_LOG_B" "$S10_PORT_B")"
+s10_teardown_extra() {
+  kill "$S10_SRV_A_PID" "$S10_SRV_B_PID" 2>/dev/null || true
+  gaai_run "$ROOT" "$START" --stop >/dev/null 2>&1 || true
+  gaai_run "$S10_ROOT_B" "$S10_START_B" --stop >/dev/null 2>&1 || true
+  gaai_teardown "$S10_ROOT_B" "$S10_PROJ_B"
+  # Reclaim only what this block's own set difference shows it added — never a
+  # concurrent invocation's scope on this account-shared root.
+  local _s10_entry _s10_name
+  if [[ -d "$S10_PRIVATE_ROOT/scope" ]]; then
+    for _s10_entry in "$S10_PRIVATE_ROOT/scope"/*; do
+      [[ -e "$_s10_entry" ]] || continue
+      _s10_name="$(basename "$_s10_entry")"
+      if ! printf '%s\n' "$S10_SCOPE_BEFORE_BLOCK" | grep -qxF "$_s10_name"; then
+        [[ -d "$_s10_entry" && ! -L "$_s10_entry" ]] && rm -rf "$_s10_entry" 2>/dev/null
+      fi
+    done
+  fi
+}
+trap 's10_teardown_extra; gaai_teardown "$ROOT" "$PROJ"' EXIT
+sleep 1
+if kill -0 "$S10_SRV_A_PID" 2>/dev/null && kill -0 "$S10_SRV_B_PID" 2>/dev/null; then
+  pass "TC-S10-SETUP: both hermetic auth origins are running"
+else
+  fail "TC-S10-SETUP: an auth origin failed to start"
+fi
+
+git -C "$PROJ" remote set-url origin "http://127.0.0.1:$S10_PORT_A/remote.git"
+git -C "$S10_PROJ_B" remote set-url origin "http://127.0.0.1:$S10_PORT_B/remote.git"
+mkdir -p "$ROOT/opshome/.gaai" "$S10_ROOT_B/opshome/.gaai"
+( umask 077; printf 'identity=svc-a\ntoken=%s\n' "$S10_TOKEN_A" > "$ROOT/opshome/.gaai/forge-token" )
+chmod 0600 "$ROOT/opshome/.gaai/forge-token"
+( umask 077; printf 'identity=svc-b\ntoken=%s\n' "$S10_TOKEN_B" > "$S10_ROOT_B/opshome/.gaai/forge-token" )
+chmod 0600 "$S10_ROOT_B/opshome/.gaai/forge-token"
+
+fresh_home
+gaai_run "$S10_ROOT_B" "$S10_START_B" --stop >/dev/null 2>&1
+rm -rf "$S10_HOME_B" "$S10_LIFECYCLE_B" 2>/dev/null
+gaai_run "$S10_ROOT_B" "$S10_SETUP_B" >/dev/null 2>&1
+
+echo ""
+echo "=== TC-S10-AC1: two live daemons, two repositories, two identities ==="
+gaai_run "$ROOT" "$START" --no-monitor >/dev/null 2>&1
+gaai_run "$S10_ROOT_B" "$S10_START_B" --no-monitor >/dev/null 2>&1
+STATUS_A="$(gaai_run "$ROOT" "$START" --status 2>&1)"
+STATUS_B="$(gaai_run "$S10_ROOT_B" "$S10_START_B" --status 2>&1)"
+echo "$STATUS_A" | grep -q 'verdict:     live' \
+  && pass "TC-S10-AC1-1: daemon A is live" || fail "TC-S10-AC1-1: daemon A is not live: $STATUS_A"
+echo "$STATUS_B" | grep -q 'verdict:     live' \
+  && pass "TC-S10-AC1-2: daemon B is live" || fail "TC-S10-AC1-2: daemon B is not live: $STATUS_B"
+S10_SCOPE_A="$(s10_field "$OWNER" launch_scope)"
+S10_SCOPE_B="$(s10_field "$S10_OWNER_B" launch_scope)"
+if [[ -n "$S10_SCOPE_A" && -n "$S10_SCOPE_B" && "$S10_SCOPE_A" != "$S10_SCOPE_B" ]]; then
+  pass "TC-S10-AC1-3: the two daemons hold distinct launch scopes"
+else
+  fail "TC-S10-AC1-3: launch scopes are missing or identical: A=$S10_SCOPE_A B=$S10_SCOPE_B"
+fi
+if grep -q '^identity=svc-a$' "$S10_LOG_A" && ! grep -q '^identity=svc-b$' "$S10_LOG_A"; then
+  pass "TC-S10-AC1-4: origin A recorded only identity svc-a"
+else
+  fail "TC-S10-AC1-4: origin A's identity log is wrong: $(cat "$S10_LOG_A")"
+fi
+if grep -q '^identity=svc-b$' "$S10_LOG_B" && ! grep -q '^identity=svc-a$' "$S10_LOG_B"; then
+  pass "TC-S10-AC1-5: origin B recorded only identity svc-b"
+else
+  fail "TC-S10-AC1-5: origin B's identity log is wrong: $(cat "$S10_LOG_B")"
+fi
+# "including an operation by each while both remain live afterwards" — enable
+# the daemons' own poll and wait for genuine growth in both origin logs.
+S10_LOG_A_BEFORE_C1="$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')"
+S10_LOG_B_BEFORE_C1="$(wc -l < "$S10_LOG_B" 2>/dev/null | tr -d ' ')"
+s10_poll_resume "$PROJ"
+s10_poll_resume "$S10_PROJ_B"
+S10_GROWN_A=0; S10_GROWN_B=0
+for _s10_i in 1 2 3 4 5 6 7 8 9 10; do
+  [[ "$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')" -gt "$S10_LOG_A_BEFORE_C1" ]] && S10_GROWN_A=1
+  [[ "$(wc -l < "$S10_LOG_B" 2>/dev/null | tr -d ' ')" -gt "$S10_LOG_B_BEFORE_C1" ]] && S10_GROWN_B=1
+  [[ "$S10_GROWN_A" -eq 1 && "$S10_GROWN_B" -eq 1 ]] && break
+  sleep 1
+done
+if [[ "$S10_GROWN_A" -eq 1 ]] && grep -q '^identity=svc-a$' "$S10_LOG_A" && ! grep -q '^identity=svc-b$' "$S10_LOG_A"; then
+  pass "TC-S10-AC1-6: origin A's log grew from the live daemon's own post-launch operation, staying identity-pure"
+else
+  fail "TC-S10-AC1-6: origin A's log did not grow as svc-a after both daemons were live"
+fi
+if [[ "$S10_GROWN_B" -eq 1 ]] && grep -q '^identity=svc-b$' "$S10_LOG_B" && ! grep -q '^identity=svc-a$' "$S10_LOG_B"; then
+  pass "TC-S10-AC1-7: origin B's log grew from the live daemon's own post-launch operation, staying identity-pure"
+else
+  fail "TC-S10-AC1-7: origin B's log did not grow as svc-b after both daemons were live"
+fi
+s10_poll_pause "$PROJ"
+s10_poll_pause "$S10_PROJ_B"
+
+echo ""
+echo "=== TC-S10-AC5: a second launch on the SAME repository, holding a valid identity of its own ==="
+S10_TRACE_A="$LIFECYCLE/trace"
+S10_TRACE_BEFORE="$(wc -l < "$S10_TRACE_A" 2>/dev/null | tr -d ' ')"
+S10_LOG_A_BEFORE="$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')"
+# A competitor holding B's own valid identity, pointed at repository A.
+S10_COMPETE_OUT="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$S10_ROOT_B/opshome" TERM=dumb "$START" --no-monitor 2>&1)"; S10_COMPETE_RC=$?
+if [[ "$S10_COMPETE_RC" -ne 0 ]] && printf '%s' "$S10_COMPETE_OUT" | grep -q 'reason=already_running'; then
+  pass "TC-S10-AC5-1: the second same-repo launch refused on the single-owner rule"
+else
+  fail "TC-S10-AC5-1: not refused as already_running (rc=$S10_COMPETE_RC): $S10_COMPETE_OUT"
+fi
+S10_TRACE_AFTER="$(wc -l < "$S10_TRACE_A" 2>/dev/null | tr -d ' ')"
+[[ "$S10_TRACE_AFTER" == "$S10_TRACE_BEFORE" ]] \
+  && pass "TC-S10-AC5-2: no forge_admitted (or any) trace event was added by the refused competitor" \
+  || fail "TC-S10-AC5-2: the trace grew during a refused competitor: before=$S10_TRACE_BEFORE after=$S10_TRACE_AFTER"
+S10_LOG_A_AFTER="$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')"
+[[ "$S10_LOG_A_AFTER" == "$S10_LOG_A_BEFORE" ]] \
+  && pass "TC-S10-AC5-3: origin A recorded no request attributable to the refused competitor" \
+  || fail "TC-S10-AC5-3: origin A's log grew during a refused competitor"
+STATUS_A2="$(gaai_run "$ROOT" "$START" --status 2>&1)"
+echo "$STATUS_A2" | grep -q 'verdict:     live' \
+  && pass "TC-S10-AC5-4: daemon A is still live and unaffected after the competing launch" \
+  || fail "TC-S10-AC5-4: daemon A's binding was disturbed: $STATUS_A2"
+# "an incumbent remote operation overlapping it is still served under the
+# original identity" and "before, throughout and after" — repeat the
+# competing launch while the incumbent's own operation is held in flight.
+S10_OWNER_BEFORE_5="$(cksum < "$OWNER")"
+s10_poll_resume "$PROJ"
+if s10_overlap_begin "$ROOT"; then
+  S10_COMPETE2_OUT="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$S10_ROOT_B/opshome" TERM=dumb "$START" --no-monitor 2>&1)"; S10_COMPETE2_RC=$?
+  s10_overlap_end "$ROOT"
+  gaai_wait_for 10 "$S10_LOG_A" '^identity=svc-a$' >/dev/null 2>&1 || true
+  S10_OWNER_AFTER_5="$(cksum < "$OWNER")"
+  if [[ "$S10_COMPETE2_RC" -ne 0 ]] && printf '%s' "$S10_COMPETE2_OUT" | grep -q 'reason=already_running' \
+     && [[ "$S10_OWNER_AFTER_5" == "$S10_OWNER_BEFORE_5" ]] \
+     && tail -3 "$S10_LOG_A" | grep -q '^identity=svc-a$' \
+     && ! tail -5 "$S10_LOG_A" | grep -qE '^identity=svc-b$|^rejected_credential$'; then
+    pass "TC-S10-AC5-5: a competitor overlapping an in-flight incumbent operation still refuses, and the incumbent's operation and binding are unchanged throughout"
+  else
+    fail "TC-S10-AC5-5: an overlapping competitor disturbed the incumbent (rc=$S10_COMPETE2_RC owner_before=$S10_OWNER_BEFORE_5 owner_after=$S10_OWNER_AFTER_5 tail=$(tail -3 "$S10_LOG_A"))"
+  fi
+else
+  fail "TC-S10-AC5-5: the hold window never engaged for the overlapping competitor"
+  rm -f "$ROOT/hold"
+fi
+s10_poll_pause "$PROJ"
+
+echo ""
+echo "=== TC-S10-AC2: a --status query neither obtains nor uses the incumbent's identity ==="
+S10_OWNER_BEFORE="$(cksum < "$OWNER")"
+S10_TRACE_BEFORE="$(wc -l < "$S10_TRACE_A" 2>/dev/null | tr -d ' ')"
+S10_LOG_A_BEFORE="$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')"
+# (i) under the incumbent's own identity; (ii) under a different admitted
+# identity; (iii) under none.
+gaai_run "$ROOT" "$START" --status >/dev/null 2>&1
+/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$S10_ROOT_B/opshome" TERM=dumb "$START" --status >/dev/null 2>&1
+S10_NOFORGE="$ROOT/opshome-noforge"; mkdir -p "$S10_NOFORGE"
+/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$S10_NOFORGE" TERM=dumb "$START" --status >/dev/null 2>&1
+S10_OWNER_AFTER="$(cksum < "$OWNER")"
+[[ "$S10_OWNER_AFTER" == "$S10_OWNER_BEFORE" ]] \
+  && pass "TC-S10-AC2-1: the owner record is unchanged across all three status conditions" \
+  || fail "TC-S10-AC2-1: the owner record changed after a status query"
+S10_TRACE_AFTER="$(wc -l < "$S10_TRACE_A" 2>/dev/null | tr -d ' ')"
+[[ "$S10_TRACE_AFTER" == "$S10_TRACE_BEFORE" ]] \
+  && pass "TC-S10-AC2-2: no forge_admitted trace event was added by any status query" \
+  || fail "TC-S10-AC2-2: the trace grew during a status query: before=$S10_TRACE_BEFORE after=$S10_TRACE_AFTER"
+S10_LOG_A_AFTER="$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')"
+[[ "$S10_LOG_A_AFTER" == "$S10_LOG_A_BEFORE" ]] \
+  && pass "TC-S10-AC2-3: origin A recorded no request attributable to any status query" \
+  || fail "TC-S10-AC2-3: origin A's log grew during a status query"
+# During-the-window overlap, all three identity conditions: the daemon's OWN
+# process performs its own poll (never a replica of its credential context),
+# held in flight on origin A while a status query runs concurrently under
+# each condition — proving the query's own activity (or absence of it) never
+# touches the incumbent's identity or binding.
+S10_AC2_N=4
+for S10_AC2_HOME in "$ROOT/opshome" "$S10_ROOT_B/opshome" "$S10_NOFORGE"; do
+  S10_OWNER_BEFORE_OV="$(cksum < "$OWNER")"
+  s10_poll_resume "$PROJ"
+  if s10_overlap_begin "$ROOT"; then
+    /usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$S10_AC2_HOME" TERM=dumb "$START" --status >/dev/null 2>&1
+    s10_overlap_end "$ROOT"
+    gaai_wait_for 10 "$S10_LOG_A" '^identity=svc-a$' >/dev/null 2>&1 || true
+    S10_OWNER_AFTER_OV="$(cksum < "$OWNER")"
+    S10_AC2_TAIL="$(tail -3 "$S10_LOG_A" 2>/dev/null)"
+    if printf '%s\n' "$S10_AC2_TAIL" | grep -q '^identity=svc-a$' \
+       && ! printf '%s\n' "$S10_AC2_TAIL" | grep -qE '^identity=svc-b$|^rejected_credential$' \
+       && [[ "$S10_OWNER_AFTER_OV" == "$S10_OWNER_BEFORE_OV" ]]; then
+      pass "TC-S10-AC2-$S10_AC2_N: the incumbent's held operation completed as svc-a during a status query under $S10_AC2_HOME, with no borrowed or foreign identity and no owner mutation"
+    else
+      fail "TC-S10-AC2-$S10_AC2_N: overlap assertion failed for $S10_AC2_HOME (owner before=$S10_OWNER_BEFORE_OV after=$S10_OWNER_AFTER_OV, tail=$S10_AC2_TAIL)"
+    fi
+  else
+    fail "TC-S10-AC2-$S10_AC2_N: the hold window never engaged for $S10_AC2_HOME"
+    rm -f "$ROOT/hold"
+  fi
+  s10_poll_pause "$PROJ"
+  S10_AC2_N=$(( S10_AC2_N + 1 ))
+done
+
+echo ""
+echo "=== TC-S10-AC3: an offline setup neither obtains, uses, nor mutates the incumbent's identity ==="
+S10_AC3_N=1
+# Own-repo target, three identity conditions, each overlapping a held
+# incumbent operation: must always refuse process_authority_invalid — the
+# lifecycle role must be reached before the credential role, even with none.
+for S10_AC3_LBL in own other none; do
+  case "$S10_AC3_LBL" in
+    own)   S10_AC3_HOME="$ROOT/opshome" ;;
+    other) S10_AC3_HOME="$S10_ROOT_B/opshome" ;;
+    none)  S10_AC3_HOME="$S10_NOFORGE" ;;
+  esac
+  S10_OWNER_BEFORE_S="$(cksum < "$OWNER")"
+  s10_poll_resume "$PROJ"
+  if s10_overlap_begin "$ROOT"; then
+    S10_SETUP_OWN_OUT="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$S10_AC3_HOME" TERM=dumb "$SETUP" --verify-only 2>&1)"; S10_SETUP_OWN_RC=$?
+    s10_overlap_end "$ROOT"
+    gaai_wait_for 10 "$S10_LOG_A" '^identity=svc-a$' >/dev/null 2>&1 || true
+    S10_OWNER_AFTER_S="$(cksum < "$OWNER")"
+    if [[ "$S10_SETUP_OWN_RC" -ne 0 ]] && printf '%s' "$S10_SETUP_OWN_OUT" | grep -q 'reason=process_authority_invalid' \
+       && ! printf '%s' "$S10_SETUP_OWN_OUT" | grep -q 'reason=forge_identity_unadmitted' \
+       && [[ "$S10_OWNER_AFTER_S" == "$S10_OWNER_BEFORE_S" ]] \
+       && tail -3 "$S10_LOG_A" | grep -q '^identity=svc-a$'; then
+      pass "TC-S10-AC3-$S10_AC3_N: own-repo setup under identity condition '$S10_AC3_LBL' refuses process_authority_invalid before credential access, incumbent unaffected throughout"
+    else
+      fail "TC-S10-AC3-$S10_AC3_N: own-repo setup under '$S10_AC3_LBL' failed (rc=$S10_SETUP_OWN_RC out=$S10_SETUP_OWN_OUT owner_before=$S10_OWNER_BEFORE_S owner_after=$S10_OWNER_AFTER_S)"
+    fi
+  else
+    fail "TC-S10-AC3-$S10_AC3_N: the hold window never engaged for own-repo/$S10_AC3_LBL"
+    rm -f "$ROOT/hold"
+  fi
+  s10_poll_pause "$PROJ"
+  S10_AC3_N=$(( S10_AC3_N + 1 ))
+done
+# Different-repo target: under its own identity it completes; under any other
+# condition it may fail, but must never authenticate as an identity it did
+# not itself admit (i.e. never leak svc-a to origin B).
+gaai_run "$S10_ROOT_B" "$S10_START_B" --stop >/dev/null 2>&1
+for S10_AC3_LBL in own other none; do
+  case "$S10_AC3_LBL" in
+    own)   S10_AC3_HOME="$S10_ROOT_B/opshome" ;;
+    other) S10_AC3_HOME="$ROOT/opshome" ;;
+    none)  S10_AC3_HOME="$S10_NOFORGE" ;;
+  esac
+  S10_OWNER_BEFORE_S="$(cksum < "$OWNER")"
+  s10_poll_resume "$PROJ"
+  if s10_overlap_begin "$ROOT"; then
+    S10_SETUP_OTHER_OUT="$(/usr/bin/env -i "PATH=$S10_ROOT_B/fakebin:/usr/bin:/bin" "HOME=$S10_AC3_HOME" TERM=dumb "$S10_SETUP_B" --verify-only 2>&1)"; S10_SETUP_OTHER_RC=$?
+    s10_overlap_end "$ROOT"
+    gaai_wait_for 10 "$S10_LOG_A" '^identity=svc-a$' >/dev/null 2>&1 || true
+    S10_OWNER_AFTER_S="$(cksum < "$OWNER")"
+    S10_LOG_B_TAIL="$(tail -5 "$S10_LOG_B" 2>/dev/null)"
+    S10_AC3_OK=1
+    [[ "$S10_OWNER_AFTER_S" == "$S10_OWNER_BEFORE_S" ]] || S10_AC3_OK=0
+    tail -3 "$S10_LOG_A" | grep -q '^identity=svc-a$' || S10_AC3_OK=0
+    printf '%s\n' "$S10_LOG_B_TAIL" | grep -q '^identity=svc-a$' && S10_AC3_OK=0
+    [[ "$S10_AC3_LBL" != "own" || "$S10_SETUP_OTHER_RC" -eq 0 ]] || S10_AC3_OK=0
+    if [[ "$S10_AC3_OK" -eq 1 ]]; then
+      pass "TC-S10-AC3-$S10_AC3_N: different-repo setup under identity condition '$S10_AC3_LBL' authenticates only under its own identity, incumbent A unaffected"
+    else
+      fail "TC-S10-AC3-$S10_AC3_N: different-repo setup under '$S10_AC3_LBL' failed the isolation assertions (rc=$S10_SETUP_OTHER_RC owner_before=$S10_OWNER_BEFORE_S owner_after=$S10_OWNER_AFTER_S log_b_tail=$S10_LOG_B_TAIL)"
+    fi
+  else
+    fail "TC-S10-AC3-$S10_AC3_N: the hold window never engaged for different-repo/$S10_AC3_LBL"
+    rm -f "$ROOT/hold"
+  fi
+  s10_poll_pause "$PROJ"
+  S10_AC3_N=$(( S10_AC3_N + 1 ))
+done
+STATUS_A3="$(gaai_run "$ROOT" "$START" --status 2>&1)"
+echo "$STATUS_A3" | grep -q 'verdict:     live' \
+  && pass "TC-S10-AC3-$S10_AC3_N: daemon A is still live after the full six-run AC3 matrix" \
+  || fail "TC-S10-AC3-$S10_AC3_N: daemon A's binding was disturbed by the AC3 matrix: $STATUS_A3"
+
+echo ""
+echo "=== TC-S10-AC4: a competitor with no admitted identity leaves no residue ==="
+S10_LOG_A_BEFORE="$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')"
+S10_ROOT_C="$(mktemp -d "${TMPDIR:-/tmp}/gaai-coord-c-XXXXXX")"; S10_ROOT_C="$(cd "$S10_ROOT_C" && pwd -P)"
+gaai_build_fixture "$S10_ROOT_C" "$SCRIPTS_DIR"
+rm -f "$S10_ROOT_C/opshome/.gaai/forge-token"
+git -C "$S10_ROOT_C/proj" remote set-url origin "http://127.0.0.1:$S10_PORT_A/remote.git"
+S10_SCOPE_BEFORE_C="$(ls -1 "$S10_PRIVATE_ROOT/scope" 2>/dev/null || true)"
+S10_NOID_OUT="$(gaai_run "$S10_ROOT_C" "$S10_ROOT_C/proj/.gaai/core/scripts/daemon-start.sh" --no-monitor 2>&1)"; S10_NOID_RC=$?
+S10_SCOPE_AFTER_C="$(ls -1 "$S10_PRIVATE_ROOT/scope" 2>/dev/null || true)"
+if [[ "$S10_NOID_RC" -ne 0 ]] && printf '%s' "$S10_NOID_OUT" | grep -q 'reason=forge_identity_unadmitted action=provision_forge_credential'; then
+  pass "TC-S10-AC4-1: a launch with no admitted identity is refused with the typed reason and action"
+else
+  fail "TC-S10-AC4-1: not refused as expected (rc=$S10_NOID_RC): $S10_NOID_OUT"
+fi
+S10_LOG_A_AFTER="$(wc -l < "$S10_LOG_A" 2>/dev/null | tr -d ' ')"
+[[ "$S10_LOG_A_AFTER" == "$S10_LOG_A_BEFORE" ]] \
+  && pass "TC-S10-AC4-2: origin A recorded no request from the unadmitted competitor" \
+  || fail "TC-S10-AC4-2: origin A's log grew from the unadmitted competitor"
+S10_C_LIFECYCLE="$(gaai_lifecycle_root "$S10_ROOT_C/proj")"
+[[ ! -e "$S10_C_LIFECYCLE/owner" ]] \
+  && pass "TC-S10-AC4-3: no owner record was created" \
+  || fail "TC-S10-AC4-3: an owner record was created despite the refusal"
+[[ ! -d "$S10_C_LIFECYCLE/launch" || -z "$(ls -A "$S10_C_LIFECYCLE/launch" 2>/dev/null)" ]] \
+  && pass "TC-S10-AC4-4: no attempt directory was created" \
+  || fail "TC-S10-AC4-4: an attempt directory was created despite the refusal: $(ls -A "$S10_C_LIFECYCLE/launch" 2>/dev/null)"
+[[ "$S10_SCOPE_AFTER_C" == "$S10_SCOPE_BEFORE_C" ]] \
+  && pass "TC-S10-AC4-5: no launch-scope directory survives the refusal" \
+  || fail "TC-S10-AC4-5: a launch-scope directory survived: before=[$S10_SCOPE_BEFORE_C] after=[$S10_SCOPE_AFTER_C]"
+S10_C_COMMON_DIR="$(git -C "$S10_ROOT_C/proj" rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
+  || git -C "$S10_ROOT_C/proj" rev-parse --git-common-dir 2>/dev/null)"
+case "$S10_C_COMMON_DIR" in /*) ;; *) S10_C_COMMON_DIR="$S10_ROOT_C/proj/$S10_C_COMMON_DIR" ;; esac
+S10_C_SOCK="$(cd "$SCRIPTS_DIR" && ( unset GAAI_HOME_SCHEMA; source "$SCRIPTS_DIR/lib/daemon-home.sh" >/dev/null 2>&1; _gaai_home_socket_path "$S10_C_COMMON_DIR" 2>/dev/null ))"
+if [[ -z "$S10_C_SOCK" ]] || { [[ ! -S "$S10_C_SOCK" ]] && ! tmux -S "$S10_C_SOCK" has-session >/dev/null 2>&1; }; then
+  pass "TC-S10-AC4-6: no tmux session exists for the unadmitted competitor"
+else
+  fail "TC-S10-AC4-6: a tmux session exists at the unadmitted competitor's derived socket path: $S10_C_SOCK"
+fi
+gaai_teardown "$S10_ROOT_C" "$S10_ROOT_C/proj"
+
+echo ""
+echo "=== TC-S10-ISO-7: a refusal firing AFTER scope creation cannot be forced live under this platform's own PATH hardening ==="
+# The execution plan's original design (a fakebin/git shim forcing
+# entry_role=git_config_scope_unhonoured) does not reach the entry script's
+# git invocation at all: section 7's tool-attestation step (daemon-start.sh
+# _GAAI_CMD_ROOTS) already pins PATH to a fixed, non-fixture-controllable
+# root list before this probe ever runs, specifically to defeat PATH-based
+# command substitution (the same control TC-ENTRY-hostile exercises). Verified
+# empirically: a git shim on $ROOT/fakebin is never invoked (rc=0, real git
+# resolved). The other two post-creation refusals (launch_scope_untrusted,
+# the tmp launch_scope_uncreatable) are TOCTOU races on an unpredictable
+# ($$.$RANDOM) path name and are not safely forceable either. All three are
+# instead proven by the static ordering falsifier below (TC-S10-ISO-9), which
+# is a stronger guarantee for source-level invariants than a live race would
+# be: it holds for every future refusal added at any of these sites, not only
+# ones a fixture happens to be able to trigger this run.
+echo "  NOTE: not independently forceable — see TC-S10-ISO-9 for this site's coverage"
+
+echo ""
+echo "=== TC-S10-ISO-8: a completed offline setup leaves no launch-scope residue ==="
+S10_ROOT_E="$(mktemp -d "${TMPDIR:-/tmp}/gaai-coord-e-XXXXXX")"; S10_ROOT_E="$(cd "$S10_ROOT_E" && pwd -P)"
+gaai_build_fixture "$S10_ROOT_E" "$SCRIPTS_DIR"
+mkdir -p "$S10_ROOT_E/opshome/.gaai"
+( umask 077; printf 'identity=svc-e\ntoken=tok-e-%s-%s\n' "$$" "$RANDOM" > "$S10_ROOT_E/opshome/.gaai/forge-token" )
+chmod 0600 "$S10_ROOT_E/opshome/.gaai/forge-token"
+# Provision first (the assertion target below is the SUBSEQUENT --verify-only
+# run against an already-exact-current home, not this provisioning call).
+gaai_run "$S10_ROOT_E" "$S10_ROOT_E/proj/.gaai/core/scripts/daemon-setup.sh" >/dev/null 2>&1
+S10_SCOPE_BEFORE_E="$(ls -1 "$S10_PRIVATE_ROOT/scope" 2>/dev/null || true)"
+S10_E_OUT="$(gaai_run "$S10_ROOT_E" "$S10_ROOT_E/proj/.gaai/core/scripts/daemon-setup.sh" --verify-only 2>&1)"; S10_E_RC=$?
+S10_SCOPE_AFTER_E="$(ls -1 "$S10_PRIVATE_ROOT/scope" 2>/dev/null || true)"
+if [[ "$S10_E_RC" -eq 0 ]] && [[ "$S10_SCOPE_AFTER_E" == "$S10_SCOPE_BEFORE_E" ]]; then
+  pass "TC-S10-ISO-8: a completed offline setup leaves no surviving launch-scope directory"
+else
+  fail "TC-S10-ISO-8: rc=$S10_E_RC scope_before=[$S10_SCOPE_BEFORE_E] scope_after=[$S10_SCOPE_AFTER_E] out=$S10_E_OUT"
+fi
+gaai_teardown "$S10_ROOT_E" "$S10_ROOT_E/proj"
+
+echo ""
+echo "=== TC-S10-ISO-9: static — the scope-cleanup trap is armed before every scope-creation-era refusal ==="
+# Covers all three post-creation refusal call sites, including
+# git_config_scope_unhonoured — the one TC-S10-ISO-7 documents as not
+# independently live-forceable given the platform's own PATH hardening.
+for S10_F in "$SCRIPTS_DIR/daemon-start.sh" "$SCRIPTS_DIR/daemon-setup.sh"; do
+  S10_TRAP_LINE="$(grep -n "trap '_gaai_launch_scope_cleanup' EXIT INT TERM" "$S10_F" | head -1 | cut -d: -f1)"
+  S10_UNTRUSTED_LINE="$(grep -n 'entry_role=launch_scope_untrusted' "$S10_F" | head -1 | cut -d: -f1)"
+  S10_TMP_LINE="$(grep -n 'entry_role=launch_scope_uncreatable' "$S10_F" | tail -1 | cut -d: -f1)"
+  S10_GITCFG_LINE="$(grep -n 'entry_role=git_config_scope_unhonoured' "$S10_F" | head -1 | cut -d: -f1)"
+  if [[ -n "$S10_TRAP_LINE" && -n "$S10_UNTRUSTED_LINE" && -n "$S10_TMP_LINE" && -n "$S10_GITCFG_LINE" \
+        && "$S10_TRAP_LINE" -lt "$S10_UNTRUSTED_LINE" && "$S10_TRAP_LINE" -lt "$S10_TMP_LINE" \
+        && "$S10_TRAP_LINE" -lt "$S10_GITCFG_LINE" ]]; then
+    pass "TC-S10-ISO-9: $(basename "$S10_F") arms the scope-cleanup trap before all three post-creation refusals"
+  else
+    fail "TC-S10-ISO-9: $(basename "$S10_F") trap=$S10_TRAP_LINE untrusted=$S10_UNTRUSTED_LINE tmp=$S10_TMP_LINE gitcfg=$S10_GITCFG_LINE"
+  fi
+done
+
+fi
+
+echo ""
+echo "════════════════════════════════════════"
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 [[ "$FAIL_COUNT" -eq 0 ]] || exit 1
 exit 0

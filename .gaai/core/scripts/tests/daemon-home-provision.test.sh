@@ -109,7 +109,26 @@ if [[ -n "$A" ]]; then
     printf 'attempt_dir=%s\n' "$A"
   } > "$OBS"
 fi
-while :; do sleep 5; done
+# Polling branch, gated on a marker file no suite creates by default: when
+# present, this loop performs a genuine authenticated remote operation — as the
+# daemon's own process, under its own launch scope and its own admitted
+# identity, never a replica of them — so "an operation while both remain live"
+# and "during the execution window" clauses become directly observable instead
+# of unprovable against an inert stub. `ls-remote`, not `fetch`: fully
+# authenticated, but it mutates no local ref, so it cannot perturb any
+# exact-current home proof another matrix asserts. Absent the marker this is
+# behaviourally identical to the prior bare wait.
+_POLL_STATE="${GAAI_REPO_ROOT:-/tmp}/.gaai-poll.state"
+_POLL_MARKER="${GAAI_REPO_ROOT:-/tmp}/.gaai-poll.marker"
+while :; do
+  if [[ -e "$_POLL_MARKER" ]]; then
+    printf 'polling\n' > "$_POLL_STATE" 2>/dev/null
+    git -C "${GAAI_DAEMON_HOME:-}" ls-remote origin >/dev/null 2>&1
+  else
+    printf 'idle\n' > "$_POLL_STATE" 2>/dev/null
+  fi
+  sleep 2
+done
 STUB_EOF
   chmod 0755 "$_proj/.gaai/core/scripts/delivery-daemon.sh"
   mkdir -p "$_root/fakebin" "$_root/opshome"
@@ -384,6 +403,111 @@ gaai_wait_for() {
     _i=$(( _i + 1 ))
   done
   return 1
+}
+
+# gaai_build_auth_origin <root> <idmap> <log> <port>
+# A real, hermetic git-http-backend origin behind HTTP Basic Auth, recording which
+# admitted identity it served for every request. <idmap> is "identity:token" lines
+# (one server instance can hold several — E1003S10's two-repo matrices point two
+# distinct local checkouts at the same origin under two different identities).
+# Repositories are served directly from <root>/<name>.git via PATH_INFO
+# (GIT_HTTP_EXPORT_ALL), so several bare remotes under the same <root> can share
+# one origin process — the two-repo E1003S10 matrices need exactly that.
+#
+# Hold gate (E1003S10 TC-S10-* overlap cases): when <root>/hold exists at request
+# time, the handler writes <root>/holding before blocking (bounded, 30s) until
+# <root>/hold is removed, THEN serves the request. This gives a deterministic way
+# to prove a competing invocation ran DURING the incumbent's own remote operation,
+# rather than inferring overlap from timing alone.
+gaai_build_auth_origin() {
+  local _root="$1" _idmap="$2" _log="$3" _port="$4"
+  : > "$_log"
+  local _server="$_root/auth-server.py"
+  cat > "$_server" <<'PYEOF'
+#!/usr/bin/env python3
+import base64, os, subprocess, sys, time
+ROOT, IDMAP, LOG, PORT = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+HOLD = os.path.join(ROOT, "hold")
+HOLDING = os.path.join(ROOT, "holding")
+from http.server import BaseHTTPRequestHandler, HTTPServer
+def load():
+    m = {}
+    with open(IDMAP) as f:
+        for line in f:
+            line = line.strip()
+            if ":" in line:
+                i, t = line.split(":", 1); m[t] = i
+    return m
+class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def log_message(self, *a): pass
+    def _auth(self):
+        ids = load()
+        a = self.headers.get("Authorization", "")
+        if not a.startswith("Basic "):
+            open(LOG, "a").write("anonymous_attempt\n")
+            self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="gaai"')
+            self.send_header("Content-Length", "0"); self.end_headers(); return None
+        try:
+            raw = base64.b64decode(a[6:]).decode("utf-8", "replace")
+            _, _, tok = raw.partition(":")
+        except Exception:
+            tok = ""
+        ident = ids.get(tok)
+        if not ident:
+            open(LOG, "a").write("rejected_credential\n")
+            self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="gaai"')
+            self.send_header("Content-Length", "0"); self.end_headers(); return None
+        if os.path.exists(HOLD):
+            open(HOLDING, "w").write("%s\n" % ident)
+            waited = 0.0
+            while os.path.exists(HOLD) and waited < 30.0:
+                time.sleep(0.1); waited += 0.1
+            try: os.remove(HOLDING)
+            except OSError: pass
+        open(LOG, "a").write("identity=%s\n" % ident)
+        return ident
+    def _run(self, ident):
+        env = dict(os.environ)
+        env.update({"GIT_PROJECT_ROOT": ROOT, "GIT_HTTP_EXPORT_ALL": "1",
+                    "REQUEST_METHOD": self.command, "PATH_INFO": self.path.split("?", 1)[0],
+                    "QUERY_STRING": self.path.split("?", 1)[1] if "?" in self.path else "",
+                    "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                    "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
+                    "REMOTE_USER": ident, "SERVER_PROTOCOL": "HTTP/1.1", "GATEWAY_INTERFACE": "CGI/1.1"})
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        body = self.rfile.read(n) if n else b""
+        p = subprocess.run(["git", "http-backend"], env=env, input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = p.stdout
+        idx = out.find(b"\r\n\r\n"); sep = 4
+        if idx == -1: idx = out.find(b"\n\n"); sep = 2
+        if idx == -1:
+            self.send_response(502); self.send_header("Content-Length", "0"); self.end_headers(); return
+        raw_headers = out[:idx].decode("latin-1"); payload = out[idx+sep:]
+        status = 200; hdrs = []
+        for line in raw_headers.split("\n"):
+            line = line.strip("\r\n")
+            if not line: continue
+            if line.lower().startswith("status:"):
+                status = int(line.split(":", 1)[1].strip().split(" ")[0])
+            elif ":" in line:
+                k, v = line.split(":", 1); hdrs.append((k.strip(), v.strip()))
+        self.send_response(status)
+        for k, v in hdrs: self.send_header(k, v)
+        self.send_header("Content-Length", str(len(payload))); self.end_headers()
+        self.wfile.write(payload)
+    def do_GET(self):
+        i = self._auth()
+        if i: self._run(i)
+    def do_POST(self):
+        i = self._auth()
+        if i: self._run(i)
+if __name__ == "__main__":
+    HTTPServer(("127.0.0.1", PORT), H).serve_forever()
+PYEOF
+  python3 "$_server" "$_root" "$_idmap" "$_log" "$_port" \
+    > "$_root/auth-server.out" 2>&1 &
+  echo "$!"
 }
 
 # Sourced by the sibling suites for the fixture only.
@@ -1149,83 +1273,7 @@ if [[ "$AUTH_RUN" -eq 1 ]]; then
   AUTH_LOG="$REAL_ROOT/auth-requests.log"
   printf '%s:%s\n' "$AUTH_IDENTITY" "$AUTH_TOKEN" > "$AUTH_IDMAP"
   : > "$AUTH_LOG"
-  AUTH_SERVER="$REAL_ROOT/auth-server.py"
-  cat > "$AUTH_SERVER" <<'PYEOF'
-#!/usr/bin/env python3
-import base64, os, subprocess, sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
-PROJECT_ROOT, IDMAP, LOG, PORT = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-def load():
-    m = {}
-    with open(IDMAP) as f:
-        for line in f:
-            line = line.strip()
-            if ":" in line:
-                i, t = line.split(":", 1); m[t] = i
-    return m
-IDS = load()
-class H(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    def log_message(self, *a): pass
-    def _auth(self):
-        a = self.headers.get("Authorization", "")
-        if not a.startswith("Basic "):
-            open(LOG, "a").write("anonymous_attempt\n")
-            self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="gaai"')
-            self.send_header("Content-Length", "0"); self.end_headers(); return None
-        try:
-            raw = base64.b64decode(a[6:]).decode("utf-8", "replace")
-            _, _, tok = raw.partition(":")
-        except Exception:
-            tok = ""
-        ident = IDS.get(tok)
-        if not ident:
-            open(LOG, "a").write("rejected_credential\n")
-            self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="gaai"')
-            self.send_header("Content-Length", "0"); self.end_headers(); return None
-        open(LOG, "a").write("identity=%s\n" % ident)
-        return ident
-    def _run(self, ident):
-        env = dict(os.environ)
-        env.update({"GIT_PROJECT_ROOT": PROJECT_ROOT, "GIT_HTTP_EXPORT_ALL": "1",
-                    "REQUEST_METHOD": self.command, "PATH_INFO": self.path.split("?", 1)[0],
-                    "QUERY_STRING": self.path.split("?", 1)[1] if "?" in self.path else "",
-                    "CONTENT_TYPE": self.headers.get("Content-Type", ""),
-                    "CONTENT_LENGTH": self.headers.get("Content-Length", "0"),
-                    "REMOTE_USER": ident, "SERVER_PROTOCOL": "HTTP/1.1", "GATEWAY_INTERFACE": "CGI/1.1"})
-        n = int(self.headers.get("Content-Length", 0) or 0)
-        body = self.rfile.read(n) if n else b""
-        p = subprocess.run(["git", "http-backend"], env=env, input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        out = p.stdout
-        idx = out.find(b"\r\n\r\n"); sep = 4
-        if idx == -1: idx = out.find(b"\n\n"); sep = 2
-        if idx == -1:
-            self.send_response(502); self.send_header("Content-Length", "0"); self.end_headers(); return
-        raw_headers = out[:idx].decode("latin-1"); payload = out[idx+sep:]
-        status = 200; hdrs = []
-        for line in raw_headers.split("\n"):
-            line = line.strip("\r\n")
-            if not line: continue
-            if line.lower().startswith("status:"):
-                status = int(line.split(":", 1)[1].strip().split(" ")[0])
-            elif ":" in line:
-                k, v = line.split(":", 1); hdrs.append((k.strip(), v.strip()))
-        self.send_response(status)
-        for k, v in hdrs: self.send_header(k, v)
-        self.send_header("Content-Length", str(len(payload))); self.end_headers()
-        self.wfile.write(payload)
-    def do_GET(self):
-        i = self._auth()
-        if i: self._run(i)
-    def do_POST(self):
-        i = self._auth()
-        if i: self._run(i)
-if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", PORT), H).serve_forever()
-PYEOF
-  python3 "$AUTH_SERVER" "$AUTH_ORIGIN_DIR" "$AUTH_IDMAP" "$AUTH_LOG" "$AUTH_PORT" \
-    > "$REAL_ROOT/auth-server.out" 2>&1 &
-  AUTH_SRV_PID=$!
+  AUTH_SRV_PID="$(gaai_build_auth_origin "$AUTH_ORIGIN_DIR" "$AUTH_IDMAP" "$AUTH_LOG" "$AUTH_PORT")"
   _auth_teardown_extra() { kill "$AUTH_SRV_PID" 2>/dev/null || true; }
   trap '_auth_teardown_extra; gaai_teardown "$ROOT" "$PROJ"; real_lane_teardown' EXIT
   sleep 1

@@ -472,7 +472,7 @@ _out="$(/usr/bin/env -i "PATH=$ROOT/fakebin:/usr/bin:/bin" "HOME=$ROOT/opshome" 
 printf '%s' "$_out" | grep -q 'reason=entry_authority_invalid' \
   && fail "ENTRY-child-strip: the entry still refused after the env -u strip (strip insufficient): $(printf '%s' "$_out" | head -1)" \
   || pass "ENTRY-child-strip: after the env -u strip the entry admits the child (strip sufficient)"
-grep -q "exec '\$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u GH_HOST -u GAAI_FORGE_IDENTITY -u GAAI_FORGE_TOKEN '\$_launcher' --daemon-child" "$START" \
+grep -q "exec '\$GAAI_ENV_CMD' -u GIT_TERMINAL_PROMPT -u GIT_ASKPASS -u GH_PROMPT_DISABLED -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u GH_HOST -u GAAI_FORGE_IDENTITY -u GAAI_FORGE_TOKEN -u GIT_CONFIG_GLOBAL -u GAAI_LAUNCH_SCOPE '\$_launcher' --daemon-child" "$START" \
   && pass "ENTRY-child-strip: the fixed pane command performs exactly that strip through the attested env" \
   || fail "ENTRY-child-strip: the fixed pane command does not strip the entry-owned GIT_*/GH_ values before the child"
 # E1003S09: the forge identity/token must never reach the child's inherited pane

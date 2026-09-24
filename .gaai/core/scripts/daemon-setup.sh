@@ -145,7 +145,7 @@ fi
 #    every candidate plus each of its parent components must be owned by root or
 #    this UID and be unwritable by anyone else.
 _GAAI_CMD_ROOTS='/usr/bin /bin /usr/sbin /sbin /usr/local/bin /opt/homebrew/bin'
-_GAAI_REQUIRED_CMDS='git tmux env stat id uname mkdir rmdir rm mv cp ln cat sed awk cut tr head wc ps sync sleep mkfifo chmod grep dirname basename date'
+_GAAI_REQUIRED_CMDS='git tmux env stat id uname mkdir rmdir rm mv cp ln readlink cat sed awk cut tr head wc ps sync sleep mkfifo chmod grep dirname basename date'
 
 # Owner must be root or this UID; group/other write bits are disqualifying.
 _gaai_safe_owner_mode() {
@@ -280,7 +280,7 @@ chmod 0700 "$GAAI_PRIVATE_ROOT" 2>/dev/null || true
 if [[ -L "$GAAI_PRIVATE_ROOT" ]] || ! _gaai_safe_owner_mode "$GAAI_PRIVATE_ROOT"; then
   _gaai_entry_refuse "entry_role=private_root_untrusted"
 fi
-for _gaai_sub in home xdg-config xdg-cache xdg-data tmp; do
+for _gaai_sub in home xdg-config xdg-cache xdg-data tmp scope; do
   mkdir -p "$GAAI_PRIVATE_ROOT/$_gaai_sub" 2>/dev/null \
     || _gaai_entry_refuse "entry_role=private_root_uncreatable"
   chmod 0700 "$GAAI_PRIVATE_ROOT/$_gaai_sub" 2>/dev/null || true
@@ -293,6 +293,55 @@ XDG_CACHE_HOME="$GAAI_PRIVATE_ROOT/xdg-cache"
 XDG_DATA_HOME="$GAAI_PRIVATE_ROOT/xdg-data"
 TMPDIR="$GAAI_PRIVATE_ROOT/tmp"
 export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
+
+# 7a. Exclusive per-invocation launch scope. Every invocation shares
+#     $GAAI_PRIVATE_ROOT, so a forge identity or git configuration written there
+#     would be visible to, and truncatable by, any other invocation on the account
+#     (AC1/AC2/AC3/AC5). `mkdir` with no `-p` on a proposed leaf is the atomic
+#     exclusivity proof: a collision means another invocation already claimed that
+#     name, never that this one may reuse it. Bounded retry only widens the
+#     candidate name, never the search space of shared state.
+#
+# Reclaimed on every normal exit. A crashed invocation's scope is instead reclaimed
+# by the next `do_start` (settled path) or by `do_stop` settlement, from the
+# durable owner record — this trap is not the only reclaim path because `exec`
+# (the child's handoff into the long-running daemon) never runs it. Defined here,
+# before the scope is claimed, so the trap can be armed the instant a scope
+# directory exists — every refusal that can fire after that point must not leak it.
+_gaai_launch_scope_cleanup() {
+  if [[ -n "${GAAI_LAUNCH_SCOPE:-}" && -d "$GAAI_LAUNCH_SCOPE" && ! -L "$GAAI_LAUNCH_SCOPE" \
+        && "$GAAI_LAUNCH_SCOPE" == "$GAAI_PRIVATE_ROOT/scope/"* ]]; then
+    rm -rf "$GAAI_LAUNCH_SCOPE" 2>/dev/null || true
+  fi
+}
+
+GAAI_LAUNCH_SCOPE=""
+_gaai_scope_tries=0
+while [[ -z "$GAAI_LAUNCH_SCOPE" ]]; do
+  _gaai_scope_tries=$(( _gaai_scope_tries + 1 ))
+  if [[ "$_gaai_scope_tries" -gt 20 ]]; then
+    _gaai_entry_refuse "entry_role=launch_scope_uncreatable"
+  fi
+  _gaai_scope_candidate="$GAAI_PRIVATE_ROOT/scope/l.$$.$RANDOM"
+  if mkdir "$_gaai_scope_candidate" 2>/dev/null; then
+    GAAI_LAUNCH_SCOPE="$_gaai_scope_candidate"
+  fi
+done
+unset -v _gaai_scope_tries _gaai_scope_candidate
+trap '_gaai_launch_scope_cleanup' EXIT INT TERM
+chmod 0700 "$GAAI_LAUNCH_SCOPE" 2>/dev/null || true
+if [[ -L "$GAAI_LAUNCH_SCOPE" ]] || ! _gaai_safe_owner_mode "$GAAI_LAUNCH_SCOPE"; then
+  _gaai_entry_refuse "entry_role=launch_scope_untrusted"
+fi
+export GAAI_LAUNCH_SCOPE
+# TMPDIR moves into the launch scope too — HOME/XDG_* stay on the shared private
+# root (agent project/session state is meant to persist across launches); only the
+# forge/git identity surface below and this process's own temp files are launch-
+# exclusive.
+mkdir -p "$GAAI_LAUNCH_SCOPE/tmp" 2>/dev/null || _gaai_entry_refuse "entry_role=launch_scope_uncreatable"
+chmod 0700 "$GAAI_LAUNCH_SCOPE/tmp" 2>/dev/null || true
+TMPDIR="$GAAI_LAUNCH_SCOPE/tmp"
+export TMPDIR
 
 # 7b. Remote authentication for the private HOME. Replacing HOME above is what
 #     makes the entry trustworthy, and it is also what removes every path Git has
@@ -329,79 +378,95 @@ export HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR
 unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN
 _GAAI_FORGE_IDENTITY=""
 _GAAI_FORGE_TOKEN=""
-_GAAI_FORGE_VERDICT="absent"
-_gaai_forge_token_file="${GAAI_OPERATOR_HOME:-}/.gaai/forge-token"
-if [[ -n "${GAAI_OPERATOR_HOME:-}" && -e "$_gaai_forge_token_file" ]]; then
-  if [[ -L "$_gaai_forge_token_file" ]]; then
-    _GAAI_FORGE_VERDICT="symlink"
-  elif [[ ! -f "$_gaai_forge_token_file" ]]; then
-    _GAAI_FORGE_VERDICT="not_regular"
-  elif ! _gaai_private_owner_mode "$_gaai_forge_token_file"; then
-    _GAAI_FORGE_VERDICT="mode_or_owner_invalid"
-  else
-    _gaai_forge_size="$(stat -c '%s' "$_gaai_forge_token_file" 2>/dev/null \
-      || stat -f '%z' "$_gaai_forge_token_file" 2>/dev/null || echo "")"
-    if [[ -z "$_gaai_forge_size" ]] || (( _gaai_forge_size > 4096 )); then
-      _GAAI_FORGE_VERDICT="oversized"
+_GAAI_FORGE_VERDICT="unread"
+# Deferred admission (AC3/AC5): this is a DEFINITION only. The credential is not
+# read until a gate that has already proven single-owner/lifecycle authority for
+# the target repository calls this function explicitly (do_start, daemon-setup.sh)
+# — never at entry time, and never for a status query or a competing invocation
+# that never reaches that gate. `unread` (not `absent`) is the verdict for "this
+# invocation never called it": a real absent-token host still reaches `absent`,
+# but only from inside the function, after the gate authorized the read.
+_gaai_admit_forge_identity() {
+  _gaai_forge_token_file="${GAAI_OPERATOR_HOME:-}/.gaai/forge-token"
+  _GAAI_FORGE_VERDICT="absent"
+  if [[ -n "${GAAI_OPERATOR_HOME:-}" && -e "$_gaai_forge_token_file" ]]; then
+    if [[ -L "$_gaai_forge_token_file" ]]; then
+      _GAAI_FORGE_VERDICT="symlink"
+    elif [[ ! -f "$_gaai_forge_token_file" ]]; then
+      _GAAI_FORGE_VERDICT="not_regular"
+    elif ! _gaai_private_owner_mode "$_gaai_forge_token_file"; then
+      _GAAI_FORGE_VERDICT="mode_or_owner_invalid"
     else
-      # Grammar: either one bare-token line (identity implied as the fixed forge
-      # convention "x-access-token") or exactly "identity=<v>" / "token=<v>". No
-      # shell evaluation — a bounded read loop, never `source`. A third line, an
-      # unknown key or an unsafe scalar is refused, never guessed at.
-      _gaai_forge_nlines=0 _gaai_forge_l1="" _gaai_forge_l2="" _gaai_forge_ln=""
-      while IFS= read -r _gaai_forge_ln || [[ -n "$_gaai_forge_ln" ]]; do
-        _gaai_forge_nlines=$(( _gaai_forge_nlines + 1 ))
+      _gaai_forge_size="$(stat -c '%s' "$_gaai_forge_token_file" 2>/dev/null \
+        || stat -f '%z' "$_gaai_forge_token_file" 2>/dev/null || echo "")"
+      if [[ -z "$_gaai_forge_size" ]] || (( _gaai_forge_size > 4096 )); then
+        _GAAI_FORGE_VERDICT="oversized"
+      else
+        # Grammar: either one bare-token line (identity implied as the fixed forge
+        # convention "x-access-token") or exactly "identity=<v>" / "token=<v>". No
+        # shell evaluation — a bounded read loop, never `source`. A third line, an
+        # unknown key or an unsafe scalar is refused, never guessed at.
+        _gaai_forge_nlines=0 _gaai_forge_l1="" _gaai_forge_l2="" _gaai_forge_ln=""
+        while IFS= read -r _gaai_forge_ln || [[ -n "$_gaai_forge_ln" ]]; do
+          _gaai_forge_nlines=$(( _gaai_forge_nlines + 1 ))
+          case "$_gaai_forge_nlines" in
+            1) _gaai_forge_l1="$_gaai_forge_ln" ;;
+            2) _gaai_forge_l2="$_gaai_forge_ln" ;;
+          esac
+          [[ "$_gaai_forge_nlines" -ge 3 ]] && break
+        done < "$_gaai_forge_token_file" 2>/dev/null
         case "$_gaai_forge_nlines" in
-          1) _gaai_forge_l1="$_gaai_forge_ln" ;;
-          2) _gaai_forge_l2="$_gaai_forge_ln" ;;
-        esac
-        [[ "$_gaai_forge_nlines" -ge 3 ]] && break
-      done < "$_gaai_forge_token_file" 2>/dev/null
-      case "$_gaai_forge_nlines" in
-        0) _GAAI_FORGE_VERDICT="empty" ;;
-        1)
-          if [[ "$_gaai_forge_l1" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            _GAAI_FORGE_IDENTITY="x-access-token"
-            _GAAI_FORGE_TOKEN="$_gaai_forge_l1"
-            _GAAI_FORGE_VERDICT="ok"
-          else
-            _GAAI_FORGE_VERDICT="charset_invalid"
-          fi
-          ;;
-        2)
-          if [[ "$_gaai_forge_l1" == identity=* && "$_gaai_forge_l2" == token=* ]]; then
-            _gaai_forge_id="${_gaai_forge_l1#identity=}"
-            _gaai_forge_tok="${_gaai_forge_l2#token=}"
-            if [[ "$_gaai_forge_id" =~ ^[A-Za-z0-9._-]+$ && "$_gaai_forge_tok" =~ ^[A-Za-z0-9._-]+$ ]]; then
-              _GAAI_FORGE_IDENTITY="$_gaai_forge_id"
-              _GAAI_FORGE_TOKEN="$_gaai_forge_tok"
+          0) _GAAI_FORGE_VERDICT="empty" ;;
+          1)
+            if [[ "$_gaai_forge_l1" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              _GAAI_FORGE_IDENTITY="x-access-token"
+              _GAAI_FORGE_TOKEN="$_gaai_forge_l1"
               _GAAI_FORGE_VERDICT="ok"
             else
               _GAAI_FORGE_VERDICT="charset_invalid"
             fi
-          else
-            _GAAI_FORGE_VERDICT="grammar_invalid"
-          fi
-          unset -v _gaai_forge_id _gaai_forge_tok
-          ;;
-        *) _GAAI_FORGE_VERDICT="grammar_invalid" ;;
-      esac
-      unset -v _gaai_forge_nlines _gaai_forge_l1 _gaai_forge_l2 _gaai_forge_ln
+            ;;
+          2)
+            if [[ "$_gaai_forge_l1" == identity=* && "$_gaai_forge_l2" == token=* ]]; then
+              _gaai_forge_id="${_gaai_forge_l1#identity=}"
+              _gaai_forge_tok="${_gaai_forge_l2#token=}"
+              if [[ "$_gaai_forge_id" =~ ^[A-Za-z0-9._-]+$ && "$_gaai_forge_tok" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                _GAAI_FORGE_IDENTITY="$_gaai_forge_id"
+                _GAAI_FORGE_TOKEN="$_gaai_forge_tok"
+                _GAAI_FORGE_VERDICT="ok"
+              else
+                _GAAI_FORGE_VERDICT="charset_invalid"
+              fi
+            else
+              _GAAI_FORGE_VERDICT="grammar_invalid"
+            fi
+            unset -v _gaai_forge_id _gaai_forge_tok
+            ;;
+          *) _GAAI_FORGE_VERDICT="grammar_invalid" ;;
+        esac
+        unset -v _gaai_forge_nlines _gaai_forge_l1 _gaai_forge_l2 _gaai_forge_ln
+      fi
+      unset -v _gaai_forge_size
     fi
-    unset -v _gaai_forge_size
   fi
-fi
-unset -v _gaai_forge_token_file
-if [[ "$_GAAI_FORGE_VERDICT" == "ok" ]]; then
-  GH_TOKEN="$_GAAI_FORGE_TOKEN"
-  GAAI_FORGE_IDENTITY="$_GAAI_FORGE_IDENTITY"
-  GAAI_FORGE_TOKEN="$_GAAI_FORGE_TOKEN"
-  export GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN
-fi
+  unset -v _gaai_forge_token_file
+  if [[ "$_GAAI_FORGE_VERDICT" == "ok" ]]; then
+    GH_TOKEN="$_GAAI_FORGE_TOKEN"
+    GAAI_FORGE_IDENTITY="$_GAAI_FORGE_IDENTITY"
+    GAAI_FORGE_TOKEN="$_GAAI_FORGE_TOKEN"
+    export GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN
+  fi
+}
 #     No ambient carrier: `gh`'s own configuration must never supply an identity
-#     this launch did not itself admit. Anything a previous launch left linked
-#     here is removed outright rather than left to rescue this one.
-rm -rf "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
+#     this launch did not itself admit. Redirecting `gh` at a fresh directory
+#     inside this launch's own scope achieves that without touching the
+#     account-shared `$XDG_CONFIG_HOME/gh` another invocation may be reading —
+#     removing it outright, as an earlier revision did, was itself the AC2 shared-
+#     state mutation this Story forbids.
+mkdir -p "$GAAI_LAUNCH_SCOPE/gh" 2>/dev/null || _gaai_entry_refuse "entry_role=launch_scope_uncreatable"
+chmod 0700 "$GAAI_LAUNCH_SCOPE/gh" 2>/dev/null || true
+GH_CONFIG_DIR="$GAAI_LAUNCH_SCOPE/gh"
+export GH_CONFIG_DIR
 #     The delivery agent CLI's account state is the same class of problem and takes
 #     the same shape: a private HOME hides the account binding the CLI keeps in the
 #     home root, and without it the CLI reports itself logged out. Linking it is
@@ -415,14 +480,30 @@ rm -rf "$XDG_CONFIG_HOME/gh" 2>/dev/null || true
 #     principal, with no group or other access, and a host missing either the CLI or
 #     the file keeps exactly today's behaviour. The destination sits inside the
 #     entry-owned private root, so a stale stub an earlier run left there is replaced
-#     rather than left to mask the link.
+#     rather than left to mask the link. Replacing is conditional now: an
+#     already-correct link is a no-op, so no invocation redirects another's
+#     executor credential even momentarily. These four links are account-shared
+#     and are not the forge-identity channel this isolation boundary otherwise
+#     anchors to; a fresh account where a later-failing launch already created
+#     one of them is a known, accepted residual (see the isolation design notes).
+_gaai_relink_if_stale() {
+  local _src="$1" _dest="$2"
+  if [[ -L "$_dest" ]]; then
+    local _cur; _cur="$(readlink "$_dest" 2>/dev/null || echo "")"
+    [[ "$_cur" == "$_src" ]] && return 0
+    rm -f "$_dest" 2>/dev/null || true
+    ln -s "$_src" "$_dest" 2>/dev/null || true
+    return 0
+  fi
+  [[ -e "$_dest" ]] && return 0
+  ln -s "$_src" "$_dest" 2>/dev/null || true
+}
 _gaai_agent_account_file="${GAAI_OPERATOR_HOME:-}/.claude.json"
 if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_agent_account_file" \
-      && ! -L "$_gaai_agent_account_file" && ! -d "$HOME/.claude.json" ]] \
+      && ! -L "$_gaai_agent_account_file" ]] \
    && _gaai_private_owner_mode "$_gaai_agent_account_file" \
    && command -v claude >/dev/null 2>&1; then
-  rm -f "$HOME/.claude.json" 2>/dev/null || true
-  ln -s "$_gaai_agent_account_file" "$HOME/.claude.json" 2>/dev/null || true
+  _gaai_relink_if_stale "$_gaai_agent_account_file" "$HOME/.claude.json"
 fi
 unset -v _gaai_agent_account_file
 #     An executor CLI that keeps a file-backed credential needs only that file to be
@@ -433,13 +514,12 @@ unset -v _gaai_agent_account_file
 #     and a host without the credential keeps exactly today's behaviour.
 _gaai_executor_auth_file="${GAAI_OPERATOR_HOME:-}/.codex/auth.json"
 if [[ -n "${GAAI_OPERATOR_HOME:-}" && -f "$_gaai_executor_auth_file" \
-      && ! -L "$_gaai_executor_auth_file" && ! -d "$HOME/.codex/auth.json" ]] \
+      && ! -L "$_gaai_executor_auth_file" ]] \
    && _gaai_private_owner_mode "$_gaai_executor_auth_file" \
    && command -v codex >/dev/null 2>&1; then
   ( umask 077; mkdir -p "$HOME/.codex" ) 2>/dev/null || true
   if [[ -d "$HOME/.codex" ]]; then
-    rm -f "$HOME/.codex/auth.json" 2>/dev/null || true
-    ln -s "$_gaai_executor_auth_file" "$HOME/.codex/auth.json" 2>/dev/null || true
+    _gaai_relink_if_stale "$_gaai_executor_auth_file" "$HOME/.codex/auth.json"
   fi
 fi
 unset -v _gaai_executor_auth_file
@@ -502,7 +582,10 @@ unset -v _gaai_agent_cred_file
 # a platform keychain — and refuses (exit 1, no output) when either is absent, so
 # a process without this launch's identity gets no credential from it rather than
 # someone else's. The helper string itself carries no secret.
-_gaai_cred_helper="$HOME/.gaai-git-credential-helper.sh"
+#     The configuration itself lives in THIS launch's own scope, not `$HOME`: two
+#     invocations writing `$HOME/.gitconfig` unconditionally is exactly the shared-
+#     state truncation AC2/AC3/AC5 forbid, however byte-identical the content.
+_gaai_cred_helper="$GAAI_LAUNCH_SCOPE/gaai-git-credential-helper.sh"
 ( umask 077
   cat > "$_gaai_cred_helper" <<'GAAI_HELPER_EOF'
 #!/bin/bash
@@ -511,10 +594,20 @@ _gaai_cred_helper="$HOME/.gaai-git-credential-helper.sh"
 printf 'username=%s\npassword=%s\n' "$GAAI_FORGE_IDENTITY" "$GAAI_FORGE_TOKEN"
 GAAI_HELPER_EOF
   chmod 0700 "$_gaai_cred_helper"
-  printf '[credential]\n\thelper =\n\thelper = !%s\n' "$_gaai_cred_helper" > "$HOME/.gitconfig"
-  chmod 0600 "$HOME/.gitconfig"
+  printf '[credential]\n\thelper =\n\thelper = !%s\n[gaai]\n\tlaunchscope = %s\n' \
+    "$_gaai_cred_helper" "$$" > "$GAAI_LAUNCH_SCOPE/gitconfig"
+  chmod 0600 "$GAAI_LAUNCH_SCOPE/gitconfig"
 ) 2>/dev/null || true
 unset -v _gaai_cred_helper
+GIT_CONFIG_GLOBAL="$GAAI_LAUNCH_SCOPE/gitconfig"
+export GIT_CONFIG_GLOBAL
+# Prove the redirection actually took effect on THIS git build before any fetch
+# is attempted: a `GIT_CONFIG_GLOBAL` git silently ignored would leave every
+# invocation sharing the account-wide config again — the exact defect the launch
+# scope exists to prevent. Fails closed rather than degrading.
+if [[ "$(git config --get gaai.launchscope 2>/dev/null || echo "")" != "$$" ]]; then
+  _gaai_entry_refuse "entry_role=git_config_scope_unhonoured"
+fi
 
 # 7c. No interactive credential path, ever. The private HOME above leaves git with
 #     no helper unless 7b provisioned one, and a pane of the private tmux server IS
@@ -579,7 +672,7 @@ unset -v _gaai_key _gaai_val _GAAI_EXPORTED_SET
 # an environment value: every hostile inherited entry was refused in sections 3-5,
 # and each entry-owned survivor was assigned unconditionally above.
 for _gaai_name in $(compgen -e 2>/dev/null || true); do
-  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED " in
+  case " $_GAAI_CONFIG_ALLOW PATH HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME TMPDIR LC_ALL LANG SHELL TERM USER LOGNAME UID EUID PWD SHLVL GH_TOKEN GAAI_FORGE_IDENTITY GAAI_FORGE_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GH_CONFIG_DIR GH_HOST GIT_TERMINAL_PROMPT GIT_ASKPASS GH_PROMPT_DISABLED GIT_CONFIG_GLOBAL GAAI_LAUNCH_SCOPE " in
     *" $_gaai_name "*) ;;
     *) export -n "$_gaai_name" 2>/dev/null || true ;;
   esac
@@ -808,12 +901,19 @@ if [[ -n "$COMMON_DIR" && "$FAIL" -eq 0 ]]; then
   if ! _gaai_home_lock_acquire "$COMMON_DIR"; then
     fail "lifecycle lock unavailable — reason=$GAAI_HOME_REASON action=$GAAI_HOME_ACTION"
   else
-    trap '_gaai_home_lock_release' EXIT INT TERM
+    trap '_gaai_home_lock_release; _gaai_launch_scope_cleanup' EXIT INT TERM
     _evidence=""
     if ! _evidence="$(_lifecycle_absent)"; then
       _gaai_home_refuse process_authority_invalid 1 "lifecycle_role=${_evidence}" || true
       fail "a daemon lifecycle is present or unsettled — stop it and dispose of the evidence first"
-    elif [[ "${_GAAI_FORGE_VERDICT:-absent}" != "ok" ]]; then
+    else
+    # Admission happens HERE, only after the lifecycle-absence proof above — never
+    # at entry time (section 7b only DEFINES _gaai_admit_forge_identity). This is
+    # the same ordering invariant as the runtime entry's own gate: no lifecycle
+    # proof, no credential read.
+    _gaai_admit_forge_identity
+    _gaai_home_trace "$COMMON_DIR/gaai-daemon-lifecycle" "-" "forge_admitted"
+    if [[ "${_GAAI_FORGE_VERDICT:-absent}" != "ok" ]]; then
       # Same admission invariant as the runtime entry, before this entry's own
       # first remote operation: no forge identity, no fetch. Setup's own mandate
       # (provisioning the home) is otherwise untouched — this only gates whether
@@ -880,6 +980,7 @@ evidence=forge_role=${_GAAI_FORGE_VERDICT:-absent}" 2>/dev/null || true
           fail "home did not settle into an exact-current, clean, registered state"
         fi
       fi
+    fi
     fi
   fi
 fi
@@ -948,7 +1049,7 @@ fi
 # ── Summary ──────────────────────────────────────────────────────────────
 
 _gaai_home_lock_release
-trap - EXIT INT TERM
+trap '_gaai_launch_scope_cleanup' EXIT INT TERM
 
 echo ""
 echo "================================"
