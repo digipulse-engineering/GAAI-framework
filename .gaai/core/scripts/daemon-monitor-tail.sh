@@ -247,6 +247,34 @@ detect_admission_gate() {
   fi
 }
 
+# Epoch second at which the Story's current phase started, or nothing.
+# Primary source: the phase's `.active` marker, which the dispatcher writes once
+# when the phase starts — a full timestamp, so no midnight ambiguity. Fallback:
+# the latest "[HH:MM:SS] <sid> phase=<p> starting" edge in the wrapper log, taken
+# as today (or yesterday when that time is still ahead of now). Prints nothing
+# when neither exists, rather than a misleading duration.
+phase_started_epoch() {
+  local story_id="$1" _ph m ts now_e today_e start_e
+  for _ph in plan impl qa commit; do
+    m="${LOCK_DIR}/${story_id}.${_ph}.active"
+    if [[ -f "$m" ]]; then
+      start_e=$(stat -c %Y "$m" 2>/dev/null || stat -f %m "$m" 2>/dev/null) || start_e=""
+      [[ "$start_e" =~ ^[0-9]+$ ]] && { echo "$start_e"; return 0; }
+    fi
+  done
+  local wlog="${LOG_DIR}/${story_id}.wrapper.log"
+  [[ -f "$wlog" ]] || return 0
+  ts=$(tail -c 262144 "$wlog" 2>/dev/null | LC_ALL=C tr -cd '\11\12\15\40-\176' \
+    | grep -E "^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ${story_id} phase=[a-z]+ starting" | tail -1 \
+    | grep -oE '[0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
+  [[ -n "$ts" ]] || return 0
+  now_e=$(date +%s)
+  today_e=$(( now_e - ( 10#$(date +%H) * 3600 + 10#$(date +%M) * 60 + 10#$(date +%S) ) ))
+  start_e=$(( today_e + 10#${ts:0:2} * 3600 + 10#${ts:3:2} * 60 + 10#${ts:6:2} ))
+  (( start_e > now_e )) && start_e=$(( start_e - 86400 ))
+  echo "$start_e"
+}
+
 # Returns the display phase label for a 3phase story using authoritative markers.
 # AC1: markers take priority over phase_status for in-progress display.
 detect_phase_3phase() {
@@ -323,19 +351,13 @@ parse_log() {
   age_label=$(format_duration $age_s)
   color=$(health_color $age_s)
 
-  # ── Duration (time since delivery started) ──
-  local started_at duration_label=""
-  started_at=$(grep -A 15 "id: $story_id" "$BACKLOG" 2>/dev/null | grep 'started_at:' | head -1 | sed 's/.*started_at: *"//;s/".*//' || true)
-  if [[ -n "$started_at" ]]; then
-    local start_epoch
-    if [[ "$(uname)" == "Darwin" ]]; then
-      start_epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" +%s 2>/dev/null || echo 0)
-    else
-      start_epoch=$(date -d "$started_at" +%s 2>/dev/null || echo 0)
-    fi
-    if [[ "$start_epoch" -gt 0 ]]; then
-      duration_label=$(format_duration $(( now - start_epoch )))
-    fi
+  # ── Duration (time since the CURRENT phase started) ──
+  # Not since the Story was claimed: a Story paused overnight or resumed after a
+  # restart would otherwise show hours that no phase actually ran.
+  local duration_label="" phase_start
+  phase_start=$(phase_started_epoch "$story_id")
+  if [[ -n "$phase_start" && "$phase_start" -le "$now" ]]; then
+    duration_label=$(format_duration $(( now - phase_start )))
   fi
 
   # ── Tool call count ──
