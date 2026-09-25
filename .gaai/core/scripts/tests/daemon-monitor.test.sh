@@ -373,6 +373,56 @@ result=$(LOG_DIR="$LOG_DIR" detect_admission_gate "TST-MON-GATE" commit)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
+echo "=== T-DUR: Running counts from the start of the CURRENT phase ==="
+# The counter used to start at the Story's claim time (started_at), so a Story
+# paused overnight showed half a day that no phase actually ran.
+_touch_ago() { # $1=file $2=seconds ago
+  local e=$(( $(date +%s) - $2 ))
+  touch -t "$(date -r "$e" +%Y%m%d%H%M.%S 2>/dev/null || date -d "@$e" +%Y%m%d%H%M.%S)" "$1"
+}
+rm -f "$LOCK_DIR"/TST-DUR.*.active "$LOG_DIR/TST-DUR.wrapper.log"
+_touch_ago "$LOCK_DIR/TST-DUR.qa.active" 600
+r=$(LOCK_DIR="$LOCK_DIR" LOG_DIR="$LOG_DIR" phase_started_epoch TST-DUR); now=$(date +%s)
+if [[ -n "$r" && $(( now - r )) -ge 598 && $(( now - r )) -le 605 ]]; then
+  pass "T-DUR1: the active phase marker's time is the phase start (~600s ago)"
+else
+  fail "T-DUR1: expected ~600s ago from the marker, got '${r}' (now=$now)"
+fi
+rm -f "$LOCK_DIR/TST-DUR.qa.active"
+# Fallback: no marker, the latest 'phase=<p> starting' edge in the wrapper log wins.
+e_old=$(( now - 7200 )); e_new=$(( now - 300 ))
+{ echo "[$(date -r $e_old +%H:%M:%S 2>/dev/null || date -d @$e_old +%H:%M:%S)] TST-DUR phase=impl starting"
+  echo "noise line"
+  echo "[$(date -r $e_new +%H:%M:%S 2>/dev/null || date -d @$e_new +%H:%M:%S)] TST-DUR phase=qa starting"; } > "$LOG_DIR/TST-DUR.wrapper.log"
+r=$(LOCK_DIR="$LOCK_DIR" LOG_DIR="$LOG_DIR" phase_started_epoch TST-DUR)
+if [[ -n "$r" && $(( now - r )) -ge 298 && $(( now - r )) -le 306 ]]; then
+  pass "T-DUR2: without a marker, the latest phase-start edge in the wrapper log is used"
+else
+  fail "T-DUR2: expected ~300s ago from the wrapper log, got '${r}'"
+fi
+# Midnight: an edge whose clock time is still ahead of now belongs to yesterday.
+e_future_clock=$(( now + 600 ))
+echo "[$(date -r $e_future_clock +%H:%M:%S 2>/dev/null || date -d @$e_future_clock +%H:%M:%S)] TST-DUR phase=plan starting" > "$LOG_DIR/TST-DUR.wrapper.log"
+r=$(LOCK_DIR="$LOCK_DIR" LOG_DIR="$LOG_DIR" phase_started_epoch TST-DUR)
+if [[ -n "$r" && "$r" -le "$now" && $(( now - r )) -ge 85790 && $(( now - r )) -le 85810 ]]; then
+  pass "T-DUR3: a clock time ahead of now is read as yesterday, never as a negative duration"
+else
+  fail "T-DUR3: expected ~85800s ago, got '${r}'"
+fi
+rm -f "$LOG_DIR/TST-DUR.wrapper.log"
+r=$(LOCK_DIR="$LOCK_DIR" LOG_DIR="$LOG_DIR" phase_started_epoch TST-DUR)
+if [[ -z "$r" ]]; then
+  pass "T-DUR4: with neither a marker nor a phase edge, no start is reported"
+else
+  fail "T-DUR4: expected nothing, got '${r}'"
+fi
+if ! grep -q 'started_at' "$MONITOR_TAIL"; then
+  pass "T-DUR5: the Running counter no longer reads the Story's claim time (started_at)"
+else
+  fail "T-DUR5: daemon-monitor-tail.sh still reads started_at for the Running counter"
+fi
+echo ""
+
 echo "Results: $PASS_COUNT passed, $FAIL_COUNT failed"
 if [[ "$FAIL_COUNT" -eq 0 ]]; then
   echo "All tests PASSED."
