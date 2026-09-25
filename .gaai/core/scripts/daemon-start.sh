@@ -2068,11 +2068,74 @@ _monitor_socket() { printf '%s/%s-mon' "$(_gaai_home_socket_root)" "$(_gaai_home
 _monitor_session() { printf 'gaai-monitor-%s' "$(_gaai_home_label "$COMMON_DIR")"; }
 
 _launch_monitor() {
+  local _hint="  Monitor: $SCRIPT_DIR/daemon-start.sh --monitor"
   if [[ "${NO_MONITOR:-}" == "true" || "${NO_MONITOR:-}" == "1" ]]; then
     echo "  Monitor: (auto-launch skipped — $SCRIPT_DIR/daemon-start.sh --monitor to attach manually)"
     return 0
   fi
-  echo "  Monitor: $SCRIPT_DIR/daemon-start.sh --monitor"
+  if [[ ! -t 1 ]]; then
+    echo "$_hint"
+    return 0
+  fi
+  local _msock _msess
+  _msock="$(_monitor_socket)"
+  _msess="$(_monitor_session)"
+  # A presentation concern never fails a launch that already reached `running`:
+  # an unusable socket path, a UI that is already up, or a creation failure all
+  # degrade to the hint. Unlike the explicit `--monitor` entry, there is nothing
+  # here for the operator to have asked for and been refused.
+  if [[ "${#_msock}" -ge "$(_gaai_home_socket_limit)" ]] \
+     || tmux -f /dev/null -S "$_msock" has-session -t "=$_msess" 2>/dev/null \
+     || ! _monitor_create "$_msock" "$_msess"; then
+    echo "$_hint"
+    return 0
+  fi
+  echo "  Monitor: created — $SCRIPT_DIR/daemon-start.sh --monitor to attach"
+  return 0
+}
+
+# _monitor_create <msock> <msess> — creates the presentation UI DETACHED and
+# returns; never attaches. Shared by the explicit `--monitor` entry and a
+# successful launch. Returns non-zero only when `new-session` itself fails;
+# every caller decides its own wording for that failure.
+_monitor_create() {
+  local _msock="$1" _msess="$2"
+  local _config_file="$LOCK_DIR/.daemon-config"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  # A launch admits a forge identity and a tmux server hands its environment to
+  # every pane it ever spawns for as long as it lives — so the presentation
+  # server, which is never daemon authority or evidence, must never carry it.
+  # `env -u` on an unset name is a no-op, so the explicit `--monitor` path,
+  # where none of these is ever set, is byte-equivalent to before this scrub.
+  env -u GAAI_IMPL_AUTH_TOKEN -u GAAI_FORGE_TOKEN -u GH_TOKEN -u GAAI_FORGE_IDENTITY \
+      -u GAAI_DAEMON_WEBHOOK_SECRET -u GAAI_NOTIFICATION_WEBHOOK \
+      tmux -f /dev/null -S "$_msock" new-session -d -s "$_msess" \
+      "'$MONITOR_TOP' '$_config_file' '$LOG_FILE'" 2>/dev/null || return 1
+  # Resolve the home the pane should read from the same repository-scoped root, so
+  # `--monitor` without a running daemon still finds the live backlog (#3176).
+  local _monitor_home="${GAAI_DAEMON_HOME:-}"
+  # Prefer the proven home recorded by a live lifecycle over any derived path.
+  if [[ -z "$_monitor_home" && -n "${OWNER_FILE:-}" && -r "$OWNER_FILE" ]]; then
+    local _owner_home
+    _owner_home="$(_owner_field "$OWNER_FILE" home 2>/dev/null || echo "")"
+    # A recorded home is only preferred while it still exists; a leftover record
+    # naming a deleted path falls through to the guarded derivation below.
+    [[ -n "$_owner_home" && -d "$_owner_home/.gaai/project/contexts/backlog" ]] && _monitor_home="$_owner_home"
+  fi
+  if [[ -z "$_monitor_home" && -d "${GAAI_WORKTREES_BASE}/__daemon-home/.gaai/project/contexts/backlog" ]]; then
+    _monitor_home="${GAAI_WORKTREES_BASE}/__daemon-home"
+  fi
+  # The proven home also names the worktree root the live lifecycle actually used, and
+  # the tail pane needs that root to resolve per-phase logs. It is NOT passed through
+  # the environment: a pane created on an already-running tmux server inherits the
+  # server's environment rather than this shell's, so an export here would not reach
+  # it. The home is already an argument to that pane, and the pane derives the root
+  # from it directly.
+  tmux -f /dev/null -S "$_msock" split-window -t "=${_msess}:0" -v -l 60% \
+    "'$MONITOR_TAIL' '$LOG_DIR' '$_monitor_home'" 2>/dev/null || true
+  tmux -f /dev/null -S "$_msock" set-option -t "=$_msess" mouse on >/dev/null 2>&1 || true
+  tmux -f /dev/null -S "$_msock" set-option -t "=$_msess" status-style "bg=colour236,fg=colour248" >/dev/null 2>&1 || true
+  tmux -f /dev/null -S "$_msock" set-option -t "=$_msess" status-left "#[fg=colour214,bold] GAAI Delivery Monitor " >/dev/null 2>&1 || true
   return 0
 }
 
@@ -2094,36 +2157,7 @@ do_monitor() {
   if tmux -f /dev/null -S "$_msock" has-session -t "=$_msess" 2>/dev/null; then
     exec tmux -f /dev/null -S "$_msock" attach -t "=$_msess"
   fi
-  local _config_file="$LOCK_DIR/.daemon-config"
-  mkdir -p "$LOG_DIR" 2>/dev/null || true
-  tmux -f /dev/null -S "$_msock" new-session -d -s "$_msess" \
-    "'$MONITOR_TOP' '$_config_file' '$LOG_FILE'" 2>/dev/null || {
-      echo "  (presentation UI unavailable)"; return 0; }
-  # Resolve the home the pane should read from the same repository-scoped root, so
-  # `--monitor` without a running daemon still finds the live backlog (#3176).
-  local _monitor_home="${GAAI_DAEMON_HOME:-}"
-  # Prefer the proven home recorded by a live lifecycle over any derived path.
-  if [[ -z "$_monitor_home" && -n "${OWNER_FILE:-}" && -r "$OWNER_FILE" ]]; then
-    local _owner_home
-    _owner_home="$(_owner_field "$OWNER_FILE" home 2>/dev/null || echo "")"
-    # A recorded home is only preferred while it still exists; a leftover record
-    # naming a deleted path falls through to the guarded derivation below.
-    [[ -n "$_owner_home" && -d "$_owner_home/.gaai/project/contexts/backlog" ]] && _monitor_home="$_owner_home"
-  fi
-  if [[ -z "$_monitor_home" && -d "${GAAI_WORKTREES_BASE}/__daemon-home/.gaai/project/contexts/backlog" ]]; then
-    _monitor_home="${GAAI_WORKTREES_BASE}/__daemon-home"
-  fi
-  # The proven home also names the worktree root the live lifecycle actually used, and
-  # the tail pane needs that root to resolve per-phase logs. It is NOT passed through
-  # the environment: a pane created on an already-running tmux server inherits the
-  # server's environment rather than this shell's, so an export here would not reach
-  # it. The home is already an argument to that pane, and the pane derives the root
-  # from it directly.
-  tmux -f /dev/null -S "$_msock" split-window -t "=${_msess}:0" -v -p 60 \
-    "'$MONITOR_TAIL' '$LOG_DIR' '$_monitor_home'" 2>/dev/null || true
-  tmux -f /dev/null -S "$_msock" set-option -t "=$_msess" mouse on >/dev/null 2>&1 || true
-  tmux -f /dev/null -S "$_msock" set-option -t "=$_msess" status-style "bg=colour236,fg=colour248" >/dev/null 2>&1 || true
-  tmux -f /dev/null -S "$_msock" set-option -t "=$_msess" status-left "#[fg=colour214,bold] GAAI Delivery Monitor " >/dev/null 2>&1 || true
+  _monitor_create "$_msock" "$_msess" || { echo "  (presentation UI unavailable)"; return 0; }
   exec tmux -f /dev/null -S "$_msock" attach -t "=$_msess"
 }
 
@@ -2161,6 +2195,22 @@ do_status() {
 # path-role identities — never an ambient or default tmux server. Kill or
 # settlement uncertainty preserves the owner record, the session and the evidence,
 # and blocks another launch rather than guessing.
+
+# Teardown of the presentation UI, bounded to the EXACT sibling `-mon` socket —
+# never `_tmux`, which is bound to the daemon's own socket, and never an ambient
+# or default server. Presentation only: this ends no delivery and proves nothing
+# about one. Reached only from a path that has already cleared every refusal on
+# its own branch — a refusal always returns before its branch reaches here.
+_monitor_teardown() {
+  local _msock
+  _msock="$(_monitor_socket)"
+  [[ -n "$_msock" ]] || return 0
+  tmux -f /dev/null -S "$_msock" kill-server 2>/dev/null || true
+  if [[ -e "$_msock" && ! -d "$_msock" ]]; then
+    rm -f "$_msock" 2>/dev/null || true
+  fi
+  return 0
+}
 
 # Phase B — acts ONLY after `_settled_disposal_verdict` has already
 # returned `proven`; never re-derives any of its conjuncts. Mirrors the full
@@ -2205,6 +2255,7 @@ _dispose_settled_lifecycle() {
   fi
   rmdir "$LAUNCH_ROOT" 2>/dev/null || true
   # $LOG_FILE is deliberately left alone on this path (AC5d) — no truncation here.
+  _monitor_teardown
 
   if [[ "$_incomplete" -eq 1 ]]; then
     echo "  Settled lifecycle disposed of; attempt directory preserved for inspection. Log preserved."
@@ -2239,6 +2290,7 @@ do_stop() {
     echo "No daemon running."
     rm -f "$PID_FILE" 2>/dev/null || true
     $NO_DRAIN || _drain_wrappers
+    _monitor_teardown
     _gaai_home_lock_release; trap '_gaai_launch_scope_cleanup' EXIT INT TERM
     return 0
   fi
@@ -2323,10 +2375,16 @@ do_stop() {
   if [[ "$_sock" == "$TMUX_SOCKET" && -e "$_sock" && ! -d "$_sock" ]]; then
     rm -f "$_sock" 2>/dev/null || true
   fi
+  _monitor_teardown
   # The launch root is only removed when it is provably empty; a leftover attempt
   # from another failed launch stays as evidence.
   rmdir "$LAUNCH_ROOT" 2>/dev/null || true
-  [[ -f "$LOG_FILE" ]] && : > "$LOG_FILE"
+  if [[ -f "$LOG_FILE" ]]; then
+    : > "$LOG_FILE"
+    # One line survives the truncation so a fresh log pane reads as an explained
+    # stop rather than a daemon that produced nothing.
+    printf '[%s] log truncated by --stop\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE" 2>/dev/null || true
+  fi
   echo "✅ Daemon stopped. Log truncated."
   _gaai_home_lock_release
   trap '_gaai_launch_scope_cleanup' EXIT INT TERM
