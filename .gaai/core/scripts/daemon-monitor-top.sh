@@ -158,8 +158,13 @@ render_phase_metrics() {
       esac
     done < <(printf '%s\n' "$raw" | grep "\"story_id\":\"${story_id}\"" 2>/dev/null || true)
 
-    # Check for in-progress phase (running duration from active marker mtime)
+    # Check for in-progress phase (running duration from active marker mtime).
+    # A marker's presence is not, on its own, evidence that the daemon is
+    # still running it — under any banner other than DAEMON RUNNING this
+    # function is dormant in the render loop, but stays fail-closed here too
+    # if it is ever called directly.
     local running_phase="" running_dur=""
+    if [[ "${_GAAI_MON_BANNER:-}" == "DAEMON RUNNING" ]]; then
     for _ph in plan impl qa commit; do
       if [[ -f "${LOCK_DIR}/${story_id}.${_ph}.active" ]]; then
         running_phase="$_ph"
@@ -174,6 +179,7 @@ render_phase_metrics() {
         break
       fi
     done
+    fi
 
     # When a phase is currently running, "running" takes priority over any
     # historical routing record (which may be stale from a prior failed attempt
@@ -216,6 +222,7 @@ render_phase_metrics() {
   echo ""
 }
 
+_bound_attempt=""
 while true; do
   clear
   render_banner
@@ -233,7 +240,14 @@ while true; do
   fi
 
   # PR watcher status line (variables scoped to while-loop iteration, no `local` needed at top level)
-  pr_watcher_status="active"
+  # The status word follows the lifecycle banner: `active` is a liveness claim
+  # and must never be shown for a daemon that is not DAEMON RUNNING.
+  case "${_GAAI_MON_BANNER:-}" in
+    "DAEMON RUNNING")  pr_watcher_status="active" ;;
+    "DAEMON STOPPED")  pr_watcher_status="stopped" ;;
+    "DAEMON STARTING") pr_watcher_status="starting" ;;
+    *)                 pr_watcher_status="unverified" ;;
+  esac
   pr_watcher_last="?"
   pr_watcher_tracked=0
   if [[ "${GAAI_PR_WATCHER_DISABLED:-}" == "1" ]]; then
@@ -275,6 +289,16 @@ while true; do
   else
     echo -e "  ${DIM}(waiting for daemon log...)${NC}"
   fi
+
+  # Self-termination: mirrors the tail pane's own state machine (duplicated,
+  # not shared, per the Story's File Inventory — the observer is consumed,
+  # not changed, here). Bind to the attempt while live or starting; once a
+  # bound attempt's daemon settles, this frame has already rendered
+  # DAEMON STOPPED above, so end the loop. DAEMON AMBIGUOUS never terminates.
+  case "${_GAAI_MON_BANNER:-}" in
+    "DAEMON RUNNING"|"DAEMON STARTING") _bound_attempt="${_GAAI_MON_ATTEMPT:-unknown}" ;;
+    "DAEMON STOPPED") [[ -n "${_bound_attempt:-}" ]] && exit 0 ;;
+  esac
 
   sleep 2
 done
