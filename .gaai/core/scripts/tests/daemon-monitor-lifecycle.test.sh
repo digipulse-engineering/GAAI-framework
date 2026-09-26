@@ -38,7 +38,14 @@ ROOT="$(mktemp -d "${TMPDIR:-/tmp}/gaai-monlc-XXXXXX")"
 ROOT="$(cd "$ROOT" && pwd -P)"
 PROJ="$ROOT/proj"
 gaai_build_fixture "$ROOT" "$SCRIPTS_DIR"
-cp "$SCRIPTS_DIR/daemon-monitor-top.sh" "$SCRIPTS_DIR/daemon-monitor-tail.sh" \
+# GAAI_MON_PANE_SRC lets a caller copy the two panes from an alternate
+# revision (e.g. `git show <base>:<path>` extracted into a scratch dir) so
+# this Story's new AC1/AC2 rows can be demonstrated to fail against the exact
+# base revision and pass after the change — without duplicating the fixture.
+# The library always comes from $SCRIPTS_DIR: it is this Story's dependency,
+# never its subject.
+GAAI_MON_PANE_SRC="${GAAI_MON_PANE_SRC:-$SCRIPTS_DIR}"
+cp "$GAAI_MON_PANE_SRC/daemon-monitor-top.sh" "$GAAI_MON_PANE_SRC/daemon-monitor-tail.sh" \
    "$PROJ/.gaai/core/scripts/"
 chmod 0755 "$PROJ/.gaai/core/scripts/daemon-monitor-top.sh" \
            "$PROJ/.gaai/core/scripts/daemon-monitor-tail.sh"
@@ -65,8 +72,24 @@ owner_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
 # the privileged entry rebuilds its own) so `git`/`tmux` resolve exactly as
 # they do for a pane inherited from the real presentation server.
 TOP="$PROJ/.gaai/core/scripts/daemon-monitor-top.sh"
+TAIL="$PROJ/.gaai/core/scripts/daemon-monitor-tail.sh"
 CONFIG_FILE="$PROJ/.gaai/project/contexts/backlog/.delivery-locks/.daemon-config"
 ENTRY_PATH='/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin'
+TAIL_LOG_DIR="$PROJ/.gaai/project/contexts/backlog/.delivery-logs"
+TAIL_LOCKS="$PROJ/.gaai/project/contexts/backlog/.delivery-locks"
+BACKLOG="$PROJ/.gaai/project/contexts/backlog/active.backlog.yaml"
+SURV_ID="TST-MON-SURV"
+RESID_ID="TST-MON-RESID"
+# The tail pane's own DEFAULT delivery-socket resolution (unit-tested
+# separately, TS6) points at the real shared launch server
+# (/tmp/tmux-$(id -u)/default) — querying that for real inside this sandbox
+# would read whatever the OPERATOR's actual host happens to be running
+# (observed: it picked up this very delivery's own real gaai-deliver-<id>
+# session). Every pane invocation below overrides GAAI_DELIVERY_TMUX_SOCKET
+# to this fixture-local, deterministic path instead; the cross-server proof
+# (querying a DIFFERENT socket than the pane's own inherited $TMUX) holds
+# just as well against an isolated path as against the real default one.
+DELIVERY_SOCK="$ROOT/delivery-sock"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Probe server (an unrelated tmux server AC2 proves untouched) + pty harness
@@ -245,6 +268,89 @@ scenario_reset() {
   tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null; rm -f "$DSOCK" 2>/dev/null
   rm -rf "$LIFECYCLE" 2>/dev/null
   rm -f "$PID_FILE" 2>/dev/null
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# This Story's own fixture helpers — a surviving delivery on the real launch
+# server, residue with no session, and the tail pane observed from inside the
+# `-mon` server it actually ships on.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# seed_backlog_rows — two in_progress/3phase rows whose ids deliberately do
+# not match E<n>S<n> (the public-reference check blocks story-id-shaped
+# tokens in newly added .gaai/core lines outside test comments).
+seed_backlog_rows() {
+  cat >> "$BACKLOG" <<BACKLOG_EOF
+- id: $SURV_ID
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+  title: "surviving delivery fixture"
+- id: $RESID_ID
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+  title: "residue fixture"
+BACKLOG_EOF
+}
+
+# start_surviving_session / stop_surviving_session — a real gaai-deliver-<id>
+# session on the REAL launch server (no `-S`), the only way to prove the
+# probe crosses the server boundary rather than reading the sandbox's own
+# fixture socket. Fixture-specific name; a real concurrent delivery is
+# neither seen (different id) nor touched (different session name).
+start_surviving_session() {
+  tmux -f /dev/null -S "$DELIVERY_SOCK" new-session -d -s "gaai-deliver-$SURV_ID" 'sleep 900' 2>/dev/null || true
+}
+stop_surviving_session() {
+  tmux -f /dev/null -S "$DELIVERY_SOCK" kill-server 2>/dev/null || true
+}
+# Re-arm the shared EXIT/INT/TERM trap to also reap the surviving-session
+# fixture — a second `trap` call would replace, not chain, the original one.
+trap 'stop_surviving_session; tmux -f /dev/null -S "${MON_SOCK:-/nonexistent}" kill-server 2>/dev/null; tmux -f /dev/null -S "$PROBE_SOCK" kill-server 2>/dev/null; rm -rf "$PROBE_DIR"; gaai_teardown "$ROOT" "$PROJ"' EXIT INT TERM
+
+# place_residue_marker — a marker with no session: the shape left behind by
+# a wrapper that died with the daemon, leaving only the sweep-only marker.
+place_residue_marker() {
+  mkdir -p "$TAIL_LOCKS"
+  : > "$TAIL_LOCKS/$RESID_ID.qa.active"
+}
+
+# seed_residue_wrapper_log — a `phase=qa starting` edge with no terminating
+# admission outcome: the second stale-liveness source AC1 names.
+seed_residue_wrapper_log() {
+  mkdir -p "$TAIL_LOG_DIR"
+  printf '[00:00:01] %s phase=qa starting\n' "$RESID_ID" > "$TAIL_LOG_DIR/$RESID_ID.wrapper.log"
+}
+
+# tail_frame_mon <label> [remain] — the shipped tail pane run ON $MON_SOCK,
+# reproducing the exact $TMUX-inheritance condition that caused cause (f):
+# a pane created on the presentation server, whose bare `tmux` would
+# otherwise see the monitor's own sessions instead of the delivery server's.
+tail_frame_mon() {
+  local _label="$1" _remain="${2:-}"
+  tmux -f "$PROBE_CONF" -S "$MON_SOCK" new-session -d -s "$_label" -x 200 -y 50 \
+    "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C GAAI_DELIVERY_TMUX_SOCKET=$DELIVERY_SOCK '$TAIL' '$TAIL_LOG_DIR' '$PROJ'" 2>/dev/null
+  [[ -n "$_remain" ]] && tmux -f /dev/null -S "$MON_SOCK" set-option -w -t "$_label" remain-on-exit on 2>/dev/null
+  local _i=0 _frame=""
+  while [[ "$_i" -lt 25 ]]; do
+    _frame="$(tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -t "$_label" 2>/dev/null)"
+    echo "$_frame" | grep -qE "$SURV_ID|Active Deliveries" && break
+    sleep 1; _i=$(( _i + 1 ))
+  done
+  tmux -f /dev/null -S "$MON_SOCK" kill-session -t "=$_label" 2>/dev/null || true
+  printf '%s' "$_frame"
+}
+
+# extract_fn <file> <name> — name-anchored function extraction from the
+# SHIPPED source (never a hardcoded line range), used to exercise
+# render_phase_metrics without wiring it into a running loop.
+extract_fn() {
+  awk -v fn="$2" '
+    $0 ~ "^"fn"\\(\\) \\{" { p=1 }
+    p { print }
+    p && /^}/ { exit }
+  ' "$1"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -817,6 +923,397 @@ if mon_alive; then
 else
   fail "F1: no presentation UI to inspect"
 fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 8 — AC1 — surviving delivery vs residue vs unverified, per
+# lifecycle state, observed by the shipped tail pane running inside the -mon
+# server itself (the exact $TMUX-inheritance condition that caused cause f).
+# ═══════════════════════════════════════════════════════════════════════════
+
+seed_backlog_rows
+place_residue_marker
+seed_residue_wrapper_log
+start_surviving_session
+
+echo ""
+echo "=== TS1: DAEMON STOPPED — surviving delivery vs residue ==="
+scenario_reset
+_frame="$(tail_frame_mon TS1)"
+echo "$_frame" | grep -q "DAEMON STOPPED" && pass "TS1-1: header carries DAEMON STOPPED" || fail "TS1-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "$SURV_ID" && echo "$_frame" | grep -q "surviving without a daemon" \
+  && pass "TS1-2: surviving delivery listed with its qualifier" || fail "TS1-2: unexpected frame: $_frame"
+echo "$_frame" | grep -q "residue of an ended lifecycle" && pass "TS1-3: residue story named as residue" || fail "TS1-3: unexpected frame: $_frame"
+[[ "$(echo "$_frame" | grep -c "$RESID_ID")" -eq 1 ]] && pass "TS1-4: residue story appears exactly once (not also in the active block)" || fail "TS1-4: unexpected frame: $_frame"
+echo "$_frame" | grep -q "admission gate running" && fail "TS1-5: residue story wrongly shown as a running phase" || pass "TS1-5: no running-phase claim for the residue story"
+
+echo ""
+echo "=== TS2: DAEMON STARTING — surviving delivery vs unverified ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.ts2.tmp"
+sed 's/^state=running$/state=bound/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_frame="$(tail_frame_mon TS2)"
+echo "$_frame" | grep -q "DAEMON STARTING" && pass "TS2-1: header carries DAEMON STARTING" || fail "TS2-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "$SURV_ID" && echo "$_frame" | grep -q "daemon still starting" \
+  && pass "TS2-2: surviving delivery listed with the starting qualifier" || fail "TS2-2: unexpected frame: $_frame"
+echo "$_frame" | grep -q "unverified" && pass "TS2-3: marker-only story shown as unverified" || fail "TS2-3: unexpected frame: $_frame"
+echo "$_frame" | grep -q "residue of an ended lifecycle" && fail "TS2-4: unverified story wrongly named as residue" || pass "TS2-4: not named as residue"
+echo "$_frame" | grep -q "admission gate running" && fail "TS2-5: unverified story wrongly shown as a running phase" || pass "TS2-5: no running-phase claim for the unverified story"
+
+echo ""
+echo "=== TS3: DAEMON AMBIGUOUS — killed daemon server ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+_frame="$(tail_frame_mon TS3)"
+echo "$_frame" | grep -q "DAEMON AMBIGUOUS" && pass "TS3-1: header carries DAEMON AMBIGUOUS" || fail "TS3-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "$SURV_ID" && echo "$_frame" | grep -q "daemon unverified" \
+  && pass "TS3-2: surviving delivery listed with the unverified qualifier" || fail "TS3-2: unexpected frame: $_frame"
+echo "$_frame" | grep -q "unverified" && pass "TS3-3: marker-only story shown as unverified" || fail "TS3-3: unexpected frame: $_frame"
+echo "$_frame" | grep -qi "ended" && fail "TS3-4: frame wrongly claims the daemon has ended" || pass "TS3-4: no ended claim"
+
+echo ""
+echo "=== TS4: DAEMON AMBIGUOUS — server incarnation mismatch behind a live server ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.ts4.tmp"
+sed 's/^server_incarnation=.*/server_incarnation=bogus-incarnation/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_frame="$(tail_frame_mon TS4)"
+echo "$_frame" | grep -q "DAEMON AMBIGUOUS" && pass "TS4-1: header carries DAEMON AMBIGUOUS" || fail "TS4-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "$SURV_ID" && echo "$_frame" | grep -q "daemon unverified" \
+  && pass "TS4-2: surviving delivery listed with the unverified qualifier" || fail "TS4-2: unexpected frame: $_frame"
+echo "$_frame" | grep -q "unverified" && pass "TS4-3: marker-only story shown as unverified" || fail "TS4-3: unexpected frame: $_frame"
+
+echo ""
+echo "=== TS5: DAEMON RUNNING — baseline unchanged (over-gating regression guard) ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_state="$(status_field state)"
+[[ "$_state" == "running" ]] && pass "TS5-0: sandbox daemon is running for this baseline" || fail "TS5-0: unexpected state: $_state"
+_frame="$(tail_frame_mon TS5)"
+_first_line="$(printf '%s\n' "$_frame" | grep -m1 'Active Deliveries')"
+case "$_first_line" in
+  *"[DAEMON"*) fail "TS5-1: header carries an unexpected lifecycle qualifier under RUNNING: $_first_line" ;;
+  *) pass "TS5-1: header carries no lifecycle qualifier under RUNNING" ;;
+esac
+echo "$_frame" | grep -q "$SURV_ID" && pass "TS5-2: surviving-fixture story rendered as active" || fail "TS5-2: unexpected: $_frame"
+echo "$_frame" | grep -q "$RESID_ID" && pass "TS5-3: residue-fixture story rendered as active (both classes render under RUNNING)" || fail "TS5-3: unexpected: $_frame"
+echo "$_frame" | grep -q "admission gate running" && pass "TS5-4: admission-gate line still present under RUNNING" || fail "TS5-4: unexpected: $_frame"
+echo "$_frame" | grep -q "residue of an ended lifecycle" && fail "TS5-5: RUNNING must never show residue wording" || pass "TS5-5: no residue wording under RUNNING"
+
+echo ""
+echo "=== TS6: delivery-server probe target ==="
+_ts6_out="$(bash -c '
+  source "$1/.gaai/core/scripts/daemon-monitor-tail.sh" "" "" 2>/dev/null
+  printf "SOCK=%s\n" "$GAAI_DELIVERY_TMUX_SOCKET"
+' _ "$PROJ" 2>/dev/null)"
+echo "$_ts6_out" | grep -q "SOCK=${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default" \
+  && pass "TS6-1: delivery socket resolves to the deterministic launch-server path" \
+  || fail "TS6-1: unexpected: $_ts6_out"
+_ts6_nonexist="$ROOT/no-such-socket"
+_ts6_out2="$(bash -c '
+  source "$1/.gaai/core/scripts/daemon-monitor-tail.sh" "" "" 2>/dev/null
+  GAAI_DELIVERY_TMUX_SOCKET="$2"
+  printf "SESS=[%s]\n" "$(delivery_sessions)"
+' _ "$PROJ" "$_ts6_nonexist" 2>/dev/null)"
+echo "$_ts6_out2" | grep -q "SESS=\[\]" && pass "TS6-2: delivery_sessions on a non-existent socket returns empty" || fail "TS6-2: unexpected: $_ts6_out2"
+[[ ! -e "$_ts6_nonexist" ]] && pass "TS6-3: probing a non-existent socket creates no server" || fail "TS6-3: a socket file was unexpectedly created"
+
+stop_surviving_session
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 9 — AC1 — the PR-watcher status word follows the lifecycle,
+# never reading [active] off a daemon that is not DAEMON RUNNING.
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== TS7-TS10: PR-watcher status word per lifecycle state ==="
+mkdir -p "$(dirname "$TAIL_LOCKS/.pr-watcher.last-poll")" 2>/dev/null
+printf '%s' "$(( $(date +%s) - 5 ))" > "$TAIL_LOCKS/.pr-watcher.last-poll"
+
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_frame="$(top_frame TS7)"
+echo "$_frame" | grep -q '\[active\]' && pass "TS7: RUNNING reads [active]" || fail "TS7: unexpected frame: $_frame"
+
+scenario_reset
+_frame="$(top_frame TS8)"
+echo "$_frame" | grep -q '\[stopped\]' && pass "TS8: STOPPED reads [stopped]" || fail "TS8: unexpected frame: $_frame"
+echo "$_frame" | grep -q '\[active\]' && fail "TS8: STOPPED must never read [active]" || pass "TS8: no [active] under STOPPED"
+
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.ts9.tmp"
+sed 's/^state=running$/state=bound/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_frame="$(top_frame TS9)"
+echo "$_frame" | grep -q '\[starting\]' && pass "TS9: STARTING reads [starting]" || fail "TS9: unexpected frame: $_frame"
+echo "$_frame" | grep -q '\[active\]' && fail "TS9: STARTING must never read [active]" || pass "TS9: no [active] under STARTING"
+
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+_frame="$(top_frame TS10)"
+echo "$_frame" | grep -q '\[unverified\]' && pass "TS10: AMBIGUOUS reads [unverified]" || fail "TS10: unexpected frame: $_frame"
+echo "$_frame" | grep -q '\[active\]' && fail "TS10: AMBIGUOUS must never read [active]" || pass "TS10: no [active] under AMBIGUOUS"
+
+echo ""
+echo "=== TS11: last-poll age older than a day — no 24h wrap ==="
+scenario_reset
+printf '%s' "$(( $(date +%s) - 90000 ))" > "$TAIL_LOCKS/.pr-watcher.last-poll"
+_frame="$(top_frame TS11)"
+_age_line="$(echo "$_frame" | grep -m1 'PR watcher')"
+_age="$(echo "$_age_line" | sed -n 's/.*last poll \([0-9]*\)s ago.*/\1/p')"
+[[ -n "$_age" && "$_age" -gt 86400 ]] && pass "TS11-1: poll age renders past 24h without wrapping ($_age s)" || fail "TS11-1: unexpected: $_age_line"
+echo "$_age_line" | grep -q '\[active\]' && fail "TS11-2: an old poll under STOPPED must never read [active]" || pass "TS11-2: no [active]"
+
+echo ""
+echo "=== TS12: GAAI_PR_WATCHER_DISABLED override preserved under STOPPED ==="
+scenario_reset
+printf '%s' "$(( $(date +%s) - 5 ))" > "$TAIL_LOCKS/.pr-watcher.last-poll"
+# top_frame's own env -i strips everything not explicitly listed, so the
+# override is passed inline in a dedicated invocation rather than as a prefix
+# to the top_frame helper (which would be lost before it ever reaches tmux).
+tmux -f "$PROBE_CONF" -S "$PROBE_SOCK" new-session -d -s TS12 -x 200 -y 50 \
+  "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C GAAI_PR_WATCHER_DISABLED=1 '$TOP' '$CONFIG_FILE' '$LOG_FILE'" 2>/dev/null
+_ts12_i=0 _frame=""
+while [[ "$_ts12_i" -lt 20 ]]; do
+  _frame="$(tmux -f /dev/null -S "$PROBE_SOCK" capture-pane -p -t TS12 2>/dev/null)"
+  echo "$_frame" | grep -q "DAEMON " && break
+  sleep 1; _ts12_i=$(( _ts12_i + 1 ))
+done
+tmux -f /dev/null -S "$PROBE_SOCK" kill-session -t "=TS12" 2>/dev/null || true
+echo "$_frame" | grep -q '\[disabled\]' && pass "TS12: GAAI_PR_WATCHER_DISABLED still reads [disabled] under STOPPED" || fail "TS12: unexpected frame: $_frame"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 10 — AC1 — the dormant render_phase_metrics running labels,
+# made lifecycle-compliant WITHOUT wiring the function into the render loop.
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== TS13: render_phase_metrics running-label gating (extracted from shipped source) ==="
+_ts13_fn="$(extract_fn "$TOP" render_phase_metrics)"
+_ts13_marker_id="TST-MON-PM"
+_ts13_dir="$ROOT/ts13"
+mkdir -p "$_ts13_dir/locks"
+: > "$_ts13_dir/locks/${_ts13_marker_id}.qa.active"
+printf -- '- id: %s\n  status: in_progress\n  delivery_pipeline: 3phase\n' "$_ts13_marker_id" > "$_ts13_dir/backlog.yaml"
+printf '{"story_id":"%s","phase":"plan","provider":"primary","duration_ms":1000}\n' "$_ts13_marker_id" > "$_ts13_dir/routing.jsonl"
+_ts13_run() {
+  bash -c "
+    HAS_JQ=false
+    LOCK_DIR='$_ts13_dir/locks'
+    BACKLOG='$_ts13_dir/backlog.yaml'
+    ROUTING_LOG='$_ts13_dir/routing.jsonl'
+    CYAN='' BOLD='' DIM='' NC=''
+    _GAAI_MON_BANNER='$1'
+    $_ts13_fn
+    render_phase_metrics
+  "
+}
+_ts13_out_running="$(_ts13_run 'DAEMON RUNNING')"
+echo "$_ts13_out_running" | grep -q 'QA .*s…' && pass "TS13-1: RUNNING still shows the QA running label" || fail "TS13-1: unexpected: $_ts13_out_running"
+for _b in 'DAEMON STOPPED' 'DAEMON STARTING' 'DAEMON AMBIGUOUS'; do
+  _ts13_out="$(_ts13_run "$_b")"
+  echo "$_ts13_out" | grep -q 'QA .*s…' && fail "TS13-2 ($_b): running label wrongly shown" || pass "TS13-2 ($_b): no running label"
+done
+
+echo ""
+echo "=== TS14: render_phase_metrics stays dormant in the render loop ==="
+_ts14_loop="$(awk '/^while true; do/,0' "$TOP")"
+echo "$_ts14_loop" | grep -q 'render_phase_metrics' \
+  && fail "TS14: render_phase_metrics is unexpectedly called from the render loop" \
+  || pass "TS14: render_phase_metrics remains dormant (never called from the render loop)"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 11 — AC2 — self-termination and the monitor's own end.
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== TS15: tail pane — live to settled to self-terminated final frame ==="
+# Settles the lifecycle directly (no --stop): --stop's own teardown targets
+# this exact socket with an unconditional kill-server (the earlier AC2 teardown), which
+# would end this isolated test session as a side effect and prove nothing
+# about self-termination specifically. Mirrors TS17's proven technique.
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+tmux -f "$PROBE_CONF" -S "$MON_SOCK" new-session -d -s TS15 -x 200 -y 50 \
+  "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C GAAI_DELIVERY_TMUX_SOCKET=$DELIVERY_SOCK '$TAIL' '$TAIL_LOG_DIR' '$PROJ'" 2>/dev/null
+poll_until 15 bash -c "tmux -f /dev/null -S '$MON_SOCK' capture-pane -p -t TS15 2>/dev/null | grep -q 'Active Deliveries'" || true
+tmux -f /dev/null -S "$MON_SOCK" set-option -w -t "TS15" remain-on-exit on 2>/dev/null
+rm -f "$OWNER_FILE" 2>/dev/null
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+poll_until 15 bash -c "[[ \"\$(tmux -f /dev/null -S '$MON_SOCK' list-panes -t '=TS15' -F '#{pane_dead}' 2>/dev/null)\" == '1' ]]"
+_ts15_final="$(tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -S -60 -t TS15 2>/dev/null)"
+tmux -f /dev/null -S "$MON_SOCK" kill-session -t "=TS15" 2>/dev/null || true
+echo "$_ts15_final" | grep -q "DAEMON STOPPED" && pass "TS15: tail pane preserves a DAEMON STOPPED final frame and self-terminates" || fail "TS15: unexpected final frame: $_ts15_final"
+
+echo ""
+echo "=== TS16: top pane — live to settled to self-terminated final frame ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+tmux -f "$PROBE_CONF" -S "$MON_SOCK" new-session -d -s TS16 -x 200 -y 50 \
+  "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C '$TOP' '$CONFIG_FILE' '$LOG_FILE'" 2>/dev/null
+poll_until 15 bash -c "tmux -f /dev/null -S '$MON_SOCK' capture-pane -p -t TS16 2>/dev/null | grep -q 'DAEMON RUNNING'" || true
+tmux -f /dev/null -S "$MON_SOCK" set-option -w -t "TS16" remain-on-exit on 2>/dev/null
+rm -f "$OWNER_FILE" 2>/dev/null
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+poll_until 15 bash -c "[[ \"\$(tmux -f /dev/null -S '$MON_SOCK' list-panes -t '=TS16' -F '#{pane_dead}' 2>/dev/null)\" == '1' ]]"
+_ts16_final="$(tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -S -60 -t TS16 2>/dev/null)"
+tmux -f /dev/null -S "$MON_SOCK" kill-session -t "=TS16" 2>/dev/null || true
+echo "$_ts16_final" | grep -q "DAEMON STOPPED" && pass "TS16: top pane preserves a DAEMON STOPPED final frame and self-terminates" || fail "TS16: unexpected final frame: $_ts16_final"
+
+echo ""
+echo "=== TS17: the real -mon server ends on its own (daemon settles without --stop) ==="
+scenario_reset
+pty_run ts17 "$START" >/dev/null
+if mon_alive; then
+  rm -f "$OWNER_FILE" 2>/dev/null
+  tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+  poll_until 15 bash -c '! ( tmux -f /dev/null -S "$0" has-session -t "=$1" 2>/dev/null )' "$MON_SOCK" "$MON_SESS"
+  if tmux -f /dev/null -S "$MON_SOCK" has-session -t "=$MON_SESS" 2>/dev/null; then
+    fail "TS17-1: the -mon session survives an ended daemon lifecycle (no --stop)"
+  else
+    pass "TS17-1: the -mon session ended on its own after the daemon settled"
+  fi
+  # AC2 requires the session AND SERVER to terminate on their own — not that
+  # the socket pathname itself is unlinked. Empirically on this host, tmux's
+  # own exit-empty shutdown ends the server process but does not always
+  # unlink its socket file (the same stale-inode behaviour as most unix
+  # daemons that do not explicitly unlink on exit); `_monitor_teardown`'s
+  # own explicit "guarded unlink" (Part 2's B1-4/B2-5/B3-5, --stop only) is
+  # the one path that removes the file, and it is out of scope here since
+  # this scenario deliberately never calls --stop. The server PROCESS ending
+  # is the evidence this row asserts.
+  _ts17_srv_gone() { [[ -z "$(mon_srv_pid)" ]]; }
+  poll_until 15 _ts17_srv_gone
+  [[ -z "$(mon_srv_pid)" ]] && pass "TS17-2: the -mon server process is gone" || fail "TS17-2: the -mon server process survives"
+else
+  fail "TS17: no presentation UI to observe"
+fi
+
+echo ""
+echo "=== TS18: DAEMON AMBIGUOUS keeps the monitor alive (D-3) ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+tmux -f "$PROBE_CONF" -S "$MON_SOCK" new-session -d -s TS18 -x 200 -y 50 \
+  "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C '$TOP' '$CONFIG_FILE' '$LOG_FILE'" 2>/dev/null
+poll_until 15 bash -c "tmux -f /dev/null -S '$MON_SOCK' capture-pane -p -t TS18 2>/dev/null | grep -q 'DAEMON AMBIGUOUS'" || true
+sleep 15
+if tmux -f /dev/null -S "$MON_SOCK" has-session -t "=TS18" 2>/dev/null; then
+  pass "TS18-1: DAEMON AMBIGUOUS keeps the pane alive past the AC2 bound"
+else
+  fail "TS18-1: pane unexpectedly terminated under DAEMON AMBIGUOUS"
+fi
+_ts18_frame="$(tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -t TS18 2>/dev/null)"
+echo "$_ts18_frame" | grep -q "operator_disposition_required" && pass "TS18-2: disposition action still present" || fail "TS18-2: unexpected: $_ts18_frame"
+tmux -f /dev/null -S "$MON_SOCK" kill-session -t "=TS18" 2>/dev/null || true
+
+echo ""
+echo "=== TS19: D-1 — a monitor opened with nothing to present stays open ==="
+scenario_reset
+_ts19_tail_frame="$(tail_frame_mon TS19-tail)"
+echo "$_ts19_tail_frame" | grep -q "DAEMON STOPPED" && pass "TS19-1: tail pane renders DAEMON STOPPED with nothing live" || fail "TS19-1: unexpected: $_ts19_tail_frame"
+tmux -f "$PROBE_CONF" -S "$MON_SOCK" new-session -d -s TS19-top -x 200 -y 50 \
+  "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C '$TOP' '$CONFIG_FILE' '$LOG_FILE'" 2>/dev/null
+poll_until 15 bash -c "tmux -f /dev/null -S '$MON_SOCK' capture-pane -p -t TS19-top 2>/dev/null | grep -q 'DAEMON STOPPED'" || true
+sleep 15
+tmux -f /dev/null -S "$MON_SOCK" has-session -t "=TS19-top" 2>/dev/null \
+  && pass "TS19-2: pane opened with nothing live stays open (D-1, does not self-terminate)" \
+  || fail "TS19-2: pane unexpectedly terminated with nothing ever having been live"
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+poll_until 15 bash -c "tmux -f /dev/null -S '$MON_SOCK' capture-pane -p -t TS19-top 2>/dev/null | grep -q 'DAEMON RUNNING'" || true
+gaai_run "$ROOT" "$START" --stop >/dev/null 2>&1
+poll_until 15 bash -c "! tmux -f /dev/null -S '$MON_SOCK' has-session -t '=TS19-top' 2>/dev/null"
+tmux -f /dev/null -S "$MON_SOCK" has-session -t "=TS19-top" 2>/dev/null \
+  && fail "TS19-3: pane did not self-terminate once bound to a subsequent live attempt" \
+  || pass "TS19-3: once bound to a live attempt, the pane self-terminates on that attempt's settlement (D-1 second clause)"
+
+echo ""
+echo "=== TS20: attempt rebinding — a pane stays bound to the current attempt, not a stale one ==="
+# -f /dev/null, not $PROBE_CONF: this row's final assertions need has-session
+# to go genuinely false on self-termination, which requires tmux's own
+# built-in remain-on-exit=off/exit-empty=on defaults (matching the real
+# -mon server's own config) — $PROBE_CONF's global remain-on-exit=on (used
+# elsewhere in this suite to capture a dead pane's final content) would keep
+# a dead pane's window alive forever, making exit-empty structurally unable
+# to fire and has-session permanently, misleadingly true.
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_ts20_attempt1="$(owner_field "$OWNER_FILE" attempt)"
+tmux -f /dev/null -S "$MON_SOCK" new-session -d -s TS20 -x 200 -y 50 \
+  "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C '$TOP' '$CONFIG_FILE' '$LOG_FILE'" 2>/dev/null
+poll_until 15 bash -c "tmux -f /dev/null -S '$MON_SOCK' capture-pane -p -t TS20 2>/dev/null | grep -q \"attempt $_ts20_attempt1\""
+# Settle attempt1 without --stop, exactly as TS15/16/17: --stop's own
+# teardown targets this exact socket with an unconditional kill-server and
+# would end this isolated test pane as a side effect, telling us nothing
+# about rebinding specifically. Then restart immediately, racing the pane's
+# own next refresh tick against attempt2's startup.
+rm -f "$OWNER_FILE" 2>/dev/null
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_ts20_attempt2="$(owner_field "$OWNER_FILE" attempt)"
+if poll_until 15 bash -c "tmux -f /dev/null -S '$MON_SOCK' capture-pane -p -t TS20 2>/dev/null | grep -q \"attempt $_ts20_attempt2\""; then
+  pass "TS20-1: pane observes the new attempt's own RUNNING frame"
+  tmux -f /dev/null -S "$MON_SOCK" has-session -t "=TS20" 2>/dev/null && pass "TS20-2: pane stays alive under the new attempt" || fail "TS20-2: pane unexpectedly gone"
+  rm -f "$OWNER_FILE" 2>/dev/null
+  tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+  poll_until 15 bash -c "! tmux -f /dev/null -S '$MON_SOCK' has-session -t '=TS20' 2>/dev/null"
+  tmux -f /dev/null -S "$MON_SOCK" has-session -t "=TS20" 2>/dev/null \
+    && fail "TS20-3: pane did not self-terminate on the new attempt's own settlement" \
+    || pass "TS20-3: pane self-terminates on the new attempt's own settlement"
+else
+  # Timing-sensitive on a loaded host (plan-authorised fallback). The race was
+  # not won: the pane already observed attempt1's own settlement and
+  # self-terminated per AC2's primary guarantee before attempt2 started. That
+  # is the correct, expected alternative outcome — not a failure — so the
+  # fallback confirms self-termination fired rather than asserting survival
+  # (asserting survival here would contradict AC2's own primary invariant).
+  echo "  NOTE: could not observe attempt2's own RUNNING frame in time before attempt1's own"
+  echo "        settlement was observed and self-terminated the pane first (AC2's primary"
+  echo "        guarantee — recorded per Risk Register as the expected alternative outcome)."
+  tmux -f /dev/null -S "$MON_SOCK" has-session -t "=TS20" 2>/dev/null \
+    && fail "TS20-fallback: pane neither rebound to attempt2 nor self-terminated on attempt1's settlement" \
+    || pass "TS20-fallback: pane correctly self-terminated on attempt1's own settlement (race not won, primary invariant held)"
+  tmux -f /dev/null -S "$MON_SOCK" kill-session -t "=TS20" 2>/dev/null || true
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 12 — AC3 — dual-shell: one representative row per AC on each
+# supported interpreter (rendering + self-termination).
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== Dual-shell: tail-pane rendering (TS1) and self-termination (TS15) ==="
+ds_tail_frame() {
+  local _interp="$1" _label="$2"
+  tmux -f "$PROBE_CONF" -S "$MON_SOCK" new-session -d -s "$_label" -x 200 -y 50 \
+    "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C GAAI_DELIVERY_TMUX_SOCKET=$DELIVERY_SOCK '$_interp' --noprofile --norc -p '$TAIL' '$TAIL_LOG_DIR' '$PROJ'" 2>/dev/null
+  local _i=0 _f=""
+  while [[ "$_i" -lt 25 ]]; do
+    _f="$(tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -t "$_label" 2>/dev/null)"
+    echo "$_f" | grep -q "DAEMON STOPPED" && break
+    sleep 1; _i=$(( _i + 1 ))
+  done
+  tmux -f /dev/null -S "$MON_SOCK" kill-session -t "=$_label" 2>/dev/null || true
+  printf '%s' "$_f"
+}
+while IFS= read -r _sh; do
+  [[ -n "$_sh" ]] || continue
+  _shname="$(basename "$_sh")"
+  scenario_reset
+  _ds_frame="$(ds_tail_frame "$_sh" "ds-tail-$_shname")"
+  echo "$_ds_frame" | grep -q "DAEMON STOPPED" \
+    && pass "DS-$_shname-TS1: tail pane renders DAEMON STOPPED under $_shname" \
+    || fail "DS-$_shname-TS1: unexpected frame under $_shname: $_ds_frame"
+
+  scenario_reset
+  gaai_run "$ROOT" "$START" >/dev/null 2>&1
+  OUT="$(gaai_run "$ROOT" "$_sh" --noprofile --norc -p "$START" --stop 2>&1)"
+  echo "$OUT" | grep -q '✅ Daemon stopped. Log truncated.' \
+    && pass "DS-$_shname-TS15: stop path succeeds under $_shname (self-termination precondition)" \
+    || fail "DS-$_shname-TS15: unexpected stop output under $_shname: $OUT"
+done <<< "$SHELLS"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary

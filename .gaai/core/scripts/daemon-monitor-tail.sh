@@ -25,6 +25,20 @@ else
   WORKTREE_BASE="${GAAI_WORKTREES_BASE:-$(cd "$PROJECT_DIR/.." && pwd)/.gaai-worktrees/$(basename "$PROJECT_DIR")}"
 fi
 
+# Read-only lifecycle observer (never daemon authority or evidence). Sourcing
+# only defines functions — the observer is initialized once inside the
+# BASH_SOURCE-guarded main block below, never at top level, so sourcing this
+# pane for tests stays a pure function-definition load. BASH_SOURCE, not $0:
+# when the sibling regression suite sources this file, $0 is the suite's own
+# path, and deriving the library location from it would resolve nowhere.
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/lib/daemon-monitor-lifecycle.sh" 2>/dev/null || true
+MONITOR_REPO_ROOT="${MONITOR_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)}"
+# The server where deliveries are actually launched — deterministically the
+# same directory tmux itself resolves to (never $TMUX, which a pane created on
+# a different server, e.g. the monitor's own, would otherwise inherit).
+GAAI_DELIVERY_TMUX_SOCKET="${GAAI_DELIVERY_TMUX_SOCKET:-${TMUX_TMPDIR:-/tmp}/tmux-${UID:-$(id -u)}/default}"
+
 HAS_JQ=false
 command -v jq &>/dev/null && HAS_JQ=true
 
@@ -73,14 +87,31 @@ PHASE_CACHE_DIR="${PROJECT_DIR}/.gaai/project/contexts/backlog/.delivery-locks/.
 # Returns story IDs — one per line — for all currently active deliveries.
 # For legacy pipeline: active tmux sessions named gaai-deliver-{id}.
 # For 3phase pipeline: .lock files in LOCK_DIR where backlog status=in_progress.
+# delivery_sessions — sessions on the server where deliveries are actually
+# launched. A bare `tmux` here would inherit $TMUX from whatever server this
+# pane's own process runs on — inside the `-mon` server that is the monitor's
+# own socket, never the delivery server, so a bare probe can see the monitor's
+# sessions and nothing else. The `-S` existence test runs first, exactly as
+# the lifecycle observer's own contract requires, so no probe can bring a
+# server into existence.
+delivery_sessions() {
+  [[ -S "$GAAI_DELIVERY_TMUX_SOCKET" ]] || return 0
+  tmux -f /dev/null -S "$GAAI_DELIVERY_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null \
+    | grep '^gaai-deliver-' \
+    | sed 's/gaai-deliver-//' || true
+}
+
+# detect_active_stories — emits one `<class><TAB><sid>` line per active
+# story: class `live` when a `gaai-deliver-<sid>` session is observed on the
+# delivery server, `marker` when only a residual `.active` lock or backlog
+# status is the signal. The caller decides what a marker-only signal means
+# under the current daemon lifecycle; this function only classifies.
 detect_active_stories() {
   local seen=()
 
   # Legacy: tmux sessions
   local tmux_ids
-  tmux_ids=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-    | grep '^gaai-deliver-' \
-    | sed 's/gaai-deliver-//' || true)
+  tmux_ids=$(delivery_sessions)
   for _id in $tmux_ids; do
     local _dp
     _dp=$(awk -v id="$_id" '
@@ -98,7 +129,7 @@ detect_active_stories() {
     # the active-marker block below handle them — adding them to seen here
     # would cause that block to skip its own stories.
     if [[ "$_dp" != "3phase" ]]; then
-      echo "$_id"
+      printf 'live\t%s\n' "$_id"
       seen+=("$_id")
     fi
   done
@@ -107,11 +138,10 @@ detect_active_stories() {
   # (tmux session OR `.active` marker) before display. Backlog-status alone
   # over-emits zombie stories whose wrapper exited without flipping status.
   # Marker alone under-emits live deliveries during wrapper→nested-claude-spawn
-  # hand-off when the marker write was skipped. The OR is the honest gate.
+  # hand-off when the marker write was skipped. The OR is the honest gate;
+  # which signal fired is carried in the emitted class.
   local _live_tmux
-  _live_tmux=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-    | grep '^gaai-deliver-' \
-    | sed 's/gaai-deliver-//' || true)
+  _live_tmux=$(delivery_sessions)
   awk '
     function emit() {
       if (current_id != "" && status == "in_progress" && dp == "3phase") {
@@ -143,8 +173,49 @@ detect_active_stories() {
       [[ -f "${LOCK_DIR}/${_sid}.${_ph}.active" ]] && _has_marker=1 && break
     done
     [[ $_has_tmux -eq 0 && $_has_marker -eq 0 ]] && continue
-    echo "$_sid"
+    if [[ $_has_tmux -eq 1 ]]; then
+      printf 'live\t%s\n' "$_sid"
+    else
+      printf 'marker\t%s\n' "$_sid"
+    fi
   done
+}
+
+# liveness_note <class> — sets _LN_RENDER (active|residue|unverified) and
+# _LN_NOTE (empty, or a short qualifier appended after the story id) from the
+# story's liveness class and the current lifecycle banner. Under a running
+# daemon every story renders exactly as before (defence against over-gating,
+# AC1's closing clause). Under any other banner, a marker-only story is never
+# shown as a running phase: it is either residue (daemon has settled) or
+# unverified (daemon's own lifecycle is not yet confirmed) — never both, and
+# the unverified wording never claims the daemon or watcher has ended.
+liveness_note() {
+  local _class="$1"
+  _LN_RENDER="active" _LN_NOTE=""
+  case "${_GAAI_MON_BANNER:-}" in
+    "DAEMON RUNNING") ;;
+    "DAEMON STOPPED")
+      if [[ "$_class" == "live" ]]; then
+        _LN_NOTE=" (surviving without a daemon)"
+      else
+        _LN_RENDER="residue"
+      fi
+      ;;
+    "DAEMON STARTING")
+      if [[ "$_class" == "live" ]]; then
+        _LN_NOTE=" (daemon still starting)"
+      else
+        _LN_RENDER="unverified"
+      fi
+      ;;
+    *)
+      if [[ "$_class" == "live" ]]; then
+        _LN_NOTE=" (daemon unverified)"
+      else
+        _LN_RENDER="unverified"
+      fi
+      ;;
+  esac
 }
 
 # Returns the canonical log path for the current active phase of a 3phase story.
@@ -715,26 +786,43 @@ parse_log() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+_gaai_mon_lifecycle_init "$MONITOR_REPO_ROOT" 2>/dev/null || true
+_bound_attempt=""
 while true; do
   clear
   # In tmux: clear scrollback left by `clear` so prior refresh doesn't ghost below
   [[ -n "${TMUX:-}" ]] && tmux clear-history 2>/dev/null || true
-  echo "═══ Active Deliveries (refreshes every 5s) ═══"
+
+  _gaai_mon_lifecycle_refresh 2>/dev/null || true
+
+  _header="═══ Active Deliveries (refreshes every 5s) ═══"
+  [[ "${_GAAI_MON_BANNER:-}" != "DAEMON RUNNING" ]] && _header="$_header  [${_GAAI_MON_BANNER:-DAEMON AMBIGUOUS}]"
+  echo "$_header"
   echo ""
 
-  # Read active stories (3phase from locks + legacy from tmux)
-  active_ids=()
-  while IFS= read -r _id; do
-    [[ -n "$_id" ]] && active_ids+=("$_id")
+  # Partition active stories by liveness class + current lifecycle banner:
+  # rendered as active (with an optional qualifier note), named as residue of
+  # an ended lifecycle, or shown as unverified. A marker-only story is never
+  # rendered as a running phase unless the daemon is DAEMON RUNNING.
+  active_ids=() active_notes=() active_classes=() residue_ids=() unverified_ids=()
+  while IFS=$'\t' read -r _class _id; do
+    [[ -n "$_id" ]] || continue
+    liveness_note "$_class"
+    case "$_LN_RENDER" in
+      residue)    residue_ids+=("$_id") ;;
+      unverified) unverified_ids+=("$_id") ;;
+      *)          active_ids+=("$_id"); active_notes+=("$_LN_NOTE"); active_classes+=("$_class") ;;
+    esac
   done < <(detect_active_stories)
 
-  if [[ ${#active_ids[@]} -eq 0 ]]; then
+  if [[ ${#active_ids[@]} -eq 0 && ${#residue_ids[@]} -eq 0 && ${#unverified_ids[@]} -eq 0 ]]; then
     echo -e "  ${DIM}No active deliveries. Use /gaai-discover to create stories for the backlog.${NC}"
-    sleep 5
-    continue
   fi
 
-  for story_id in "${active_ids[@]}"; do
+  for _i in "${!active_ids[@]}"; do
+    story_id="${active_ids[$_i]}"
+    _note="${active_notes[$_i]}"
+    _class="${active_classes[$_i]}"
     # Determine pipeline
     pipeline=$(awk -v id="$story_id" '
       $0 == "- id: " id { found=1; next }
@@ -764,16 +852,22 @@ while true; do
           }
         ' "$BACKLOG" 2>/dev/null || true)
         if [[ -n "$_title" ]]; then
-          printf '%b%s%b — %s\n' "$CYAN" "$story_id" "$NC" "$_title"
+          printf '%b%s%b%s — %s\n' "$CYAN" "$story_id" "$NC" "$_note" "$_title"
         else
-          printf '%b%s%b\n' "$CYAN" "$story_id" "$NC"
+          printf '%b%s%b%s\n' "$CYAN" "$story_id" "$NC" "$_note"
         fi
         # The gate before QA / commit is not a marker phase; say what is running.
+        # Defence in depth: a marker-only story never reaches this branch under
+        # a non-RUNNING banner (it was already partitioned into unverified
+        # above), so this condition is always true in practice — but the gate
+        # is explicit rather than implied by control flow alone.
         gate=""
-        case "$phase_label" in
-          QA)     gate=$(detect_admission_gate "$story_id" qa) ;;
-          COMMIT) gate=$(detect_admission_gate "$story_id" commit) ;;
-        esac
+        if [[ "${_GAAI_MON_BANNER:-}" == "DAEMON RUNNING" || "$_class" == "live" ]]; then
+          case "$phase_label" in
+            QA)     gate=$(detect_admission_gate "$story_id" qa) ;;
+            COMMIT) gate=$(detect_admission_gate "$story_id" commit) ;;
+          esac
+        fi
         # QA is three stages: 1/3 the deterministic admission gate, 2/3 the QA
         # agent, 3/3 the publication gate at the commit phase.
         stage="QA 1/3"; next_stage="2/3 agent"; gate_name="admission gate"
@@ -802,14 +896,42 @@ while true; do
       fi
       # The agent's log exists: for QA that is stage 2/3 of the phase.
       [[ "$phase_label" == QA ]] && phase_label="QA 2/3 agent"
+      [[ -n "$_note" ]] && echo -e "  ${CYAN}${story_id}${NC}${_note}"
       parse_log "$log_path" "$story_id" "3phase" "$phase_label"
     else
       # Legacy: unchanged path
+      [[ -n "$_note" ]] && echo -e "  ${CYAN}${story_id}${NC}${_note}"
       log_path="$LOG_DIR/${story_id}.log"
       parse_log "$log_path" "$story_id" "legacy" ""
     fi
     echo ""
   done
+
+  if [[ ${#residue_ids[@]} -gt 0 ]]; then
+    echo -e "${DIM}Residue of an ended lifecycle (no daemon, no live session):${NC}"
+    for story_id in "${residue_ids[@]}"; do
+      echo -e "  ${DIM}${story_id} — residue of an ended lifecycle${NC}"
+    done
+    echo ""
+  fi
+  if [[ ${#unverified_ids[@]} -gt 0 ]]; then
+    echo -e "${DIM}Unverified (daemon lifecycle not yet confirmed):${NC}"
+    for story_id in "${unverified_ids[@]}"; do
+      echo -e "  ${DIM}${story_id} — unverified${NC}"
+    done
+    echo ""
+  fi
+
+  # Self-termination: bind to the attempt while it is live or starting; once a
+  # bound attempt's daemon settles (DAEMON STOPPED), render this frame — it
+  # already happened, above — and end the loop on our own. DAEMON AMBIGUOUS
+  # never terminates (the operator's disposition action stays reachable via
+  # the top pane); a monitor opened with nothing live never binds, so it stays
+  # until it observes a live/starting attempt.
+  case "${_GAAI_MON_BANNER:-}" in
+    "DAEMON RUNNING"|"DAEMON STARTING") _bound_attempt="${_GAAI_MON_ATTEMPT:-unknown}" ;;
+    "DAEMON STOPPED") [[ -n "$_bound_attempt" ]] && exit 0 ;;
+  esac
 
   sleep 5
 done
