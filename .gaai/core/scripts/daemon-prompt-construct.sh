@@ -13,6 +13,13 @@
 #   SECONDARY_ROUTE      — "true" or "false" (default: "false")
 #   GAAI_STORY_TIER      — story tier, e.g. "1" or "2" (default: "", treated as < 2)
 #   PROJECT_DIR          — repo root (for resolving DEC file paths)
+# Optional (prior local-admission evidence, Section 4c):
+#   GAAI_ADMISSION_EVIDENCE_STATE    — "receipt" | "unavailable" | "" (empty = no handoff, renders nothing)
+#   GAAI_ADMISSION_EVIDENCE_BOUNDARY — "pre_qa" | "final"
+#   GAAI_ADMISSION_EVIDENCE_OUTCOME  — the typed blocked:* outcome
+#   GAAI_ADMISSION_EVIDENCE_RESULTS  — comma-joined command_id:outcome:exit_code (state=receipt only)
+#   GAAI_ADMISSION_EVIDENCE_RECEIPT  — absolute path to the retained receipt copy (state=receipt only)
+#   GAAI_ADMISSION_EVIDENCE_REASON   — typed unavailability reason (state=unavailable only)
 
 set -euo pipefail
 
@@ -471,6 +478,51 @@ QA_FINDINGS_REF
     echo "(Above qa-report is from a previous QA pass on this story. Your task is to address the specific findings, NOT re-implement from scratch. Read the impl-report + plan + story to triangulate. Apply minimal corrections and update the impl-report with a 'Cycle N corrections' section.)"
     echo ""
   fi
+fi
+
+# ── Section 4c: Prior local-admission evidence ─────────────────────────
+# The dispatcher reloads and validates a durable evidence handoff (bound to
+# story + candidate head) before every impl entry, including after a daemon
+# restart, and exports it as GAAI_ADMISSION_EVIDENCE_*. Gated ONLY on
+# GAAI_ADMISSION_EVIDENCE_STATE — never on SECONDARY_ROUTE or
+# GAAI_STORY_TIER — so the expanded bytes are identical for the claude and
+# codex executors, and byte-identical to today's output when no handoff
+# exists (the common case).
+if [[ "${GAAI_ADMISSION_EVIDENCE_STATE:-}" == "receipt" ]]; then
+  echo "=== PRIOR LOCAL ADMISSION FAILURE — EVIDENCE ==="
+  echo ""
+  echo "boundary: ${GAAI_ADMISSION_EVIDENCE_BOUNDARY:-unknown}"
+  echo "outcome: ${GAAI_ADMISSION_EVIDENCE_OUTCOME:-unknown}"
+  echo ""
+  echo "Non-passing command results (command_id:outcome:exit_code):"
+  if [[ -n "${GAAI_ADMISSION_EVIDENCE_RESULTS:-}" ]]; then
+    IFS=',' read -ra _adm_ev_result_items <<< "$GAAI_ADMISSION_EVIDENCE_RESULTS"
+    for _adm_ev_item in "${_adm_ev_result_items[@]}"; do
+      [[ -n "$_adm_ev_item" ]] && echo "  - ${_adm_ev_item}"
+    done
+  fi
+  echo ""
+  echo "Retained receipt (full command output/evidence): ${GAAI_ADMISSION_EVIDENCE_RECEIPT:-unavailable}"
+  echo ""
+  echo "(The candidate you are about to implement previously failed local admission at the"
+  echo "${GAAI_ADMISSION_EVIDENCE_BOUNDARY:-pre_qa} boundary. Fix the specific failures shown above —"
+  echo "read the retained receipt for full command output if you need it. Do not broaden scope.)"
+  echo ""
+  echo "=== END PRIOR LOCAL ADMISSION FAILURE ==="
+  echo ""
+elif [[ "${GAAI_ADMISSION_EVIDENCE_STATE:-}" == "unavailable" ]]; then
+  echo "=== PRIOR LOCAL ADMISSION FAILURE — EVIDENCE UNAVAILABLE ==="
+  echo ""
+  echo "boundary: ${GAAI_ADMISSION_EVIDENCE_BOUNDARY:-unknown}"
+  echo "outcome: ${GAAI_ADMISSION_EVIDENCE_OUTCOME:-unknown}"
+  echo "evidence=unavailable reason=${GAAI_ADMISSION_EVIDENCE_REASON:-unknown}"
+  echo ""
+  echo "(The candidate you are about to implement previously failed local admission, but no"
+  echo "command-level evidence could be captured for this outcome — it carries no receipt. Re-check"
+  echo "the story's acceptance criteria and your prior implementation for the likely defect.)"
+  echo ""
+  echo "=== END PRIOR LOCAL ADMISSION FAILURE ==="
+  echo ""
 fi
 
 # ── Section 5: DEC reads instruction ─────────────────────────────────────

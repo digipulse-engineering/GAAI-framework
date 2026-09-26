@@ -5,6 +5,16 @@ CONFIG_FILE="${1:-.gaai/project/contexts/backlog/.delivery-locks/.daemon-config}
 LOG_FILE="${2:-.gaai/project/contexts/backlog/.delivery-daemon.log}"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+
+# Read-only lifecycle observer (never daemon authority or evidence). Sourcing
+# this file only defines functions — it is safe even though this script's own
+# render loop below runs at source time with no BASH_SOURCE guard. A partial
+# or absent install renders a fail-closed DAEMON AMBIGUOUS line rather than a
+# broken pane.
+# shellcheck disable=SC1091
+source "$(dirname "$0")/lib/daemon-monitor-lifecycle.sh" 2>/dev/null || true
+_gaai_mon_lifecycle_init "$PROJECT_DIR" 2>/dev/null || true
+
 HAS_JQ=false
 command -v jq &>/dev/null && HAS_JQ=true
 LOCK_DIR="${PROJECT_DIR}/.gaai/project/contexts/backlog/.delivery-locks"
@@ -20,8 +30,38 @@ DIM='\033[2m'
 NC='\033[0m'
 
 render_banner() {
-  # shellcheck disable=SC1090
-  source "$CONFIG_FILE" 2>/dev/null || return
+  _gaai_mon_lifecycle_refresh 2>/dev/null || true
+  _gaai_mon_config_attribution "$CONFIG_FILE" 2>/dev/null || true
+
+  case "${_GAAI_MON_BANNER:-}" in
+    "DAEMON RUNNING")
+      echo -e "  ${GREEN}${BOLD}DAEMON RUNNING${NC}  daemon pid ${_GAAI_MON_DAEMON_PID}  attempt ${_GAAI_MON_ATTEMPT}"
+      ;;
+    "DAEMON STARTING")
+      echo -e "  ${YELLOW}${BOLD}DAEMON STARTING${NC}  attempt ${_GAAI_MON_ATTEMPT}"
+      ;;
+    "DAEMON STOPPED")
+      echo -e "  ${DIM}${BOLD}DAEMON STOPPED${NC}"
+      ;;
+    *)
+      echo -e "  ${YELLOW}${BOLD}DAEMON AMBIGUOUS${NC}  process_authority_invalid  operator_disposition_required"
+      ;;
+  esac
+  echo ""
+
+  # The ten names are unset unconditionally on every frame — this pane is a
+  # long-running loop, and a value sourced while the file was current must not
+  # persist into a later frame after that lifecycle ended (the defect AC1
+  # closes). Only a `current`-attributed file is then sourced.
+  unset BRANCH MODEL INTERVAL LAUNCHER CONCURRENT SKIP_PERMS MAX_TURNS HEARTBEAT TIMEOUT DRY_RUN
+  case "${_GAAI_MON_CONFIG_ATTR:-}" in
+    current)    echo -e "  ${DIM}Config: current attempt${NC}" ;;
+    historical) echo -e "  ${DIM}Config: previous lifecycle's file (not current)${NC}" ;;
+    pending)    echo -e "  ${DIM}Config: pending for this attempt${NC}" ;;
+    *)          echo -e "  ${DIM}Config: none on disk${NC}" ;;
+  esac
+  [[ "${_GAAI_MON_CONFIG_ATTR:-}" == "current" ]] && source "$CONFIG_FILE" 2>/dev/null
+  echo ""
 
   # 2-column banner (28 │ 29 = 58 inner width)
   local W=58
@@ -223,6 +263,11 @@ while true; do
     term_lines=$(tput lines 2>/dev/null || echo 24)
     log_lines=$(( term_lines - 12 ))
     [[ $log_lines -lt 5 ]] && log_lines=5
+    if [[ "${_GAAI_MON_BANNER:-}" == "DAEMON RUNNING" ]]; then
+      echo -e "  ${DIM}Log: live daemon output${NC}"
+    else
+      echo -e "  ${DIM}Log: last lifecycle's output (not live)${NC}"
+    fi
     # Filter raw NDJSON lines that nested-claude-spawn writes via --log-file when
     # orchestrators pass the daemon log path (instead of per-story). Keeps the top
     # banner human-readable without changing the underlying log pollution.

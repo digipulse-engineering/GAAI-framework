@@ -2809,6 +2809,48 @@ GAAI_ADMITTED_SHA=""
 GAAI_ADMITTED_BASE_SHA=""
 GAAI_ADMISSION_RECEIPT=""
 
+# ── Inconclusive-timeout containment + evidence-handoff paths ──
+# All markers live directly under $(_marker_dir) (= LOCK_DIR), never inside
+# the story worktree, so none of them can enter the candidate diff.
+_admission_hold_path() {
+  printf '%s/.admission-hold-%s-%s\n' "$(_marker_dir)" "$1" "$2"
+}
+
+_admission_diagnostic_path() {
+  printf '%s/.admission-diagnostic-%s-%s\n' "$(_marker_dir)" "$1" "$2"
+}
+
+_admission_retained_receipt_path() {
+  printf '%s/.admission-retained-receipt-%s-%s.json\n' "$(_marker_dir)" "$1" "$2"
+}
+
+_admission_evidence_handoff_path() {
+  printf '%s/.admission-evidence-%s\n' "$(_marker_dir)" "$1"
+}
+
+# Reproduces the adapter's own receipt naming exactly (local-admission.sh /
+# _local_admission_gate) — must never drift from that definition.
+_admission_live_receipt_path() {
+  printf '%s/local-admission-receipts/.local-admission-%s-%s.json\n' "$(_marker_dir)" "$1" "$2"
+}
+
+# 1-minute load average. Never fails: prints nothing and returns 0 when no
+# source is available, so callers can safely capture it in `$(...)`.
+_sample_load_average() {
+  local v
+  if [[ -r /proc/loadavg ]]; then
+    v=$(awk '{print $1}' /proc/loadavg 2>/dev/null) && [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    v=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}') && [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+  fi
+  if command -v uptime >/dev/null 2>&1; then
+    v=$(uptime 2>/dev/null | sed -n 's/.*load average[s]*: *\([0-9.]*\).*/\1/p')
+    [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+  fi
+  return 0
+}
+
 _admission_retryable() {
   case "$1" in
     blocked:empty_candidate_diff|blocked:command_*|blocked:execution_failed|blocked:stale_evidence)
@@ -2817,8 +2859,296 @@ _admission_retryable() {
   esac
 }
 
+# Classifies the sealed receipt for a `blocked:command_*` outcome. Prints one
+# TAB-separated line `class<TAB>nonpassing<TAB>reason` — class is
+# inconclusive|conclusive|unusable, nonpassing is a comma-joined
+# id:outcome:exit_code list (or empty), reason is empty or a typed unusable
+# reason. Never `eval`s node output; imports canonicalJson rather than
+# re-implementing the digest so it never drifts from sealReceipt's own
+# definition.
+_classify_admission_receipt() {
+  local story="$1" boundary="$2" repo="$3" receipt_path
+  receipt_path=$(_admission_live_receipt_path "$story" "$boundary")
+  if [[ -z "$repo" || ! -d "$repo" ]]; then
+    printf 'unusable\t\trepo_unresolved\n'
+    return 0
+  fi
+  local head_sha
+  head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || head_sha=""
+  local lib_dir
+  lib_dir=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+  node --input-type=module -e '
+import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+// process.argv has no placeholder for the -e script itself: argv[0] is the
+// node binary and argv[1..] are exactly the extra args passed below.
+const [, receiptPath, boundary, story, mjsPath, headSha] = process.argv;
+const { canonicalJson } = await import(mjsPath);
+const fail = (reason) => { process.stdout.write(`unusable\t\t${reason}\n`); process.exit(0); };
+let raw;
+try { raw = await readFile(receiptPath, "utf8"); } catch { fail("receipt_absent"); }
+let receipt;
+try { receipt = JSON.parse(raw); } catch { fail("receipt_unparseable"); }
+const required = ["schema_version", "boundary", "story_id", "candidate", "binding_digest",
+  "results", "outcome", "publication_admitted", "created_at", "receipt_digest"];
+if (!receipt || typeof receipt !== "object" || !required.every((k) => Object.hasOwn(receipt, k))) fail("receipt_incomplete");
+if (receipt.boundary !== boundary || receipt.story_id !== story) fail("receipt_incomplete");
+const { receipt_digest, ...rest } = receipt;
+const recomputed = createHash("sha256").update(canonicalJson(rest)).digest("hex");
+if (recomputed !== receipt_digest) fail("receipt_integrity_failed");
+const candidateHead = receipt.candidate?.head_sha;
+if (typeof candidateHead !== "string" || !/^[0-9a-f]{40}$/.test(candidateHead) || candidateHead !== headSha) fail("receipt_not_current");
+if (!Array.isArray(receipt.results) || receipt.results.length === 0) fail("receipt_incomplete");
+const validOutcomes = new Set(["passed", "failed", "timed_out", "cancelled"]);
+for (const r of receipt.results) {
+  if (!r || typeof r !== "object" || typeof r.command_id !== "string" || !validOutcomes.has(r.outcome)) fail("receipt_incomplete");
+}
+const nonPassing = receipt.results.filter((r) => r.outcome !== "passed");
+const nonPassingStr = nonPassing.map((r) => `${r.command_id}:${r.outcome}:${r.exit_code ?? "null"}`).join(",");
+const anyTimedOut = nonPassing.some((r) => r.outcome === "timed_out");
+const allPassedOrTimedOut = receipt.results.every((r) => r.outcome === "passed" || r.outcome === "timed_out");
+const cls = anyTimedOut && allPassedOrTimedOut ? "inconclusive" : "conclusive";
+process.stdout.write(`${cls}\t${nonPassingStr}\t\n`);
+' "$receipt_path" "$boundary" "$story" "${lib_dir}/lib/local-admission-executor.mjs" "$head_sha" 2>/dev/null \
+    || printf 'unusable\t\treceipt_unparseable\n'
+}
+
+# ── Containment writers (AC2) ─────────────────────────────────────────────
+# All atomic: mkdir -p, umask 077, tmp.$$ + mv. Non-zero return on any failure.
+_write_admission_hold() {
+  local story="$1" boundary="$2" head_sha="$3" outcome="$4" diagnostic_path="$5" retained_receipt="$6"
+  local path tmp
+  path=$(_admission_hold_path "$story" "$boundary")
+  tmp="${path}.tmp.$$"
+  mkdir -p "$(_marker_dir)" 2>/dev/null || return 1
+  ( umask 077
+    printf 'story_id=%s\nboundary=%s\nhead_sha=%s\noutcome=%s\ncreated_at=%s\ndiagnostic=%s\nretained_receipt=%s\n' \
+      "$story" "$boundary" "$head_sha" "$outcome" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+      "$diagnostic_path" "$retained_receipt" > "$tmp"
+  ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv "$tmp" "$path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+}
+
+_admission_hold_active() {
+  [[ -f "$(_admission_hold_path "$1" "$2")" ]]
+}
+
+_copy_admission_receipt() {
+  local story="$1" boundary="$2" src dst tmp
+  src=$(_admission_live_receipt_path "$story" "$boundary")
+  dst=$(_admission_retained_receipt_path "$story" "$boundary")
+  [[ -f "$src" ]] || return 1
+  mkdir -p "$(_marker_dir)" 2>/dev/null || return 1
+  tmp="${dst}.tmp.$$"
+  ( umask 077; cp "$src" "$tmp" ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv "$tmp" "$dst" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+}
+
+# Renders the resume procedure + evidence pointer as an operator-readable
+# diagnostic. Writes it (atomically) to the diagnostic path AND prints the
+# same content unconditionally — the print is the operator signal whether or
+# not a notifier is configured. `repo` (optional) is the worktree used to
+# check for the QA-report sidecar at the final boundary, per AC2 step 1.
+_write_admission_diagnostic() {
+  local story="$1" boundary="$2" outcome="$3" class="$4" nonpassing="$5" reason="$6"
+  local retained_receipt="$7" hold_path="$8" repo="${9:-}"
+  local target="${TARGET_BRANCH:-staging}"
+  local backlog_rel=".gaai/project/contexts/backlog/active.backlog.yaml"
+  local repo_root="${REPO_ROOT:-$PROJECT_DIR}"
+  local evidence_line
+  if [[ -n "$retained_receipt" && -f "$retained_receipt" ]]; then
+    evidence_line="retained receipt: ${retained_receipt}"
+  else
+    evidence_line="evidence=unavailable reason=${reason:-receipt_unavailable} (no receipt was copied)"
+  fi
+  local phase_target="implemented"
+  if [[ "$boundary" == final && -n "$repo" ]]; then
+    if [[ -f "${repo}/.gaai/project/contexts/artefacts/qa-reports/${story}.qa-verdict.json" \
+        && -f "${repo}/.gaai/project/contexts/artefacts/qa-reports/${story}.qa-report.md" ]]; then
+      phase_target="qa_passed"
+    fi
+  fi
+  local path tmp
+  path=$(_admission_diagnostic_path "$story" "$boundary")
+  mkdir -p "$(_marker_dir)" 2>/dev/null || return 1
+  tmp="${path}.tmp.$$"
+  # Written directly to the tmp file (never through a $(cat <<HEREDOC) command
+  # substitution) — a heredoc nested inside $(...) that mixes parens and single
+  # quotes mis-parses under bash's command-substitution scanner (verified: the
+  # exact "(...)" + embedded 'bash -c '\''...'\''' combination below breaks
+  # `bash -n` when wrapped in $()). Writing straight to a file sidesteps it.
+  ( umask 077; cat > "$tmp" <<DIAG
+[ADMISSION-ESCALATION] story=${story} boundary=${boundary} outcome=${outcome} class=${class}
+non-passing results: ${nonpassing:-none}
+${evidence_line}
+
+This admission was stopped at a typed human route and held — no implementation
+cycle was started and no further local admission will run for this story/boundary
+until the hold below is explicitly removed.
+
+Resume procedure (run against a fresh checkout of '${target}'):
+
+1. Ensure your working tree is fresh:
+     cd ${repo_root} && git fetch origin ${target} && git checkout ${target} && git reset --hard origin/${target}
+
+2. Reset the Story's lifecycle fields and publish the reset to the target branch
+   (governed write — uses the daemon's own claim protocol):
+     .gaai/core/scripts/gaai-claim.sh -- bash -c '
+       .gaai/core/scripts/backlog-scheduler.sh --set-field ${story} status in_progress ${backlog_rel} &&
+       .gaai/core/scripts/backlog-scheduler.sh --set-field ${story} phase_status ${phase_target} ${backlog_rel} &&
+       git add ${backlog_rel} &&
+       git commit -m "chore(${story}): resume after admission hold [${boundary}]" &&
+       git push origin HEAD:${target}
+     '
+
+3. Verify the reset landed on the target branch:
+     git fetch origin ${target} && git show origin/${target}:${backlog_rel} | grep -A2 "id: ${story}"
+
+4. Only after verifying step 3, remove the hold (last step):
+     rm -f ${hold_path}
+
+Residual note: if this diagnostic could not be written (disk/permission failure),
+or if the hold marker itself could not be written, this boundary reports
+'hold_unwritable' and routes nothing — a later process may then re-run the
+admission from scratch, since no hold exists to stop it.
+DIAG
+  ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  cat "$tmp"
+  mv "$tmp" "$path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+}
+
+# ── Evidence handoff (AC3) ────────────────────────────────────────────────
+# Bound to story + boundary + candidate head; reloaded (never sourced/eval'd)
+# on every impl entry so it survives a daemon restart.
+_write_admission_evidence_handoff() {
+  local story="$1" boundary="$2" head_sha="$3" outcome="$4" state="$5" results="$6" retained_receipt="$7" reason="$8"
+  local path tmp
+  path=$(_admission_evidence_handoff_path "$story")
+  tmp="${path}.tmp.$$"
+  mkdir -p "$(_marker_dir)" 2>/dev/null || return 1
+  ( umask 077
+    printf 'story_id=%s\nboundary=%s\nhead_sha=%s\noutcome=%s\nstate=%s\nresults=%s\nretained_receipt=%s\nreason=%s\ncreated_at=%s\n' \
+      "$story" "$boundary" "$head_sha" "$outcome" "$state" "$results" "$retained_receipt" "$reason" \
+      "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$tmp"
+  ) 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv "$tmp" "$path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+}
+
+# Parses line-wise with IFS='=' — never source/eval. Validates story_id and
+# head_sha against the live repo before returning success. On any mismatch,
+# reports and removes the file so a stale handoff is never rendered.
+# On success, sets: _ADM_EV_STATE _ADM_EV_BOUNDARY _ADM_EV_OUTCOME
+#                   _ADM_EV_RESULTS _ADM_EV_RECEIPT _ADM_EV_REASON
+_load_admission_evidence_handoff() {
+  local story="$1" repo="$2" path
+  _ADM_EV_STATE=""; _ADM_EV_BOUNDARY=""; _ADM_EV_OUTCOME=""
+  _ADM_EV_RESULTS=""; _ADM_EV_RECEIPT=""; _ADM_EV_REASON=""
+  path=$(_admission_evidence_handoff_path "$story")
+  [[ -f "$path" ]] || return 1
+  local head_sha file_story file_head file_boundary file_outcome file_state file_results file_receipt file_reason
+  head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || head_sha=""
+  local line key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      story_id) file_story="$value" ;;
+      boundary) file_boundary="$value" ;;
+      head_sha) file_head="$value" ;;
+      outcome) file_outcome="$value" ;;
+      state) file_state="$value" ;;
+      results) file_results="$value" ;;
+      retained_receipt) file_receipt="$value" ;;
+      reason) file_reason="$value" ;;
+    esac
+  done < "$path"
+  if [[ "$file_story" != "$story" || -z "$head_sha" || "$file_head" != "$head_sha" ]]; then
+    echo "[ADMISSION-EVIDENCE] story=${story} ignored=stale_or_mismatched_handoff"
+    rm -f "$path" 2>/dev/null || true
+    return 1
+  fi
+  _ADM_EV_STATE="$file_state"; _ADM_EV_BOUNDARY="$file_boundary"; _ADM_EV_OUTCOME="$file_outcome"
+  _ADM_EV_RESULTS="$file_results"; _ADM_EV_RECEIPT="$file_receipt"; _ADM_EV_REASON="$file_reason"
+  return 0
+}
+
+_clear_admission_evidence_handoff() {
+  rm -f "$(_admission_evidence_handoff_path "$1")" 2>/dev/null || true
+}
+
+# ── Shared human-route applier (AC2) ──────────────────────────────────────
+# Mandatory order: (a) hold write [failure → hold_unwritable, route/persist
+# nothing]; (b) retained receipt copy [failure → continue, evidence=unavailable
+# in reason]; (c) diagnostic write + unconditional print; (d) terminal
+# lifecycle persist; (e) guarded notify. Never writes .qa-route, never touches
+# a retry counter, spawns nothing, never sets status=failed.
+_apply_admission_human_route() {
+  local story="$1" trace="$2" boundary="$3" outcome="$4" class="$5" nonpassing="$6" reason="$7" repo="${8:-}"
+  local head_sha=""
+  [[ -n "$repo" ]] && head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || true
+  local diagnostic_path retained_receipt=""
+  diagnostic_path=$(_admission_diagnostic_path "$story" "$boundary")
+  if ! _write_admission_hold "$story" "$boundary" "$head_sha" "$outcome" "$diagnostic_path" ""; then
+    echo "[ADMISSION-HOLD] story=${story} boundary=${boundary} hold_unwritable — routing nothing; a later process may re-run this admission"
+    return 1
+  fi
+  # AC5: an "unusable" receipt (unreadable/invalid/incomplete/stale) is never
+  # copied as if it were evidence — a raw byte-copy of garbage is not evidence,
+  # and AC5 requires evidence=unavailable with the live path in that case.
+  # Only "inconclusive" (a receipt the classifier trusts) attempts the copy.
+  if [[ "$class" != "unusable" ]] && _copy_admission_receipt "$story" "$boundary"; then
+    retained_receipt=$(_admission_retained_receipt_path "$story" "$boundary")
+  else
+    [[ -n "$reason" ]] || reason="receipt_copy_failed"
+  fi
+  _write_admission_diagnostic "$story" "$boundary" "$outcome" "$class" "$nonpassing" "$reason" \
+    "$retained_receipt" "$(_admission_hold_path "$story" "$boundary")" "$repo" || true
+  local phase="commit" terminal="commit_stalled"
+  [[ "$boundary" == pre_qa ]] && { phase="qa"; terminal="qa_escalated"; }
+  _journal_persist_lifecycle "$story" "dispatch.${phase}" phase_status "$terminal" || return 1
+  declare -F notify_escalation_inline >/dev/null 2>&1 && \
+    notify_escalation_inline "$story" "$outcome" "Local ${boundary} admission is ${class} — held for operator review, see ${diagnostic_path}"
+  return 0
+}
+
+# ── Boundary hold guard (AC2) ──────────────────────────────────────────────
+# Called first, before any fetch/restore/neutralize/seal/commit/admission at
+# both boundary entry points. A present hold re-applies the already-written
+# human route — no new hold, no second receipt copy, no admission execution —
+# and re-prints the existing diagnostic so re-entry (including after a daemon
+# restart) is idempotent and silent-stop-proof.
+_enforce_admission_hold() {
+  local story_id="$1" trace_id="$2" boundary="$3" repo="${4:-}"
+  local hold_path diag_path outcome_val="" key value
+  hold_path=$(_admission_hold_path "$story_id" "$boundary")
+  diag_path=$(_admission_diagnostic_path "$story_id" "$boundary")
+  if [[ -f "$hold_path" ]]; then
+    while IFS='=' read -r key value; do
+      [[ "$key" == outcome ]] && outcome_val="$value"
+    done < "$hold_path"
+  fi
+  echo "[ADMISSION-HOLD] story=${story_id} boundary=${boundary} outcome=${outcome_val:-unknown} — held, re-applying human route, zero admission executions"
+  [[ -f "$diag_path" ]] && cat "$diag_path"
+  local phase="commit" terminal="commit_stalled"
+  [[ "$boundary" == pre_qa ]] && { phase="qa"; terminal="qa_escalated"; }
+  _journal_persist_lifecycle "$story_id" "dispatch.${phase}" phase_status "$terminal" || true
+  declare -F notify_escalation_inline >/dev/null 2>&1 && \
+    notify_escalation_inline "$story_id" "${outcome_val:-admission_held}" \
+      "Local ${boundary} admission remains held for operator review — see ${diag_path}"
+  echo "[ADMISSION-DECISION] story=${story_id} boundary=${boundary} outcome=${outcome_val:-held} nonpassing=none class=inconclusive route=human diagnostic=${diag_path} hold=${hold_path} load=unavailable"
+}
+
+# Outcomes routed before any admission runs, or by a publication guard after
+# one — no load sample exists for these regardless of what a stale env var
+# from an earlier boundary in the same commit-phase call might hold.
+_admission_load_unavailable_outcome() {
+  case "$1" in
+    blocked:empty_candidate_diff|blocked:base_fetch_failed|blocked:seal_*|blocked:base_reconcile_failed|blocked:governance_neutralize_failed)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 _route_admission_block() {
-  local story_id="$1" trace_id="$2" boundary="$3" outcome="$4"
+  local story_id="$1" trace_id="$2" boundary="$3" outcome="$4" repo="${5:-}"
   local phase="commit"
   LOCAL_ADMISSION_OUTCOME="$outcome"
   [[ "$boundary" == pre_qa ]] && phase="qa"
@@ -2828,20 +3158,92 @@ _route_admission_block() {
   else
     _emit_commit_routing_record "$story_id" "$trace_id" error "$outcome" 0 "" false
   fi
-  if _admission_retryable "$outcome"; then
-    local route="${LOCK_DIR}/.qa-route-${story_id}" tmp="${LOCK_DIR}/.qa-route-${story_id}.tmp.$$"
+
+  # AC1: classify only for blocked:command_* — every other outcome keeps
+  # today's route (retryable → impl; else → today's bare human route, no hold).
+  local class="conclusive" nonpassing="" reason=""
+  if [[ "$outcome" == blocked:command_* ]]; then
+    local cls_line
+    cls_line=$(_classify_admission_receipt "$story_id" "$boundary" "$repo")
+    IFS=$'\t' read -r class nonpassing reason <<<"$cls_line"
+  fi
+
+  local route_taken="" diag_path="-" hold_path_disp="-" journal_failed=0
+  if [[ "$class" == inconclusive ]]; then
+    # AC1/AC2: host-implicated timeout — typed human route, held.
+    diag_path=$(_admission_diagnostic_path "$story_id" "$boundary")
+    hold_path_disp=$(_admission_hold_path "$story_id" "$boundary")
+    if _apply_admission_human_route "$story_id" "$trace_id" "$boundary" "$outcome" inconclusive "$nonpassing" "" "$repo"; then
+      route_taken="human"
+    else
+      route_taken="none"
+    fi
+  elif [[ "$class" == unusable && "$outcome" == blocked:command_* ]]; then
+    # AC5: a command_* outcome whose receipt cannot be trusted never goes to
+    # implementation (no evidence to fix) — same typed human route, evidence=unavailable.
+    local live_receipt; live_receipt=$(_admission_live_receipt_path "$story_id" "$boundary")
+    diag_path=$(_admission_diagnostic_path "$story_id" "$boundary")
+    hold_path_disp=$(_admission_hold_path "$story_id" "$boundary")
+    if _apply_admission_human_route "$story_id" "$trace_id" "$boundary" "$outcome" unusable "$nonpassing" \
+        "${reason}; live_receipt=${live_receipt}" "$repo"; then
+      route_taken="human"
+    else
+      route_taken="none"
+    fi
+  elif _admission_retryable "$outcome"; then
+    route_taken="impl"
+    local qroute="${LOCK_DIR}/.qa-route-${story_id}" qtmp="${LOCK_DIR}/.qa-route-${story_id}.tmp.$$"
     local retry_phase_status="qa_failed"
     [[ "$phase" == commit ]] && retry_phase_status="implemented"
-    _journal_persist_lifecycle "$story_id" "dispatch.${phase}" \
-      phase_status "$retry_phase_status" || return 1
-    mkdir -p "$LOCK_DIR" 2>/dev/null || true
-    printf 'impl\n' > "$tmp" 2>/dev/null && mv "$tmp" "$route" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    # AC3: write the evidence handoff for the pre-QA retryable branch, before
+    # the lifecycle persist and the .qa-route write — this is the branch that
+    # leads to an implementation spawn.
+    if [[ "$phase" == qa ]]; then
+      local head_sha=""
+      [[ -n "$repo" ]] && head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
+      local ev_state="unavailable" ev_results="" ev_receipt="" ev_reason="$outcome"
+      if [[ "$outcome" == blocked:command_* && "$class" == conclusive ]]; then
+        if _copy_admission_receipt "$story_id" "$boundary"; then
+          ev_state="receipt"; ev_receipt=$(_admission_retained_receipt_path "$story_id" "$boundary")
+          ev_results="$nonpassing"; ev_reason=""
+        else
+          ev_reason="retained_copy_failed"
+        fi
+      fi
+      _write_admission_evidence_handoff "$story_id" "$boundary" "$head_sha" "$outcome" \
+        "$ev_state" "$ev_results" "$ev_receipt" "$ev_reason" || true
+    fi
+    if _journal_persist_lifecycle "$story_id" "dispatch.${phase}" \
+        phase_status "$retry_phase_status"; then
+      mkdir -p "$LOCK_DIR" 2>/dev/null || true
+      printf 'impl\n' > "$qtmp" 2>/dev/null && mv "$qtmp" "$qroute" 2>/dev/null || rm -f "$qtmp" 2>/dev/null
+    else
+      route_taken="none"
+      journal_failed=1
+    fi
   else
+    route_taken="human"
     local terminal="commit_stalled"; [[ "$boundary" == pre_qa ]] && terminal="qa_escalated"
-    _journal_persist_lifecycle "$story_id" "dispatch.${phase}" phase_status "$terminal" || return 1
-    declare -F notify_escalation_inline >/dev/null 2>&1 && \
-      notify_escalation_inline "$story_id" "$outcome" "Local ${boundary} admission requires operator attention before any downstream spend"
+    if _journal_persist_lifecycle "$story_id" "dispatch.${phase}" phase_status "$terminal"; then
+      declare -F notify_escalation_inline >/dev/null 2>&1 && \
+        notify_escalation_inline "$story_id" "$outcome" "Local ${boundary} admission requires operator attention before any downstream spend"
+    else
+      route_taken="none"
+      journal_failed=1
+    fi
   fi
+
+  # AC4: one decision line per call, on every path.
+  local decision_class="conclusive"; [[ "$class" == inconclusive ]] && decision_class="inconclusive"
+  local load_str="unavailable"
+  if ! _admission_load_unavailable_outcome "$outcome"; then
+    if [[ -n "${GAAI_ADMISSION_LOAD_BEFORE:-}" || -n "${GAAI_ADMISSION_LOAD_AFTER:-}" ]]; then
+      load_str="${GAAI_ADMISSION_LOAD_BEFORE:-unavailable}/${GAAI_ADMISSION_LOAD_AFTER:-unavailable}"
+    fi
+  fi
+  echo "[ADMISSION-DECISION] story=${story_id} boundary=${boundary} outcome=${outcome} nonpassing=${nonpassing:-none} class=${decision_class} route=${route_taken} diagnostic=${diag_path} hold=${hold_path_disp} load=${load_str}"
+  (( journal_failed )) && return 1
+  return 0
 }
 
 _restore_delivery_governance() {
@@ -2980,11 +3382,13 @@ _local_admission_gate() {
   # shared-home repair waits instead of moving the ground under its fetches.
   local _gate_rc=0
   _write_admission_gate_marker || true
+  GAAI_ADMISSION_LOAD_BEFORE=$(_sample_load_average)
   _run_local_admission "$boundary" "$story_id" "$repo" "${TARGET_BRANCH:-staging}" "$receipts" \
     || _gate_rc=$?
+  GAAI_ADMISSION_LOAD_AFTER=$(_sample_load_average)
   _remove_admission_gate_marker
   if (( _gate_rc != 0 )); then
-    _route_admission_block "$story_id" "$trace_id" "$boundary" "${LOCAL_ADMISSION_OUTCOME:-blocked:unknown}"
+    _route_admission_block "$story_id" "$trace_id" "$boundary" "${LOCAL_ADMISSION_OUTCOME:-blocked:unknown}" "$repo"
     return 1
   fi
   local fields receipt_head receipt_base receipt_outcome receipt_publication selected
@@ -2994,7 +3398,7 @@ _local_admission_gate() {
       || ! "$receipt_base" =~ ^[0-9a-f]{40}$ || "$receipt_outcome" != pass \
       || "$receipt_publication" != "$expected_publication" ]]; then
     rm -f "$LOCAL_ADMISSION_RECEIPT_PATH" 2>/dev/null || true
-    _route_admission_block "$story_id" "$trace_id" "$boundary" blocked:receipt_invalid
+    _route_admission_block "$story_id" "$trace_id" "$boundary" blocked:receipt_invalid "$repo"
     return 1
   fi
   GAAI_ADMITTED_SHA="$receipt_head"; GAAI_ADMITTED_BASE_SHA="$receipt_base"
@@ -3004,8 +3408,13 @@ _local_admission_gate() {
 
 _admit_current_candidate() {
   local boundary="$1" story_id="$2" trace_id="$3" repo="$4"
+  GAAI_ADMISSION_LOAD_BEFORE=""; GAAI_ADMISSION_LOAD_AFTER=""
+  if _admission_hold_active "$story_id" "$boundary"; then
+    _enforce_admission_hold "$story_id" "$trace_id" "$boundary" "$repo"
+    return 1
+  fi
   if ! _reconcile_admission_base "$repo"; then
-    _route_admission_block "$story_id" "$trace_id" "$boundary" blocked:base_reconcile_failed
+    _route_admission_block "$story_id" "$trace_id" "$boundary" blocked:base_reconcile_failed "$repo"
     return 1
   fi
   _local_admission_gate "$boundary" "$story_id" "$trace_id" "$repo"
@@ -3013,6 +3422,11 @@ _admit_current_candidate() {
 
 _prepare_pre_qa_admission() {
   local story_id="$1" trace_id="$2" repo="$3" base="${TARGET_BRANCH:-staging}"
+  GAAI_ADMISSION_LOAD_BEFORE=""; GAAI_ADMISSION_LOAD_AFTER=""
+  if _admission_hold_active "$story_id" pre_qa; then
+    _enforce_admission_hold "$story_id" "$trace_id" pre_qa "$repo"
+    return 1
+  fi
   local candidate_paths=(. \
     ":(exclude,top,literal).gaai/project/contexts/artefacts/plans/${story_id}.execution-plan.md" \
     ":(exclude,top,literal).gaai/project/contexts/artefacts/impl-reports/${story_id}.impl-report.md" \
@@ -3024,23 +3438,23 @@ _prepare_pre_qa_admission() {
   # Fetched first so the merge-base neutralization reverts to is computed
   # against the current target.
   git -C "$repo" fetch origin "$base" --quiet 2>/dev/null || {
-    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:base_fetch_failed; return 1; }
+    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:base_fetch_failed "$repo"; return 1; }
   _neutralize_committed_governance "$repo" "$story_id" pre_qa || {
-    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:governance_neutralize_failed; return 1; }
+    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:governance_neutralize_failed "$repo"; return 1; }
   git -C "$repo" add -A 2>/dev/null || {
-    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_stage_failed; return 1; }
+    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_stage_failed "$repo"; return 1; }
   if git -C "$repo" diff --cached --quiet "origin/${base}" -- "${candidate_paths[@]}"; then
-    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:empty_candidate_diff
+    _route_admission_block "$story_id" "$trace_id" pre_qa blocked:empty_candidate_diff "$repo"
     return 1
   fi
   if ! git -C "$repo" diff --cached --quiet; then
     git -C "$repo" commit -m "chore(${story_id}): local implementation seal" \
       -m '[gaai-local-admission:pre_qa]' >/dev/null 2>&1 || {
-      _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_commit_failed; return 1; }
+      _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_commit_failed "$repo"; return 1; }
   elif ! git -C "$repo" log -1 --format=%B | grep -q '^\[gaai-local-admission:pre_qa\]$'; then
     git -C "$repo" commit --allow-empty -m "chore(${story_id}): local implementation seal" \
       -m '[gaai-local-admission:pre_qa]' >/dev/null 2>&1 || {
-      _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_commit_failed; return 1; }
+      _route_admission_block "$story_id" "$trace_id" pre_qa blocked:seal_commit_failed "$repo"; return 1; }
   fi
   _admit_current_candidate pre_qa "$story_id" "$trace_id" "$repo"
 }
@@ -4458,6 +4872,18 @@ handle_impl_phase() {
   # choice — let it run, observe the outcome, learn from data. Removing the
   # gate trades probabilistic cost exposure for deterministic governability.
 
+  # ── AC3: reload the admission evidence handoff, if any, so a conclusive
+  #    pre-QA local-admission failure reaches this implementation prompt with
+  #    structured evidence of what failed. Runs on every impl entry, including
+  #    after a daemon restart — the handoff is a file under LOCK_DIR, not
+  #    in-memory state. Absent/stale/mismatched handoff → all six vars empty,
+  #    byte-identical to today's prompt.
+  local _adm_ev_state="" _adm_ev_boundary="" _adm_ev_outcome="" _adm_ev_results="" _adm_ev_receipt="" _adm_ev_reason=""
+  if _load_admission_evidence_handoff "$story_id" "$worktree_path"; then
+    _adm_ev_state="$_ADM_EV_STATE"; _adm_ev_boundary="$_ADM_EV_BOUNDARY"; _adm_ev_outcome="$_ADM_EV_OUTCOME"
+    _adm_ev_results="$_ADM_EV_RESULTS"; _adm_ev_receipt="$_ADM_EV_RECEIPT"; _adm_ev_reason="$_ADM_EV_REASON"
+  fi
+
   local prompt_content
   if ! prompt_content=$(
     GAAI_STORY_ID="$story_id" \
@@ -4468,6 +4894,12 @@ handle_impl_phase() {
     SECONDARY_ROUTE="$_secondary_route_flag" \
     GAAI_STORY_TIER="$_tier" \
     PROJECT_DIR="$PROJECT_DIR" \
+    GAAI_ADMISSION_EVIDENCE_STATE="$_adm_ev_state" \
+    GAAI_ADMISSION_EVIDENCE_BOUNDARY="$_adm_ev_boundary" \
+    GAAI_ADMISSION_EVIDENCE_OUTCOME="$_adm_ev_outcome" \
+    GAAI_ADMISSION_EVIDENCE_RESULTS="$_adm_ev_results" \
+    GAAI_ADMISSION_EVIDENCE_RECEIPT="$_adm_ev_receipt" \
+    GAAI_ADMISSION_EVIDENCE_REASON="$_adm_ev_reason" \
     bash "$prompt_construct_script" 2>/dev/null
   ); then
     echo "[ERROR] ${story_id} handle_impl_phase: daemon-prompt-construct.sh failed"
@@ -5293,6 +5725,9 @@ handle_qa_phase() {
         _emit_qa_routing_record "$story_id" "$trace_id" "error" "QA_SCHEDULER_FAILURE" "$duration_ms"
         return 1
       fi
+      # AC3: the handoff is retained until the next QA verdict is persisted —
+      # this is one.
+      _clear_admission_evidence_handoff "$story_id"
       _emit_qa_routing_record "$story_id" "$trace_id" "primary" "null" "$duration_ms" "$qa_validator_out"
       # Worktree-scope audit (advisory)
       _run_worktree_audit "$story_id" "qa" "$log_path" "$worktree_path"
@@ -5313,6 +5748,10 @@ handle_qa_phase() {
         _emit_qa_routing_record "$story_id" "$trace_id" "error" "QA_SCHEDULER_FAILURE" "$duration_ms"
         return 1
       fi
+      # AC3: the handoff is retained until the next QA verdict is persisted —
+      # this is one. A fresh handoff (if any) is written by the pre-QA retry
+      # branch of _route_admission_block on the next admission, not here.
+      _clear_admission_evidence_handoff "$story_id"
       # DEC-200 D5 / AC3-AC4: persist the resolver's derived root-cause route for
       # dispatch_3phase_story's qa_failed case to consume. remediation_route is
       # closed to plan|impl on a FAIL aggregate; any other/empty value defensively
@@ -5337,6 +5776,9 @@ handle_qa_phase() {
         _emit_qa_routing_record "$story_id" "$trace_id" "error" "QA_SCHEDULER_FAILURE" "$duration_ms"
         return 1
       fi
+      # AC3: the handoff is retained until the next QA verdict is persisted —
+      # this is one.
+      _clear_admission_evidence_handoff "$story_id"
       _emit_qa_routing_record "$story_id" "$trace_id" "error" "QA_VERDICT:ESCALATE" "$duration_ms" "$qa_validator_out"
       # Surface the QA-agent ESCALATE verdict to the operator via the existing
       # notification machinery (terminal bell + macOS osascript + webhook+HMAC).
@@ -6318,7 +6760,7 @@ ${qa_snippet}"
   # admission seals and the publication loop pushes.
   if ! _neutralize_committed_governance "$worktree_path" "$story_id" final; then
     echo "[ERROR] ${story_id} handle_commit_phase: committed governance edits could not be neutralized [class=COMMIT_FAILED]"
-    _route_admission_block "$story_id" "$trace_id" final blocked:governance_neutralize_failed
+    _route_admission_block "$story_id" "$trace_id" final blocked:governance_neutralize_failed "$worktree_path"
     return 1
   fi
 
@@ -6481,11 +6923,11 @@ work, not as a reviewed result."
   # HEAD. NOT effective after squash-merge (squash yields a new commit). Fail-open.
   local pr_url="" _skip_pr_create=0 _head_in_base=0
   if ! git -C "$worktree_path" fetch origin staging 2>/dev/null; then
-    _route_admission_block "$story_id" "$trace_id" final blocked:base_fetch_failed
+    _route_admission_block "$story_id" "$trace_id" final blocked:base_fetch_failed "$worktree_path"
     return 1
   fi
   if [[ "$(git -C "$worktree_path" rev-parse origin/staging 2>/dev/null)" != "$GAAI_ADMITTED_BASE_SHA" ]]; then
-    _route_admission_block "$story_id" "$trace_id" final blocked:stale_evidence
+    _route_admission_block "$story_id" "$trace_id" final blocked:stale_evidence "$worktree_path"
     return 1
   fi
   if git -C "$worktree_path" merge-base --is-ancestor HEAD origin/staging 2>/dev/null; then

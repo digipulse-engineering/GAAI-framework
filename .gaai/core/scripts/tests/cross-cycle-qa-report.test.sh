@@ -531,6 +531,101 @@ run_t11() {
   [[ -z "$out" ]] && pass "T11: no output (invalid handoff -> no injection)" || fail "T11: expected no output got='$out'"
 }
 
+# ── T12: prior local-admission evidence (Section 4c) ────────────
+# Runs the real daemon-prompt-construct.sh (not a stub) with GAAI_ADMISSION_EVIDENCE_*
+# set, and asserts the receipt-bearing and receipt-absent blocks' content before
+# comparing bytes. Also checks: retained-receipt path stays outside the candidate
+# worktree; the block is byte-identical whether or not SECONDARY_ROUTE (the
+# claude/codex-equivalent routing knob this constructor exposes) is set; and an
+# empty GAAI_ADMISSION_EVIDENCE_STATE reproduces today's output exactly.
+run_t12() {
+  echo "T12: prior local-admission evidence"
+  local wt="$FIXTURE_DIR/t12-wt"
+  mkdir -p "$wt"
+  make_story_with_inventory "$wt" "some/file.ts"
+  local story_path="${wt}/.gaai/project/contexts/artefacts/stories/${SID}.story.md"
+  local plan_path="${wt}/.gaai/project/contexts/artefacts/plans/${SID}.execution-plan.md"
+  mkdir -p "$(dirname "$plan_path")"
+  echo "# Plan" > "$plan_path"
+  local retained_receipt="${FIXTURE_DIR}/locks/.admission-retained-receipt-${SID}-pre_qa.json"
+
+  local out_receipt
+  out_receipt=$(GAAI_STORY_ID="$SID" GAAI_STORY_PATH="$story_path" GAAI_PLAN_PATH="$plan_path" \
+    GAAI_WORKSPACE_PATH="$wt" PROJECT_DIR="$PROJECT_DIR" \
+    GAAI_ADMISSION_EVIDENCE_STATE=receipt GAAI_ADMISSION_EVIDENCE_BOUNDARY=pre_qa \
+    GAAI_ADMISSION_EVIDENCE_OUTCOME=blocked:command_failed \
+    GAAI_ADMISSION_EVIDENCE_RESULTS="c1:failed:1" \
+    GAAI_ADMISSION_EVIDENCE_RECEIPT="$retained_receipt" \
+    bash "$PROMPT_LIB" 2>/dev/null)
+  local rc1=$?
+  [[ "$rc1" -eq 0 ]] && pass "T12: receipt-state exits 0" || fail "T12: receipt-state exited $rc1"
+  grep -q "boundary: pre_qa" <<<"$out_receipt" && pass "T12: receipt-state renders boundary" || fail "T12: receipt-state missing boundary"
+  grep -q "outcome: blocked:command_failed" <<<"$out_receipt" && pass "T12: receipt-state renders outcome" || fail "T12: receipt-state missing outcome"
+  grep -q "c1:failed:1" <<<"$out_receipt" && pass "T12: receipt-state renders non-passing result" || fail "T12: receipt-state missing result"
+  grep -qF "$retained_receipt" <<<"$out_receipt" && pass "T12: receipt-state renders retained receipt path" || fail "T12: receipt-state missing retained path"
+  # Scope the containment check to the admission-evidence block itself — the
+  # wider prompt legitimately mentions $wt/ elsewhere (NOTES_PATH etc).
+  local receipt_block
+  receipt_block=$(sed -n '/^=== PRIOR LOCAL ADMISSION FAILURE/,/^=== END PRIOR LOCAL ADMISSION FAILURE ===$/p' <<<"$out_receipt")
+  if grep -qF "${wt}/" <<<"$receipt_block"; then
+    fail "T12: retained receipt path leaked into the candidate worktree"
+  else
+    pass "T12: retained receipt path stays outside the candidate worktree"
+  fi
+  # Full containment check per the Story's own test requirement: not merely
+  # "outside the candidate" but specifically "inside the lock directory" —
+  # the two are independent claims (a path could be outside the worktree and
+  # still not be under LOCK_DIR, e.g. /tmp or the repo root).
+  if [[ "$retained_receipt" == "${FIXTURE_DIR}/locks/"* ]] && grep -qF "$retained_receipt" <<<"$receipt_block"; then
+    pass "T12: retained receipt path lies inside the lock directory"
+  else
+    fail "T12: retained receipt path is not inside the lock directory (got: $retained_receipt)"
+  fi
+
+  local out_unavail
+  out_unavail=$(GAAI_STORY_ID="$SID" GAAI_STORY_PATH="$story_path" GAAI_PLAN_PATH="$plan_path" \
+    GAAI_WORKSPACE_PATH="$wt" PROJECT_DIR="$PROJECT_DIR" \
+    GAAI_ADMISSION_EVIDENCE_STATE=unavailable GAAI_ADMISSION_EVIDENCE_BOUNDARY=pre_qa \
+    GAAI_ADMISSION_EVIDENCE_OUTCOME=blocked:empty_candidate_diff \
+    GAAI_ADMISSION_EVIDENCE_REASON=blocked:empty_candidate_diff \
+    bash "$PROMPT_LIB" 2>/dev/null)
+  grep -q "evidence=unavailable reason=blocked:empty_candidate_diff" <<<"$out_unavail" \
+    && pass "T12: unavailable-state renders the typed reason" || fail "T12: unavailable-state missing reason"
+  local unavail_block
+  unavail_block=$(sed -n '/^=== PRIOR LOCAL ADMISSION FAILURE/,/^=== END PRIOR LOCAL ADMISSION FAILURE ===$/p' <<<"$out_unavail")
+  if grep -qE '^  - ' <<<"$unavail_block"; then
+    fail "T12: unavailable-state fabricated a non-passing result line"
+  else
+    pass "T12: unavailable-state fabricates no result fields"
+  fi
+
+  local out_receipt_route2
+  out_receipt_route2=$(GAAI_STORY_ID="$SID" GAAI_STORY_PATH="$story_path" GAAI_PLAN_PATH="$plan_path" \
+    GAAI_WORKSPACE_PATH="$wt" PROJECT_DIR="$PROJECT_DIR" SECONDARY_ROUTE=true GAAI_STORY_TIER=2 \
+    GAAI_ADMISSION_EVIDENCE_STATE=receipt GAAI_ADMISSION_EVIDENCE_BOUNDARY=pre_qa \
+    GAAI_ADMISSION_EVIDENCE_OUTCOME=blocked:command_failed \
+    GAAI_ADMISSION_EVIDENCE_RESULTS="c1:failed:1" \
+    GAAI_ADMISSION_EVIDENCE_RECEIPT="$retained_receipt" \
+    bash "$PROMPT_LIB" 2>/dev/null)
+  local block1 block2
+  block1=$(sed -n '/^=== PRIOR LOCAL ADMISSION FAILURE/,/^=== END PRIOR LOCAL ADMISSION FAILURE ===$/p' <<<"$out_receipt")
+  block2=$(sed -n '/^=== PRIOR LOCAL ADMISSION FAILURE/,/^=== END PRIOR LOCAL ADMISSION FAILURE ===$/p' <<<"$out_receipt_route2")
+  [[ -n "$block1" && "$block1" == "$block2" ]] \
+    && pass "T12: admission-evidence block is byte-identical regardless of SECONDARY_ROUTE/tier" \
+    || fail "T12: admission-evidence block differs across route settings"
+
+  local out_empty out_noenv
+  out_empty=$(GAAI_STORY_ID="$SID" GAAI_STORY_PATH="$story_path" GAAI_PLAN_PATH="$plan_path" \
+    GAAI_WORKSPACE_PATH="$wt" PROJECT_DIR="$PROJECT_DIR" GAAI_ADMISSION_EVIDENCE_STATE="" \
+    bash "$PROMPT_LIB" 2>/dev/null)
+  out_noenv=$(GAAI_STORY_ID="$SID" GAAI_STORY_PATH="$story_path" GAAI_PLAN_PATH="$plan_path" \
+    GAAI_WORKSPACE_PATH="$wt" PROJECT_DIR="$PROJECT_DIR" \
+    bash "$PROMPT_LIB" 2>/dev/null)
+  [[ "$out_empty" == "$out_noenv" ]] \
+    && pass "T12: empty GAAI_ADMISSION_EVIDENCE_STATE reproduces today's output byte-for-byte" \
+    || fail "T12: empty-state output differs from the no-env baseline"
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 run_t1
@@ -544,6 +639,7 @@ run_t8
 run_t9
 run_t10
 run_t11
+run_t12
 
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""

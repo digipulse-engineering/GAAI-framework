@@ -4646,6 +4646,807 @@ else
   fail "LOCAL-ADMISSION-REAL-c: final currentness/publication separation failed"
 fi
 
+# ── Admission AC6: inconclusive-timeout human route; real failure carries evidence ──
+# Dedicated story ids + dedicated LOCK_DIR subdirectory (never TST-QA-SPAWN-ERR,
+# never TST-LOCAL-ADMISSION), stubbing _run_local_admission (not
+# _prepare_pre_qa_admission) so the real boundary handlers, the real
+# _route_admission_block and the real hold guard execute. The real
+# functions are still bound here (LOCAL-ADMISSION-AC4 below overrides
+# _admit_current_candidate — this block runs first).
+echo "ADMISSION-AC6: inconclusive timeout admission -> human route; real failure -> impl with evidence"
+AC6_FIXTURE=$(mktemp -d /tmp/gaai-e1127s30-ac6-XXXXXX)
+AC6_REPO="$AC6_FIXTURE/repo"; AC6_REMOTE="$AC6_FIXTURE/remote.git"
+AC6_LOCK_DIR="$AC6_FIXTURE/locks"
+mkdir -p "$AC6_REPO/src" "$AC6_LOCK_DIR"
+git init -q --bare "$AC6_REMOTE"; git init -q "$AC6_REPO"
+git -C "$AC6_REPO" config user.email test@example.com; git -C "$AC6_REPO" config user.name Test
+git -C "$AC6_REPO" checkout -q -b staging; git -C "$AC6_REPO" remote add origin "$AC6_REMOTE"
+printf 'base\n' > "$AC6_REPO/README.md"
+git -C "$AC6_REPO" add -A; git -C "$AC6_REPO" commit -q -m base; git -C "$AC6_REPO" push -q origin staging
+
+# Writes a correctly-sealed receipt (real receipt_digest, via the executor's
+# own exported canonicalJson) at the adapter's exact path — never a hand-rolled
+# digest that could silently drift from sealReceipt's definition.
+_ac6_write_receipt() {
+  local receipt_path="$1" boundary="$2" story="$3" head_sha="$4" outcome="$5" results_json="$6"
+  node --input-type=module -e '
+import { writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+const [, receiptPath, boundary, story, headSha, outcome, resultsJson, mjsPath] = process.argv;
+const { canonicalJson } = await import(mjsPath);
+const results = JSON.parse(resultsJson);
+const receipt = { schema_version: "1.0.0", boundary, story_id: story,
+  candidate: { head_sha: headSha, base_sha: "0".repeat(40) },
+  binding_digest: "test-binding", selected_surface_ids: [],
+  selected_command_ids: results.map((r) => r.command_id), results, outcome,
+  publication_admitted: false, created_at: new Date().toISOString() };
+receipt.receipt_digest = createHash("sha256").update(canonicalJson(receipt)).digest("hex");
+await writeFile(receiptPath, canonicalJson(receipt));
+' "$receipt_path" "$boundary" "$story" "$head_sha" "$outcome" "$results_json" \
+    "$SCRIPT_DIR/../lib/local-admission-executor.mjs"
+}
+
+AC6_RUN_COUNT=0
+_AC6_STUB_OUTCOME=""; _AC6_STUB_RESULTS="[]"; _AC6_STUB_MODE=""
+_run_local_admission() {
+  local boundary="$1" story="$2" repo="$3" base_ref="$4" receipt_dir="$5"
+  AC6_RUN_COUNT=$((AC6_RUN_COUNT + 1))
+  mkdir -p "$receipt_dir"
+  local head_sha; head_sha=$(git -C "$repo" rev-parse HEAD 2>/dev/null)
+  local target="${receipt_dir}/.local-admission-${story}-${boundary}.json"
+  case "$_AC6_STUB_MODE" in
+    no_receipt) rm -f "$target" ;;
+    bad_receipt) printf 'not-json' > "$target" ;;
+    *) _ac6_write_receipt "$target" "$boundary" "$story" "$head_sha" "$_AC6_STUB_OUTCOME" "$_AC6_STUB_RESULTS" ;;
+  esac
+  LOCAL_ADMISSION_OUTCOME="$_AC6_STUB_OUTCOME"
+  LOCAL_ADMISSION_RECEIPT_PATH="$target"
+  [[ "$_AC6_STUB_OUTCOME" == pass ]]
+}
+
+_ac6_make_story_branch() {
+  local story="$1"
+  git -C "$AC6_REPO" checkout -q staging
+  git -C "$AC6_REPO" branch -q -D "story/$story" 2>/dev/null || true
+  git -C "$AC6_REPO" checkout -q -b "story/$story"
+  # A prior story branch's src/ content is not on staging, so checkout prunes
+  # the now-empty directory — recreate it every time.
+  mkdir -p "$AC6_REPO/src"
+  printf 'change-%s\n' "$story" > "$AC6_REPO/src/change-$story.txt"
+}
+
+# ── (a) timed_out-only at pre_qa -> qa_escalated, no .qa-route, zero spawns,
+#        retained receipt copy recorded ────────────────────────────────────
+AC6_S1=AC6-TIMEOUT-PREQA
+# Registered in the real $FIXTURE/$BACKLOG_FILE so the file-scope
+# _journal_persist_lifecycle test double (setup L191, calls the real
+# `$SCHEDULER --set-field`) can actually persist against it — proving the
+# journal-call placement/arguments and the resulting field value, without
+# depending on the full git/journal-commit substrate (out of this Story's
+# scope; see F4 in the prior QA report for the unrelated pre-existing
+# corruption that blocks that substrate in this workspace).
+cat >> "$FIXTURE" << AC6S1ROW
+- id: ${AC6_S1}
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+AC6S1ROW
+_ac6_make_story_branch "$AC6_S1"
+_AC6_STUB_OUTCOME="blocked:command_timed_out"
+_AC6_STUB_RESULTS='[{"command_id":"unit","descriptor_digest":"d","configuration_digest":"c","outcome":"timed_out","exit_code":null,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+_AC6_STUB_MODE=""; AC6_RUN_COUNT=0
+: > "$JOURNAL_CALL_LOG"
+AC6A_RC=0
+AC6A_DIAG=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_diagnostic_path "$AC6_S1" pre_qa)
+AC6A_RETAINED=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_retained_receipt_path "$AC6_S1" pre_qa)
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S1" trace-ac6a "$AC6_REPO" >/tmp/ac6a.out 2>&1 || AC6A_RC=$?
+if [[ "$AC6A_RC" -ne 0 && "$AC6_RUN_COUNT" -eq 1 \
+    && ! -f "${AC6_LOCK_DIR}/.qa-route-${AC6_S1}" \
+    && -f "${AC6_LOCK_DIR}/.admission-hold-${AC6_S1}-pre_qa" \
+    && -s "${AC6_LOCK_DIR}/.admission-retained-receipt-${AC6_S1}-pre_qa.json" ]]; then
+  pass "AC6a: timed_out-only routes to the human hold, no .qa-route, retained receipt copy exists"
+else
+  fail "AC6a: timed_out-only routing/containment mismatch (rc=$AC6A_RC runs=$AC6_RUN_COUNT)"
+fi
+# ── (a-ext) AC2 containment detail: the journal call itself carries
+#     phase_status=qa_escalated and actually persists it, .qa-retries is
+#     never touched, the diagnostic names the retained receipt path in its
+#     evidence line, and no notifier is configured in this harness yet the
+#     diagnostic is still written and printed (AC6i) ───────────────────────
+if grep -qx "${AC6_S1}|dispatch.qa|phase_status" "$JOURNAL_CALL_LOG" \
+    && [[ "$(get_phase_status "$AC6_S1")" == "qa_escalated" ]] \
+    && [[ ! -f "${AC6_LOCK_DIR}/.qa-retries-${AC6_S1}" ]] \
+    && [[ -f "$AC6A_DIAG" ]] && grep -q "retained receipt: ${AC6A_RETAINED}" "$AC6A_DIAG" \
+    && grep -q "retained receipt: ${AC6A_RETAINED}" /tmp/ac6a.out \
+    && ! declare -F notify_escalation_inline >/dev/null 2>&1; then
+  pass "AC6a-ext: journal persists phase_status=qa_escalated, .qa-retries untouched, diagnostic (file+print) names the retained receipt, no notifier configured"
+else
+  fail "AC6a-ext: journal-write/.qa-retries/diagnostic-content/notifier-absence mismatch (ps=$(get_phase_status "$AC6_S1"))"
+fi
+# ── (a-dispatch) terminal short-circuit under the REAL dispatch_3phase_story
+#     entry point: qa_escalated is one of the bare `return 0` terminal states
+#     (no case arm invokes a phase handler), so a second, independent
+#     dispatch call on the same story proves "successive dispatch calls,
+#     zero spawn" beyond what AC6f already proves at the boundary-handler
+#     level (zero *admission* executions) ───────────────────────────────────
+AC6_REAL_PLAN_DEF=$(declare -f handle_plan_phase)
+AC6_REAL_IMPL_DEF=$(declare -f handle_impl_phase)
+AC6_REAL_QA_DEF=$(declare -f handle_qa_phase)
+AC6_REAL_COMMIT_DEF=$(declare -f handle_commit_phase)
+AC6_SPAWN_LOG="$AC6_FIXTURE/spawn-a.log"; : > "$AC6_SPAWN_LOG"
+handle_plan_phase() { echo "plan" >> "$AC6_SPAWN_LOG"; return 1; }
+handle_impl_phase() { echo "impl" >> "$AC6_SPAWN_LOG"; return 1; }
+handle_qa_phase() { echo "qa" >> "$AC6_SPAWN_LOG"; return 1; }
+handle_commit_phase() { echo "commit" >> "$AC6_SPAWN_LOG"; return 1; }
+AC6_DISPATCH_RC=0
+LOCK_DIR="$AC6_LOCK_DIR" GAAI_DISPATCH_IDENTITY_GUARD=legacy_direct \
+  dispatch_3phase_story "$AC6_S1" trace-ac6a-dispatch \
+  >/tmp/ac6a-dispatch.out 2>&1 || AC6_DISPATCH_RC=$?
+if [[ "$AC6_DISPATCH_RC" -eq 0 && ! -s "$AC6_SPAWN_LOG" ]]; then
+  pass "AC6a-dispatch: a story held at qa_escalated reaches zero phase handlers via the real dispatch_3phase_story entry point"
+else
+  fail "AC6a-dispatch: qa_escalated reached a phase handler or dispatch_3phase_story failed (rc=$AC6_DISPATCH_RC log=$(tr '\n' ',' < "$AC6_SPAWN_LOG"))"
+fi
+eval "$AC6_REAL_PLAN_DEF"; eval "$AC6_REAL_IMPL_DEF"; eval "$AC6_REAL_QA_DEF"; eval "$AC6_REAL_COMMIT_DEF"
+
+# ── (a-final) the same timed_out-only proof at the FINAL boundary, driven
+#     directly through _route_admission_block — exactly as AC6d already does
+#     for pre_qa — rather than through _admit_current_candidate's own
+#     base-reconciliation prerequisite, which is a separate concern already
+#     covered live by LOCAL-ADMISSION-REAL-c and is not what this case
+#     proves (that the final boundary's own terminal target is
+#     commit_stalled, not qa_escalated) ─────────────────────────────────────
+AC6_S1F=AC6-TIMEOUT-FINAL
+cat >> "$FIXTURE" << AC6S1FROW
+- id: ${AC6_S1F}
+  status: in_progress
+  phase_status: qa_passed
+  delivery_pipeline: 3phase
+AC6S1FROW
+_ac6_make_story_branch "$AC6_S1F"
+AC6_S1F_HEAD=$(git -C "$AC6_REPO" rev-parse HEAD)
+AC6_S1F_RECEIPT_DIR="${AC6_LOCK_DIR}/local-admission-receipts"
+mkdir -p "$AC6_S1F_RECEIPT_DIR"
+_ac6_write_receipt "${AC6_S1F_RECEIPT_DIR}/.local-admission-${AC6_S1F}-final.json" final "$AC6_S1F" \
+  "$AC6_S1F_HEAD" "blocked:command_timed_out" \
+  '[{"command_id":"unit","descriptor_digest":"d","configuration_digest":"c","outcome":"timed_out","exit_code":null,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+: > "$JOURNAL_CALL_LOG"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _route_admission_block "$AC6_S1F" trace-ac6a-final final blocked:command_timed_out "$AC6_REPO" \
+  >/tmp/ac6af.out 2>&1 || true   # the human route returns non-zero by design; assert below
+if [[ -f "${AC6_LOCK_DIR}/.admission-hold-${AC6_S1F}-final" \
+    && -s "${AC6_LOCK_DIR}/.admission-retained-receipt-${AC6_S1F}-final.json" ]] \
+    && grep -qx "${AC6_S1F}|dispatch.commit|phase_status" "$JOURNAL_CALL_LOG" \
+    && [[ "$(get_phase_status "$AC6_S1F")" == "commit_stalled" ]]; then
+  pass "AC6a-final: timed_out-only at the final boundary routes to the human hold and persists commit_stalled"
+else
+  fail "AC6a-final: final-boundary timed_out-only routing/persistence mismatch (ps=$(get_phase_status "$AC6_S1F"))"
+fi
+
+# ── (b) [timed_out, failed] in both orders -> today's route (impl) unchanged ─
+for AC6_ORDER in "timed_out,failed" "failed,timed_out"; do
+  AC6_S2="AC6-MIXED-$(tr ',' '-' <<<"$AC6_ORDER")"
+  _ac6_make_story_branch "$AC6_S2"
+  IFS=',' read -r AC6_O1 AC6_O2 <<<"$AC6_ORDER"
+  _AC6_STUB_OUTCOME="blocked:command_${AC6_O2}"
+  _AC6_STUB_RESULTS=$(printf '[{"command_id":"c1","descriptor_digest":"d","configuration_digest":"c","outcome":"%s","exit_code":null,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false},{"command_id":"c2","descriptor_digest":"d","configuration_digest":"c","outcome":"%s","exit_code":1,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]' "$AC6_O1" "$AC6_O2")
+  _AC6_STUB_MODE=""; AC6_RUN_COUNT=0
+  LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+    _prepare_pre_qa_admission "$AC6_S2" "trace-ac6b-$AC6_ORDER" "$AC6_REPO" >/tmp/ac6b.out 2>&1 || true
+  if [[ -f "${AC6_LOCK_DIR}/.qa-route-${AC6_S2}" ]] && [[ "$(cat "${AC6_LOCK_DIR}/.qa-route-${AC6_S2}")" == impl ]] \
+      && [[ ! -f "${AC6_LOCK_DIR}/.admission-hold-${AC6_S2}-pre_qa" ]]; then
+    pass "AC6b [$AC6_ORDER]: mixed timed_out+failed keeps today's impl route, no hold"
+  else
+    fail "AC6b [$AC6_ORDER]: mixed timed_out+failed route changed"
+  fi
+done
+
+# ── (b-dispatch) sidecar present/absent through the REAL dispatch_3phase_story
+#     retry-loop: sidecar present -> the qa_failed case body spends a QA
+#     retry and rewinds to `planned` (a SECOND dispatch call then reaches
+#     handle_impl_phase); sidecar absent -> the DEC-200D7 currentness gate
+#     rewinds to `implemented` and falls into handle_qa_phase in the SAME
+#     call — no QA retry spent, matching the Story's own description of the
+#     two sub-cases ───────────────────────────────────────────────────────
+AC6_REAL_QA_DEF2=$(declare -f handle_qa_phase)
+AC6_REAL_IMPL_DEF2=$(declare -f handle_impl_phase)
+AC6_WT_BASE="$AC6_FIXTURE/worktrees"; mkdir -p "$AC6_WT_BASE"
+
+# -- sidecar present --
+AC6_S2S=AC6-MIXED-DISPATCH-SIDECAR
+cat >> "$FIXTURE" << AC6S2SROW
+- id: ${AC6_S2S}
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+AC6S2SROW
+_ac6_make_story_branch "$AC6_S2S"
+_AC6_STUB_OUTCOME="blocked:command_failed"
+_AC6_STUB_RESULTS='[{"command_id":"c1","descriptor_digest":"d","configuration_digest":"c","outcome":"timed_out","exit_code":null,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false},{"command_id":"c2","descriptor_digest":"d","configuration_digest":"c","outcome":"failed","exit_code":1,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+_AC6_STUB_MODE=""; AC6_RUN_COUNT=0
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S2S" "trace-ac6b-ds" "$AC6_REPO" >/tmp/ac6b-ds.out 2>&1 || true
+AC6_S2S_WT="${AC6_WT_BASE}/${AC6_S2S}-workspace"
+mkdir -p "${AC6_S2S_WT}/.gaai/project/contexts/artefacts/qa-reports"
+printf '{}' > "${AC6_S2S_WT}/.gaai/project/contexts/artefacts/qa-reports/${AC6_S2S}.qa-verdict.json"
+printf '# qa report\n' > "${AC6_S2S_WT}/.gaai/project/contexts/artefacts/qa-reports/${AC6_S2S}.qa-report.md"
+AC6_SPAWN_LOG_S="$AC6_FIXTURE/spawn-b-sidecar.log"; : > "$AC6_SPAWN_LOG_S"
+handle_qa_phase() { echo "qa" >> "$AC6_SPAWN_LOG_S"; return 0; }
+handle_impl_phase() { echo "impl" >> "$AC6_SPAWN_LOG_S"; return 0; }
+AC6_S2S_RC1=0
+GAAI_WORKTREES_BASE="$AC6_WT_BASE" LOCK_DIR="$AC6_LOCK_DIR" GAAI_DISPATCH_IDENTITY_GUARD=legacy_direct \
+  dispatch_3phase_story "$AC6_S2S" trace-ac6b-ds1 >/tmp/ac6b-ds1.out 2>&1 || AC6_S2S_RC1=$?
+if [[ "$AC6_S2S_RC1" -eq 0 && ! -s "$AC6_SPAWN_LOG_S" \
+    && "$(get_phase_status "$AC6_S2S")" == "planned" \
+    && "$(cat "${AC6_LOCK_DIR}/.qa-retries-${AC6_S2S}" 2>/dev/null)" == "1" ]]; then
+  pass "AC6b-dispatch[sidecar-present] call 1: QA retry spent, rewound to planned, no handler invoked yet"
+else
+  fail "AC6b-dispatch[sidecar-present] call 1: rc=$AC6_S2S_RC1 ps=$(get_phase_status "$AC6_S2S") retries=$(cat "${AC6_LOCK_DIR}/.qa-retries-${AC6_S2S}" 2>/dev/null) log=$(tr '\n' ',' < "$AC6_SPAWN_LOG_S")"
+fi
+AC6_S2S_RC2=0
+GAAI_WORKTREES_BASE="$AC6_WT_BASE" LOCK_DIR="$AC6_LOCK_DIR" GAAI_DISPATCH_IDENTITY_GUARD=legacy_direct \
+  dispatch_3phase_story "$AC6_S2S" trace-ac6b-ds2 >/tmp/ac6b-ds2.out 2>&1 || AC6_S2S_RC2=$?
+if [[ "$AC6_S2S_RC2" -eq 0 && "$(cat "$AC6_SPAWN_LOG_S")" == "impl" ]]; then
+  pass "AC6b-dispatch[sidecar-present] call 2: reaches the implementation handler"
+else
+  fail "AC6b-dispatch[sidecar-present] call 2: rc=$AC6_S2S_RC2 log=$(tr '\n' ',' < "$AC6_SPAWN_LOG_S")"
+fi
+
+# -- sidecar absent --
+AC6_S2N=AC6-MIXED-DISPATCH-NOSIDECAR
+cat >> "$FIXTURE" << AC6S2NROW
+- id: ${AC6_S2N}
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+AC6S2NROW
+_ac6_make_story_branch "$AC6_S2N"
+_AC6_STUB_MODE=""; AC6_RUN_COUNT=0
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S2N" "trace-ac6b-dn" "$AC6_REPO" >/tmp/ac6b-dn.out 2>&1 || true
+AC6_S2N_WT="${AC6_WT_BASE}/${AC6_S2N}-workspace"
+mkdir -p "${AC6_S2N_WT}/.gaai/project/contexts/artefacts/qa-reports"
+# Deliberately no .qa-verdict.json / .qa-report.md — this is the sidecar-absent case.
+AC6_SPAWN_LOG_N="$AC6_FIXTURE/spawn-b-nosidecar.log"; : > "$AC6_SPAWN_LOG_N"
+handle_qa_phase() { echo "qa" >> "$AC6_SPAWN_LOG_N"; return 0; }
+handle_impl_phase() { echo "impl" >> "$AC6_SPAWN_LOG_N"; return 0; }
+AC6_S2N_RC1=0
+GAAI_WORKTREES_BASE="$AC6_WT_BASE" LOCK_DIR="$AC6_LOCK_DIR" GAAI_DISPATCH_IDENTITY_GUARD=legacy_direct \
+  dispatch_3phase_story "$AC6_S2N" trace-ac6b-dn1 >/tmp/ac6b-dn1.out 2>&1 || AC6_S2N_RC1=$?
+if [[ "$AC6_S2N_RC1" -eq 0 && "$(cat "$AC6_SPAWN_LOG_N")" == "qa" \
+    && "$(get_phase_status "$AC6_S2N")" == "implemented" \
+    && ! -f "${AC6_LOCK_DIR}/.qa-retries-${AC6_S2N}" ]]; then
+  pass "AC6b-dispatch[sidecar-absent]: currentness gate rewinds to implemented and re-enters QA in the same call, no retry spent"
+else
+  fail "AC6b-dispatch[sidecar-absent]: rc=$AC6_S2N_RC1 ps=$(get_phase_status "$AC6_S2N") retries=$([[ -f "${AC6_LOCK_DIR}/.qa-retries-${AC6_S2N}" ]] && echo present || echo absent) log=$(tr '\n' ',' < "$AC6_SPAWN_LOG_N")"
+fi
+eval "$AC6_REAL_QA_DEF2"; eval "$AC6_REAL_IMPL_DEF2"
+
+# ── (evidence-reload) AC3's whole reload chain, end to end, across a REAL
+#     process boundary: a conclusive pre-QA failure writes the evidence
+#     handoff -> dispatch call 1 (same process) spends the QA retry and
+#     rewinds to `planned` (mirrors AC6b-dispatch[sidecar-present] call 1
+#     above) -> a genuinely separate `bash` process (not handle_impl_phase
+#     stubbed — the REAL handler) makes dispatch call 2, which must reach
+#     handle_impl_phase, reload the handoff from disk, and render Section 4c
+#     into the actual constructed prompt. A `node` PATH shim intercepts only
+#     the nested-claude-spawn.js invocation (captures --prompt-file's content
+#     before handing off to the same impl-spawn-stub.mjs helper T15-T21 use),
+#     so runImpl()'s real routing still executes but no real claude/codex
+#     process is spawned. Proves the gap QA found: nothing before this called
+#     the loader, drove handle_impl_phase's reload, or exercised
+#     restart-safety end to end ────────────────────────────────────────────
+AC6EV_S=AC6-EVIDENCE-RELOAD
+AC6EV_ROOT="$AC6_FIXTURE/evidence-reload"
+AC6EV_SHIM_DIR="$AC6EV_ROOT/shims"; mkdir -p "$AC6EV_SHIM_DIR"
+export AC6EV_REAL_NODE="$(command -v node)"
+export AC6EV_SPAWN_STUB="$SCRIPT_DIR/helpers/impl-spawn-stub.mjs"
+export AC6EV_PROMPT_CAPTURE="$AC6EV_ROOT/captured-prompt.txt"
+cat > "$AC6EV_SHIM_DIR/claude" << 'AC6EV_CLAUDE_EOF'
+#!/usr/bin/env bash
+exit 1
+AC6EV_CLAUDE_EOF
+chmod +x "$AC6EV_SHIM_DIR/claude"
+cat > "$AC6EV_SHIM_DIR/node" << 'AC6EV_NODE_EOF'
+#!/usr/bin/env bash
+if [[ "$1" == *nested-claude-spawn.js* ]]; then
+  args=("$@")
+  for ((i=0; i<${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == "--prompt-file" ]]; then
+      cp "${args[$((i+1))]}" "$AC6EV_PROMPT_CAPTURE" 2>/dev/null || true
+    fi
+  done
+  exec "$AC6EV_REAL_NODE" "$AC6EV_SPAWN_STUB" "${@:2}" --stub-success true
+fi
+exec "$AC6EV_REAL_NODE" "$@"
+AC6EV_NODE_EOF
+chmod +x "$AC6EV_SHIM_DIR/node"
+
+AC6EV_WT_BASE="$AC6EV_ROOT/worktrees"; mkdir -p "$AC6EV_WT_BASE"
+AC6EV_WT="${AC6EV_WT_BASE}/${AC6EV_S}-workspace"
+# The evidence handoff's currentness check (_load_admission_evidence_handoff)
+# reads HEAD from the `repo` handle_impl_phase resolves — which real daemon
+# usage always makes the SAME git checkout _prepare_pre_qa_admission just
+# admitted. Symlink the worktree to $AC6_REPO (not a separate plain
+# directory) so `git -C "$AC6EV_WT" rev-parse HEAD` resolves to the exact
+# head the handoff was written against.
+ln -s "$AC6_REPO" "$AC6EV_WT"
+mkdir -p "${AC6EV_WT}/.gaai/project/contexts/artefacts/stories" \
+         "${AC6EV_WT}/.gaai/project/contexts/artefacts/plans" \
+         "${AC6EV_WT}/.gaai/project/contexts/artefacts/impl-reports" \
+         "${AC6EV_WT}/.gaai/project/contexts/artefacts/qa-reports" \
+         "${AC6EV_WT}/.delivery-logs"
+cat > "${AC6EV_WT}/.gaai/project/contexts/artefacts/stories/${AC6EV_S}.story.md" << 'AC6EV_STORY_EOF'
+---
+type: artefact
+artefact_type: story
+id: AC6-EVIDENCE-RELOAD
+related_decs: []
+---
+## Acceptance Criteria
+- [ ] AC1: test evidence reload
+AC6EV_STORY_EOF
+printf '## Implementation Sequence\nStep 1: do the thing.\n' \
+  > "${AC6EV_WT}/.gaai/project/contexts/artefacts/plans/${AC6EV_S}.execution-plan.md"
+printf '{}' > "${AC6EV_WT}/.gaai/project/contexts/artefacts/qa-reports/${AC6EV_S}.qa-verdict.json"
+printf '# qa report\n' > "${AC6EV_WT}/.gaai/project/contexts/artefacts/qa-reports/${AC6EV_S}.qa-report.md"
+cat >> "$FIXTURE" << AC6EVROW
+- id: ${AC6EV_S}
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+  impl_model: primary
+AC6EVROW
+
+_ac6_make_story_branch "$AC6EV_S"
+_AC6_STUB_OUTCOME="blocked:command_failed"
+_AC6_STUB_RESULTS='[{"command_id":"c1","descriptor_digest":"d","configuration_digest":"c","outcome":"failed","exit_code":1,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+_AC6_STUB_MODE=""; AC6_RUN_COUNT=0
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6EV_S" trace-ac6ev1 "$AC6_REPO" >/tmp/ac6ev1.out 2>&1 || true
+AC6EV_RETAINED=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_retained_receipt_path "$AC6EV_S" pre_qa)
+
+: > "$AC6EV_PROMPT_CAPTURE"
+GAAI_WORKTREES_BASE="$AC6EV_WT_BASE" LOCK_DIR="$AC6_LOCK_DIR" GAAI_DISPATCH_IDENTITY_GUARD=legacy_direct \
+  dispatch_3phase_story "$AC6EV_S" trace-ac6ev-call1 >/tmp/ac6ev-call1.out 2>&1 || true
+AC6EV_RETRIES_AFTER1=$(cat "${AC6_LOCK_DIR}/.qa-retries-${AC6EV_S}" 2>/dev/null || echo "")
+if [[ "$(get_phase_status "$AC6EV_S")" == "planned" && "$AC6EV_RETRIES_AFTER1" == "1" ]]; then
+  pass "AC6-evidence-reload call1: QA retry spent, rewound to planned (sidecar present), handoff written"
+else
+  fail "AC6-evidence-reload call1: ps=$(get_phase_status "$AC6EV_S") retries=$AC6EV_RETRIES_AFTER1"
+fi
+
+AC6EV_FRESH_SCRIPT="$AC6EV_ROOT/fresh-impl-reentry.sh"
+cat > "$AC6EV_FRESH_SCRIPT" << 'AC6EV_FRESH_EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+DISPATCH_LIB_PATH="$1"; STORY="$2"
+BACKLOG_FILE="${BACKLOG_FILE:-}"
+SCHEDULER="${SCHEDULER:-}"
+PROJECT_DIR="${PROJECT_DIR:-}"
+source "$DISPATCH_LIB_PATH"
+dispatch_3phase_story "$STORY" trace-ac6ev-call2-fresh
+AC6EV_FRESH_EOF
+chmod +x "$AC6EV_FRESH_SCRIPT"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging BACKLOG_FILE="$FIXTURE" SCHEDULER="$SCHEDULER" PROJECT_DIR="$PROJECT_DIR" \
+  GAAI_WORKTREES_BASE="$AC6EV_WT_BASE" PATH="$AC6EV_SHIM_DIR:$PATH" GAAI_DISPATCH_IDENTITY_GUARD=legacy_direct \
+  bash "$AC6EV_FRESH_SCRIPT" "$DISPATCH_LIB" "$AC6EV_S" >/tmp/ac6ev-call2.out 2>&1 || true
+
+if grep -qF "=== PRIOR LOCAL ADMISSION FAILURE — EVIDENCE ===" "$AC6EV_PROMPT_CAPTURE" 2>/dev/null \
+    && grep -q "boundary: pre_qa" "$AC6EV_PROMPT_CAPTURE" \
+    && grep -q "outcome: blocked:command_failed" "$AC6EV_PROMPT_CAPTURE" \
+    && grep -q "c1:failed:1" "$AC6EV_PROMPT_CAPTURE" \
+    && grep -qF "Retained receipt (full command output/evidence): ${AC6EV_RETAINED}" "$AC6EV_PROMPT_CAPTURE"; then
+  pass "AC6-evidence-reload call2 (fresh process): the reloaded evidence handoff reaches the real constructed implementation prompt"
+else
+  fail "AC6-evidence-reload call2: evidence not found in captured prompt (captured=$(cat "$AC6EV_PROMPT_CAPTURE" 2>/dev/null | head -5))"
+fi
+AC6EV_RETRIES_AFTER2=$(cat "${AC6_LOCK_DIR}/.qa-retries-${AC6EV_S}" 2>/dev/null || echo "")
+if [[ "$AC6EV_RETRIES_AFTER2" == "1" ]]; then
+  pass "AC6-evidence-reload call2: .qa-retries is unchanged (no extra increment) across the fresh-process reload"
+else
+  fail "AC6-evidence-reload call2: .qa-retries changed unexpectedly (before=1 after=$AC6EV_RETRIES_AFTER2)"
+fi
+
+# ── (evidence-stale) AC3 negative half: a handoff whose head does not match
+#     the repo's current HEAD is ignored, reported, and removed — never
+#     rendered. Checked at the loader itself: an empty GAAI_ADMISSION_EVIDENCE_*
+#     set (T12 in cross-cycle-qa-report.test.sh) already proves that renders
+#     nothing, so this only needs to prove the loader's own reject/report/
+#     remove behaviour ─────────────────────────────────────────────────────
+AC6EV_S2=AC6-EVIDENCE-STALE
+_ac6_make_story_branch "$AC6EV_S2"
+LOCK_DIR="$AC6_LOCK_DIR" _write_admission_evidence_handoff "$AC6EV_S2" pre_qa \
+  "0000000000000000000000000000000000000000" blocked:command_failed receipt "c1:failed:1" \
+  "/tmp/nonexistent-receipt.json" "" \
+  || fail "AC6-evidence-stale: handoff write setup succeeded"
+AC6EV_STALE_PATH=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_evidence_handoff_path "$AC6EV_S2")
+AC6EV_STALE_RC=0
+AC6EV_STALE_OUT=$(LOCK_DIR="$AC6_LOCK_DIR" _load_admission_evidence_handoff "$AC6EV_S2" "$AC6_REPO" 2>&1) || AC6EV_STALE_RC=$?
+if [[ "$AC6EV_STALE_RC" -ne 0 ]] \
+    && grep -q "ignored=stale_or_mismatched_handoff" <<<"$AC6EV_STALE_OUT" \
+    && [[ ! -f "$AC6EV_STALE_PATH" ]]; then
+  pass "AC6-evidence-stale: a handoff whose head does not match is ignored, reported, and removed — never rendered"
+else
+  fail "AC6-evidence-stale: rc=$AC6EV_STALE_RC out=$AC6EV_STALE_OUT file_exists=$([[ -f "$AC6EV_STALE_PATH" ]] && echo yes || echo no)"
+fi
+
+rm -f /tmp/ac6ev1.out /tmp/ac6ev-call1.out /tmp/ac6ev-call2.out
+unset AC6EV_REAL_NODE AC6EV_SPAWN_STUB AC6EV_PROMPT_CAPTURE
+
+# ── (c) all-passed is never inconclusive — driven through the real classifier ──
+# LOCAL-ADMISSION-REAL-b/c above only prove the PASS path never reaches
+# _route_admission_block at all; they say nothing about the classifier itself.
+# This case forces a blocked:command_* outcome with an all-"passed" results
+# vector (a receipt shape that cannot arise from the real adapter on a genuine
+# pass, but is exactly what the classifier must still refuse to call
+# inconclusive per AC1's "allPassedOrTimedOut" definition requiring >=1
+# timed_out) and asserts the classifier's own verdict directly.
+AC6_SC=AC6-ALL-PASSED-CLASSIFY
+_ac6_make_story_branch "$AC6_SC"
+AC6_SC_HEAD=$(git -C "$AC6_REPO" rev-parse HEAD)
+AC6_SC_RECEIPT_DIR="${AC6_LOCK_DIR}/local-admission-receipts"
+mkdir -p "$AC6_SC_RECEIPT_DIR"
+AC6_SC_RECEIPT="${AC6_SC_RECEIPT_DIR}/.local-admission-${AC6_SC}-pre_qa.json"
+_ac6_write_receipt "$AC6_SC_RECEIPT" pre_qa "$AC6_SC" "$AC6_SC_HEAD" "blocked:command_failed" \
+  '[{"command_id":"c1","descriptor_digest":"d","configuration_digest":"c","outcome":"passed","exit_code":0,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false},{"command_id":"c2","descriptor_digest":"d","configuration_digest":"c","outcome":"passed","exit_code":0,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+AC6_SC_CLASS_LINE=$(LOCK_DIR="$AC6_LOCK_DIR" _classify_admission_receipt "$AC6_SC" pre_qa "$AC6_REPO")
+IFS=$'\t' read -r AC6_SC_CLASS AC6_SC_NONPASS AC6_SC_REASON <<<"$AC6_SC_CLASS_LINE"
+if [[ "$AC6_SC_CLASS" == "conclusive" ]]; then
+  pass "AC6c: an all-passed results vector classifies conclusive, never inconclusive, via the real classifier"
+else
+  fail "AC6c: all-passed results vector misclassified as '${AC6_SC_CLASS}' (expected conclusive)"
+fi
+
+# ── (d) execution_failed / stale_evidence routes unchanged (empty_candidate_diff
+#        covered live by LOCAL-ADMISSION-REAL-a above) ─────────────────────
+for AC6_OUTCOME in blocked:execution_failed blocked:stale_evidence; do
+  AC6_S3="AC6-D-${AC6_OUTCOME##*:}"
+  : > "$ROUTING_LOG"
+  LOCK_DIR="$AC6_LOCK_DIR" _route_admission_block "$AC6_S3" "trace-ac6d" pre_qa "$AC6_OUTCOME" "$AC6_REPO" >/tmp/ac6d.out 2>&1 || true
+  if [[ -f "${AC6_LOCK_DIR}/.qa-route-${AC6_S3}" ]] && [[ ! -f "${AC6_LOCK_DIR}/.admission-hold-${AC6_S3}-pre_qa" ]]; then
+    pass "AC6d ${AC6_OUTCOME}: route is unchanged (impl, no hold)"
+  else
+    fail "AC6d ${AC6_OUTCOME}: route changed"
+  fi
+done
+
+# ── (e) unwritable retained-copy path — AC5's copy-failure fallback, for
+#     both the inconclusive/AC2-human route and the conclusive/AC3-impl
+#     evidence route. Forces the real, already OS-tested `cp`/`mv` machinery
+#     in _copy_admission_receipt to fail (any write-permission cause reduces
+#     to this same return value) so the assertion is about the REAL
+#     _apply_admission_human_route / _route_admission_block fallback
+#     behaviour around that failure, not about re-proving `cp` itself fails
+#     on an unwritable directory ────────────────────────────────────────────
+AC6_REAL_COPY_DEF=$(declare -f _copy_admission_receipt)
+_copy_admission_receipt() { return 1; }
+
+# (e1) inconclusive -> AC2 human route, reason=receipt_copy_failed
+AC6_S5E=AC6-COPY-FAIL-HUMAN
+cat >> "$FIXTURE" << AC6S5EROW
+- id: ${AC6_S5E}
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+AC6S5EROW
+_ac6_make_story_branch "$AC6_S5E"
+_AC6_STUB_OUTCOME="blocked:command_timed_out"
+_AC6_STUB_RESULTS='[{"command_id":"unit","descriptor_digest":"d","configuration_digest":"c","outcome":"timed_out","exit_code":null,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+_AC6_STUB_MODE=""; AC6_RUN_COUNT=0
+AC6E_DIAG=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_diagnostic_path "$AC6_S5E" pre_qa)
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S5E" trace-ac6e1 "$AC6_REPO" >/tmp/ac6e1.out 2>&1 || true
+if [[ -f "${AC6_LOCK_DIR}/.admission-hold-${AC6_S5E}-pre_qa" \
+    && ! -f "${AC6_LOCK_DIR}/.admission-retained-receipt-${AC6_S5E}-pre_qa.json" ]] \
+    && grep -q "evidence=unavailable reason=receipt_copy_failed" "$AC6E_DIAG" \
+    && [[ "$(get_phase_status "$AC6_S5E")" == "qa_escalated" ]]; then
+  pass "AC6e[human]: a retained-copy failure still takes AC2's human route, reason=receipt_copy_failed"
+else
+  fail "AC6e[human]: retained-copy failure did not fall back correctly (ps=$(get_phase_status "$AC6_S5E"))"
+fi
+
+# (e2) conclusive -> impl route degrades to AC3's receipt-absent evidence block
+AC6_S5I=AC6-COPY-FAIL-IMPL
+cat >> "$FIXTURE" << AC6S5IROW
+- id: ${AC6_S5I}
+  status: in_progress
+  phase_status: implemented
+  delivery_pipeline: 3phase
+AC6S5IROW
+_ac6_make_story_branch "$AC6_S5I"
+_AC6_STUB_OUTCOME="blocked:command_failed"
+_AC6_STUB_RESULTS='[{"command_id":"c1","descriptor_digest":"d","configuration_digest":"c","outcome":"failed","exit_code":1,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+_AC6_STUB_MODE=""; AC6_RUN_COUNT=0
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S5I" trace-ac6e2 "$AC6_REPO" >/tmp/ac6e2.out 2>&1 || true
+AC6E2_HANDOFF=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_evidence_handoff_path "$AC6_S5I")
+if [[ -f "${AC6_LOCK_DIR}/.qa-route-${AC6_S5I}" ]] \
+    && [[ "$(cat "${AC6_LOCK_DIR}/.qa-route-${AC6_S5I}")" == impl ]] \
+    && [[ -f "$AC6E2_HANDOFF" ]] && grep -qx "state=unavailable" "$AC6E2_HANDOFF" \
+    && grep -qx "reason=retained_copy_failed" "$AC6E2_HANDOFF"; then
+  pass "AC6e[impl]: a retained-copy failure on the impl route degrades to AC3's receipt-absent block"
+else
+  fail "AC6e[impl]: retained-copy failure did not degrade to receipt-absent evidence"
+fi
+eval "$AC6_REAL_COPY_DEF"
+
+# ── (f) hold re-entry: zero admission executions, human route re-applied ───
+AC6_RUN_COUNT=0
+AC6F_RC=0
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S1" trace-ac6f "$AC6_REPO" >/tmp/ac6f.out 2>&1 || AC6F_RC=$?
+if [[ "$AC6F_RC" -ne 0 && "$AC6_RUN_COUNT" -eq 0 ]] && grep -q "ADMISSION-HOLD" /tmp/ac6f.out; then
+  pass "AC6f: held boundary re-entry performs zero admission executions"
+else
+  fail "AC6f: held boundary re-entry ran an admission (runs=$AC6_RUN_COUNT)"
+fi
+
+# ── (g) unwritable hold write -> hold_unwritable, nothing routed ───────────
+AC6_S4=AC6-HOLD-UNWRITABLE
+_ac6_make_story_branch "$AC6_S4"
+_AC6_STUB_OUTCOME="blocked:command_timed_out"
+_AC6_STUB_RESULTS='[{"command_id":"unit","descriptor_digest":"d","configuration_digest":"c","outcome":"timed_out","exit_code":null,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+AC6_RO_LOCK="$AC6_FIXTURE/locks-ro"
+mkdir -p "$AC6_RO_LOCK"; chmod 500 "$AC6_RO_LOCK"
+LOCK_DIR="$AC6_RO_LOCK" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S4" trace-ac6g "$AC6_REPO" >/tmp/ac6g.out 2>&1 || true
+if grep -q "hold_unwritable" /tmp/ac6g.out && [[ ! -f "${AC6_RO_LOCK}/.qa-route-${AC6_S4}" ]]; then
+  pass "AC6g: unwritable hold reports hold_unwritable and routes nothing"
+else
+  fail "AC6g: unwritable-hold path did not fail closed as expected"
+fi
+chmod 700 "$AC6_RO_LOCK"
+
+# ── (g-ext) incomplete/corrupt hold file: a PRE-EXISTING hold that fails
+#     _enforce_admission_hold's own parse is still a hold (any file at that
+#     path stops the boundary — presence alone is the contract, per AC2's
+#     "presence alone stops the boundary" design) — this proves a corrupt
+#     hold fails closed (still stops) rather than being silently skipped ──
+AC6_S4C=AC6-HOLD-CORRUPT
+_ac6_make_story_branch "$AC6_S4C"
+AC6_S4C_HOLD=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_hold_path "$AC6_S4C" pre_qa)
+mkdir -p "$(dirname "$AC6_S4C_HOLD")"
+printf 'not-a-valid-hold-file\x00\xff garbage' > "$AC6_S4C_HOLD"
+AC6_RUN_COUNT=0
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S4C" trace-ac6g-ext "$AC6_REPO" >/tmp/ac6g-ext.out 2>&1 || true
+if [[ "$AC6_RUN_COUNT" -eq 0 ]] && grep -q "ADMISSION-HOLD" /tmp/ac6g-ext.out; then
+  pass "AC6g-ext: a corrupt pre-existing hold file still stops the boundary (fails closed, not silently skipped)"
+else
+  fail "AC6g-ext: a corrupt hold file did not stop the boundary (runs=$AC6_RUN_COUNT)"
+fi
+rm -f "$AC6_S4C_HOLD"
+
+# ── (k) command_timed_out w/ unreadable receipt; command_failed w/
+#        integrity-failing receipt -> human route, evidence=unavailable ────
+AC6_S5=AC6-UNREADABLE-RECEIPT
+_ac6_make_story_branch "$AC6_S5"
+_AC6_STUB_OUTCOME="blocked:command_timed_out"; _AC6_STUB_MODE="no_receipt"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S5" trace-ac6k1 "$AC6_REPO" >/tmp/ac6k1.out 2>&1 || true
+if grep -q "evidence=unavailable" /tmp/ac6k1.out && grep -q "receipt_absent" /tmp/ac6k1.out; then
+  pass "AC6k1: command_timed_out with an absent receipt takes the human route, evidence=unavailable"
+else
+  fail "AC6k1: missing-receipt case did not report evidence=unavailable/receipt_absent"
+fi
+
+AC6_S6=AC6-BAD-DIGEST-RECEIPT
+_ac6_make_story_branch "$AC6_S6"
+_AC6_STUB_OUTCOME="blocked:command_failed"; _AC6_STUB_MODE="bad_receipt"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission "$AC6_S6" trace-ac6k2 "$AC6_REPO" >/tmp/ac6k2.out 2>&1 || true
+if grep -q "evidence=unavailable" /tmp/ac6k2.out; then
+  pass "AC6k2: command_failed with an unparseable receipt takes the human route, evidence=unavailable"
+else
+  fail "AC6k2: unparseable-receipt case did not report evidence=unavailable"
+fi
+_AC6_STUB_MODE=""
+
+# ── (k2-ext) command_failed w/ a READABLE, well-formed receipt whose
+#     receipt_digest has been tampered — the receipt_integrity_failed branch
+#     of the classifier specifically, distinct from k2's unparseable-JSON
+#     case above ────────────────────────────────────────────────────────────
+AC6_S6T=AC6-TAMPERED-DIGEST-RECEIPT
+_ac6_make_story_branch "$AC6_S6T"
+AC6_S6T_HEAD=$(git -C "$AC6_REPO" rev-parse HEAD)
+AC6_S6T_RDIR="${AC6_LOCK_DIR}/local-admission-receipts"; mkdir -p "$AC6_S6T_RDIR"
+AC6_S6T_RECEIPT="${AC6_S6T_RDIR}/.local-admission-${AC6_S6T}-pre_qa.json"
+_ac6_write_receipt "$AC6_S6T_RECEIPT" pre_qa "$AC6_S6T" "$AC6_S6T_HEAD" "blocked:command_failed" \
+  '[{"command_id":"c1","descriptor_digest":"d","configuration_digest":"c","outcome":"failed","exit_code":1,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+# Flip one hex character of the (well-formed, readable) receipt_digest value
+# in place — the file stays valid JSON with every required key present, so
+# only the digest-recomputation check (not the parse/shape checks) can catch it.
+python3 -c '
+import json, sys
+p = sys.argv[1]
+with open(p) as f:
+    r = json.load(f)
+d = r["receipt_digest"]
+r["receipt_digest"] = ("0" if d[0] != "0" else "1") + d[1:]
+with open(p, "w") as f:
+    json.dump(r, f)
+' "$AC6_S6T_RECEIPT"
+: > "$JOURNAL_CALL_LOG"
+AC6S6T_OUT=$(LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _route_admission_block "$AC6_S6T" trace-ac6k2ext pre_qa blocked:command_failed "$AC6_REPO" 2>&1)
+if grep -q "evidence=unavailable" <<<"$AC6S6T_OUT" && grep -q "receipt_integrity_failed" <<<"$AC6S6T_OUT"; then
+  pass "AC6k2-ext: command_failed with a digest-tampered (but readable, well-formed) receipt takes the human route, receipt_integrity_failed"
+else
+  fail "AC6k2-ext: tampered-digest receipt did not report receipt_integrity_failed: $AC6S6T_OUT"
+fi
+
+# ── (l) a pre-admission outcome (blocked:base_fetch_failed) prints its
+#     decision line with load=unavailable ──────────────────────────────────
+AC6_S7L=AC6-BASE-FETCH-FAILED
+GAAI_ADMISSION_LOAD_BEFORE="9.99"; GAAI_ADMISSION_LOAD_AFTER="9.99"
+AC6L_OUT=$(LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging \
+  _route_admission_block "$AC6_S7L" trace-ac6l pre_qa blocked:base_fetch_failed "$AC6_REPO" 2>&1)
+unset GAAI_ADMISSION_LOAD_BEFORE GAAI_ADMISSION_LOAD_AFTER
+if grep -q "^\[ADMISSION-DECISION\] story=${AC6_S7L}.*load=unavailable" <<<"$AC6L_OUT"; then
+  pass "AC6l: blocked:base_fetch_failed prints its decision line with load=unavailable even with stale load samples set"
+else
+  fail "AC6l: blocked:base_fetch_failed did not report load=unavailable: $AC6L_OUT"
+fi
+
+# ── journal-block (GAAI_TEST_JOURNAL_BLOCK=1): proves F3's fix directly —
+#     the [ADMISSION-DECISION] line is still printed on BOTH the retryable
+#     branch and the bare-human branch when _journal_persist_lifecycle
+#     fails closed, instead of the pre-fix `|| return 1` swallowing it ─────
+AC6_S8R=AC6-JOURNAL-BLOCK-RETRYABLE
+AC6J1_OUT=$(LOCK_DIR="$AC6_LOCK_DIR" GAAI_TEST_JOURNAL_BLOCK=1 \
+  _route_admission_block "$AC6_S8R" trace-ac6j1 pre_qa blocked:execution_failed "$AC6_REPO" 2>&1) || true
+if grep -q "^\[ADMISSION-DECISION\] story=${AC6_S8R}" <<<"$AC6J1_OUT" && grep -q "route=none" <<<"$AC6J1_OUT"; then
+  pass "AC6-journal-block[retryable]: F3 — decision line still prints when the journal call fails closed"
+else
+  fail "AC6-journal-block[retryable]: decision line missing or route unexpected: $AC6J1_OUT"
+fi
+
+AC6_S8H=AC6-JOURNAL-BLOCK-HUMAN
+AC6J2_OUT=$(LOCK_DIR="$AC6_LOCK_DIR" GAAI_TEST_JOURNAL_BLOCK=1 \
+  _route_admission_block "$AC6_S8H" trace-ac6j2 pre_qa blocked:policy_missing "$AC6_REPO" 2>&1) || true
+if grep -q "^\[ADMISSION-DECISION\] story=${AC6_S8H}" <<<"$AC6J2_OUT" && grep -q "route=none" <<<"$AC6J2_OUT"; then
+  pass "AC6-journal-block[bare-human]: F3 — decision line still prints when the journal call fails closed"
+else
+  fail "AC6-journal-block[bare-human]: decision line missing or route unexpected: $AC6J2_OUT"
+fi
+
+# ── fresh-process crash re-entry: a hold written by a PRIOR, now-dead
+#     process still stops the boundary in a BRAND NEW process that shares no
+#     shell memory with the writer — proves the durability the hold file
+#     exists for, beyond same-process re-entry (AC6f already covers that) ──
+AC6_S9=AC6-CRASH-FRESH-PROCESS
+_ac6_make_story_branch "$AC6_S9"
+AC6_S9_HOLD=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_hold_path "$AC6_S9" pre_qa)
+mkdir -p "$(dirname "$AC6_S9_HOLD")"
+( umask 077; printf 'story_id=%s\nboundary=pre_qa\nhead_sha=%s\noutcome=blocked:command_timed_out\ncreated_at=%s\ndiagnostic=\nretained_receipt=\n' \
+    "$AC6_S9" "$(git -C "$AC6_REPO" rev-parse HEAD)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$AC6_S9_HOLD" )
+AC6_FRESH_SCRIPT="$AC6_FIXTURE/fresh-reentry.sh"
+cat > "$AC6_FRESH_SCRIPT" << 'AC6FRESHEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+DISPATCH_LIB_PATH="$1"; STORY="$2"; REPO="$3"; SPAWN_LOG="$4"
+BACKLOG_FILE="${BACKLOG_FILE:-}"
+SCHEDULER="${SCHEDULER:-}"
+PROJECT_DIR="${PROJECT_DIR:-}"
+source "$DISPATCH_LIB_PATH"
+_run_local_admission() { echo "SPAWNED-ADMISSION" >> "$SPAWN_LOG"; return 1; }
+_prepare_pre_qa_admission "$STORY" trace-ac6-fresh "$REPO"
+AC6FRESHEOF
+chmod +x "$AC6_FRESH_SCRIPT"
+AC6_SPAWN_MARK="$AC6_FIXTURE/fresh-spawn.log"; : > "$AC6_SPAWN_MARK"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging BACKLOG_FILE="$FIXTURE" SCHEDULER="$SCHEDULER" PROJECT_DIR="$PROJECT_DIR" \
+  bash "$AC6_FRESH_SCRIPT" "$DISPATCH_LIB" "$AC6_S9" "$AC6_REPO" "$AC6_SPAWN_MARK" >/tmp/ac6-fresh.out 2>&1 || true
+if [[ ! -s "$AC6_SPAWN_MARK" ]] && grep -q "ADMISSION-HOLD" /tmp/ac6-fresh.out; then
+  pass "AC6-fresh-process: a hold written by a dead process stops the boundary in a brand-new process, zero admission executions"
+else
+  fail "AC6-fresh-process: fresh-process re-entry did not stop cleanly (spawn-log=$(cat "$AC6_SPAWN_MARK" 2>/dev/null))"
+fi
+
+# ── fresh-process crash re-entry, 3 MORE interruption points (AC6's own
+#     enumeration: "between the hold and the receipt copy" — already proven
+#     above by AC6-fresh-process, hold only, nothing else on disk yet —
+#     "before and during the projection, and after it"). Each hand-constructs
+#     the exact partial on-disk state a crash at that point would leave (the
+#     hold file alone is the sole stop condition regardless of what else
+#     exists), then re-enters via the SAME genuinely separate process as
+#     above. Proves only what AC6 actually requires here — "the hold
+#     re-applies the human route with zero admission executions" — not the
+#     unrelated, already-fragile (G6) real cross-process journal substrate,
+#     which the fresh script never doubles (it sources the real
+#     _journal_persist_lifecycle, guarded by _enforce_admission_hold's own
+#     `|| true`) ─────────────────────────────────────────────────────────────
+_ac6_hand_write_hold() {
+  local story="$1" hold_path="$2" diag_path="$3" retained_path="$4"
+  ( umask 077; printf 'story_id=%s\nboundary=pre_qa\nhead_sha=%s\noutcome=blocked:command_timed_out\ncreated_at=%s\ndiagnostic=%s\nretained_receipt=%s\n' \
+      "$story" "$(git -C "$AC6_REPO" rev-parse HEAD)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$diag_path" "$retained_path" > "$hold_path" )
+}
+_ac6_timedout_receipt_json='[{"command_id":"unit","descriptor_digest":"d","configuration_digest":"c","outcome":"timed_out","exit_code":null,"signal":null,"duration_ms":1,"stdout_bytes":0,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}]'
+
+# (crash-B) after the retained-copy write, before the diagnostic exists yet.
+AC6_S10=AC6-CRASH-BEFORE-DIAG
+_ac6_make_story_branch "$AC6_S10"
+AC6_S10_HOLD=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_hold_path "$AC6_S10" pre_qa)
+AC6_S10_RETAINED=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_retained_receipt_path "$AC6_S10" pre_qa)
+AC6_S10_DIAG=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_diagnostic_path "$AC6_S10" pre_qa)
+mkdir -p "$(dirname "$AC6_S10_HOLD")"
+_ac6_hand_write_hold "$AC6_S10" "$AC6_S10_HOLD" "$AC6_S10_DIAG" "$AC6_S10_RETAINED"
+_ac6_write_receipt "$AC6_S10_RETAINED" pre_qa "$AC6_S10" "$(git -C "$AC6_REPO" rev-parse HEAD)" \
+  "blocked:command_timed_out" "$_ac6_timedout_receipt_json"
+# No diagnostic file at all yet — simulates a crash right after the retained
+# copy landed, before _write_admission_diagnostic ran.
+AC6_SPAWN_B="$AC6_FIXTURE/fresh-spawn-b.log"; : > "$AC6_SPAWN_B"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging BACKLOG_FILE="$FIXTURE" SCHEDULER="$SCHEDULER" PROJECT_DIR="$PROJECT_DIR" \
+  bash "$AC6_FRESH_SCRIPT" "$DISPATCH_LIB" "$AC6_S10" "$AC6_REPO" "$AC6_SPAWN_B" >/tmp/ac6-fresh-b.out 2>&1 || true
+if [[ ! -s "$AC6_SPAWN_B" ]] && grep -q "ADMISSION-HOLD" /tmp/ac6-fresh-b.out; then
+  pass "AC6-fresh-process-B: crash after the retained copy, before the diagnostic exists — fresh process still stops cleanly, zero admission executions"
+else
+  fail "AC6-fresh-process-B: mismatch (spawn-log=$(cat "$AC6_SPAWN_B" 2>/dev/null))"
+fi
+
+# (crash-C) diagnostic already on disk, but the lifecycle projection that
+#     would follow it had not yet been persisted (mid-projection).
+AC6_S11=AC6-CRASH-MID-PROJECTION
+_ac6_make_story_branch "$AC6_S11"
+AC6_S11_HOLD=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_hold_path "$AC6_S11" pre_qa)
+AC6_S11_RETAINED=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_retained_receipt_path "$AC6_S11" pre_qa)
+AC6_S11_DIAG=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_diagnostic_path "$AC6_S11" pre_qa)
+mkdir -p "$(dirname "$AC6_S11_HOLD")"
+_ac6_hand_write_hold "$AC6_S11" "$AC6_S11_HOLD" "$AC6_S11_DIAG" "$AC6_S11_RETAINED"
+_ac6_write_receipt "$AC6_S11_RETAINED" pre_qa "$AC6_S11" "$(git -C "$AC6_REPO" rev-parse HEAD)" \
+  "blocked:command_timed_out" "$_ac6_timedout_receipt_json"
+printf '[ADMISSION-ESCALATION] story=%s boundary=pre_qa outcome=blocked:command_timed_out class=inconclusive\nretained receipt: %s\n' \
+  "$AC6_S11" "$AC6_S11_RETAINED" > "$AC6_S11_DIAG"
+AC6_SPAWN_C="$AC6_FIXTURE/fresh-spawn-c.log"; : > "$AC6_SPAWN_C"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging BACKLOG_FILE="$FIXTURE" SCHEDULER="$SCHEDULER" PROJECT_DIR="$PROJECT_DIR" \
+  bash "$AC6_FRESH_SCRIPT" "$DISPATCH_LIB" "$AC6_S11" "$AC6_REPO" "$AC6_SPAWN_C" >/tmp/ac6-fresh-c.out 2>&1 || true
+if [[ ! -s "$AC6_SPAWN_C" ]] && grep -q "ADMISSION-HOLD" /tmp/ac6-fresh-c.out \
+    && grep -q "retained receipt: ${AC6_S11_RETAINED}" /tmp/ac6-fresh-c.out; then
+  pass "AC6-fresh-process-C: crash mid-projection (diagnostic already on disk, journal not yet persisted) — fresh process re-prints it, zero admission executions"
+else
+  fail "AC6-fresh-process-C: mismatch (spawn-log=$(cat "$AC6_SPAWN_C" 2>/dev/null))"
+fi
+
+# (crash-D) the projection had already landed before the crash — re-entry
+#     must be idempotent: no error, no admission execution, same stop.
+AC6_S12=AC6-CRASH-AFTER-PROJECTION
+_ac6_make_story_branch "$AC6_S12"
+cat >> "$FIXTURE" << AC6S12ROW
+- id: ${AC6_S12}
+  status: in_progress
+  phase_status: qa_escalated
+  delivery_pipeline: 3phase
+AC6S12ROW
+AC6_S12_HOLD=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_hold_path "$AC6_S12" pre_qa)
+AC6_S12_RETAINED=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_retained_receipt_path "$AC6_S12" pre_qa)
+AC6_S12_DIAG=$(LOCK_DIR="$AC6_LOCK_DIR" _admission_diagnostic_path "$AC6_S12" pre_qa)
+mkdir -p "$(dirname "$AC6_S12_HOLD")"
+_ac6_hand_write_hold "$AC6_S12" "$AC6_S12_HOLD" "$AC6_S12_DIAG" "$AC6_S12_RETAINED"
+_ac6_write_receipt "$AC6_S12_RETAINED" pre_qa "$AC6_S12" "$(git -C "$AC6_REPO" rev-parse HEAD)" \
+  "blocked:command_timed_out" "$_ac6_timedout_receipt_json"
+printf '[ADMISSION-ESCALATION] story=%s boundary=pre_qa outcome=blocked:command_timed_out class=inconclusive\nretained receipt: %s\n' \
+  "$AC6_S12" "$AC6_S12_RETAINED" > "$AC6_S12_DIAG"
+AC6_S12_PS_BEFORE=$(get_phase_status "$AC6_S12")
+AC6_SPAWN_D="$AC6_FIXTURE/fresh-spawn-d.log"; : > "$AC6_SPAWN_D"
+LOCK_DIR="$AC6_LOCK_DIR" TARGET_BRANCH=staging BACKLOG_FILE="$FIXTURE" SCHEDULER="$SCHEDULER" PROJECT_DIR="$PROJECT_DIR" \
+  bash "$AC6_FRESH_SCRIPT" "$DISPATCH_LIB" "$AC6_S12" "$AC6_REPO" "$AC6_SPAWN_D" >/tmp/ac6-fresh-d.out 2>&1 || true
+if [[ ! -s "$AC6_SPAWN_D" ]] && grep -q "ADMISSION-HOLD" /tmp/ac6-fresh-d.out \
+    && [[ "$AC6_S12_PS_BEFORE" == "qa_escalated" ]] \
+    && [[ "$(get_phase_status "$AC6_S12")" == "qa_escalated" ]]; then
+  pass "AC6-fresh-process-D: crash after the projection already landed — fresh-process re-entry is idempotent, zero admission executions"
+else
+  fail "AC6-fresh-process-D: mismatch (spawn-log=$(cat "$AC6_SPAWN_D" 2>/dev/null) ps_before=$AC6_S12_PS_BEFORE ps_after=$(get_phase_status "$AC6_S12"))"
+fi
+
+rm -f /tmp/ac6-fresh-b.out /tmp/ac6-fresh-c.out /tmp/ac6-fresh-d.out
+unset -f _ac6_hand_write_hold
+unset _ac6_timedout_receipt_json
+
+unset -f _run_local_admission _ac6_write_receipt _ac6_make_story_branch
+eval "$REAL_PRE_QA_DEF"; eval "$REAL_ADMIT_DEF"
+rm -f /tmp/ac6*.out
+
 # ── LOCAL-ADMISSION-AC4: every typed final rejection blocks remote calls ──
 echo "LOCAL-ADMISSION-AC4: complete rejection matrix blocks publication"
 AC4_REMOTE_LOG="$LOCAL_ADMISSION_FIXTURE/remote-calls.log"

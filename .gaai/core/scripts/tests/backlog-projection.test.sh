@@ -617,6 +617,236 @@ if [[ "$T18K_DIAG" != *Traceback* && "$T18K_DIAG" != *"$T18K_REPO"* ]]; then pas
 project_records "$T18K_REPO" recovery
 assert_eq noop "$PROJECT_OUTCOME" "T18k live archive: retry archives then no-ops"
 
+printf '\n=== T19: admission-hold resume procedure — reset lands on target ===\n'
+# Applies the exact two-field reset + commit + push the admission-hold
+# diagnostic's resume procedure prescribes, using backlog-scheduler.sh
+# --set-field directly (the same tool the diagnostic's rendered burst names —
+# NOT the daemon's internal journal path, which enforces PHASE_EDGES
+# transition validity the operator's manual recovery burst is not subject
+# to), and asserts it lands on origin/staging with every unrelated byte
+# preserved.
+SCHEDULER="$SCRIPT_DIR/../backlog-scheduler.sh"
+T19_REPO="$(setup_repo t19)"
+T19_BASE="$(git -C "$T19_REPO" rev-parse origin/staging)"
+bash "$SCHEDULER" --set-field A status in_progress "$T19_REPO/$BACKLOG_REL" >/dev/null \
+  || fail "T19: --set-field status applied"
+bash "$SCHEDULER" --set-field A phase_status implemented "$T19_REPO/$BACKLOG_REL" >/dev/null \
+  || fail "T19: --set-field phase_status applied"
+(
+  cd "$T19_REPO" || exit 1
+  git add "$BACKLOG_REL" \
+    && git commit -q -m "chore(A): resume after admission hold [pre_qa]" \
+    && git push -q origin HEAD:staging
+)
+assert_eq 0 "$?" "T19: resume commit+push exits 0"
+T19_REMOTE="$(remote_backlog "$T19_REPO")"
+# --set-field is a straightforward line rewrite (unlike the journal's
+# comment-preserving projection exercised in T1) — it drops the inline
+# comment on the line it rewrites; that is this tool's real, unchanged
+# behavior, not a regression to assert away.
+assert_contains "$T19_REMOTE" 'status: in_progress' "T19: reset status lands on target"
+assert_contains "$T19_REMOTE" 'phase_status: implemented' "T19: reset phase_status lands on target"
+assert_contains "$T19_REMOTE" '# formatting sentinel: keep exactly' "T19: unrelated bytes are preserved"
+assert_contains "$T19_REMOTE" 'tail: "preserve: yes"' "T19: unrelated tail is preserved"
+assert_eq "$T19_BASE" "$(git -C "$T19_REPO" rev-parse "origin/staging^")" "T19: resume candidate has exact remote parent"
+
+printf '\n=== T19b: a local-only edit never reaches origin/staging (resume-procedure verification gate) ===\n'
+# Mirrors T1's ambient-sentinel style: a local-only edit (applied with
+# --set-field but never committed/pushed) must never appear in the
+# remote-authoritative read the diagnostic's step 3 verification relies on.
+T19B_REMOTE_BEFORE="$(git -C "$T19_REPO" rev-parse origin/staging)"
+bash "$SCHEDULER" --set-field A status done "$T19_REPO/$BACKLOG_REL" >/dev/null \
+  || fail "T19b: local-only --set-field applied"
+T19B_REMOTE_AFTER="$(git -C "$T19_REPO" rev-parse origin/staging)"
+assert_eq "$T19B_REMOTE_BEFORE" "$T19B_REMOTE_AFTER" "T19b: local-only edit leaves origin/staging unchanged"
+if [[ "$(remote_backlog "$T19_REPO")" != *'status: done'* ]]; then
+  pass "T19b: remote-authoritative read does not see the local-only edit"
+else
+  fail "T19b: local-only edit leaked into the remote-authoritative read"
+fi
+
+printf '\n=== T19c: resume procedure at the FINAL boundary (target qa_passed) lands the same way ===\n'
+# T19/T19b already prove the pre_qa target (phase_status: implemented). The
+# diagnostic's rendered resume target at the final boundary is qa_passed
+# when the QA-report sidecar is present (implemented otherwise — the
+# sidecar-detection itself is daemon-dispatch.sh territory, exercised by
+# the AC6a-final/AC6b-dispatch cases in daemon-state-machine.test.sh); this
+# case proves the SAME --set-field+commit+push mechanism lands that second
+# target value correctly too, with every unrelated byte preserved.
+T19C_REPO="$(setup_repo t19c)"
+T19C_BASE="$(git -C "$T19C_REPO" rev-parse origin/staging)"
+bash "$SCHEDULER" --set-field A status in_progress "$T19C_REPO/$BACKLOG_REL" >/dev/null \
+  || fail "T19c: --set-field status applied"
+bash "$SCHEDULER" --set-field A phase_status qa_passed "$T19C_REPO/$BACKLOG_REL" >/dev/null \
+  || fail "T19c: --set-field phase_status applied"
+(
+  cd "$T19C_REPO" || exit 1
+  git add "$BACKLOG_REL" \
+    && git commit -q -m "chore(A): resume after admission hold [final]" \
+    && git push -q origin HEAD:staging
+)
+assert_eq 0 "$?" "T19c: resume commit+push exits 0"
+T19C_REMOTE="$(remote_backlog "$T19C_REPO")"
+assert_contains "$T19C_REMOTE" 'status: in_progress' "T19c: reset status lands on target"
+assert_contains "$T19C_REMOTE" 'phase_status: qa_passed' "T19c: reset phase_status (final-boundary target) lands on target"
+assert_contains "$T19C_REMOTE" '# formatting sentinel: keep exactly' "T19c: unrelated bytes are preserved"
+assert_eq "$T19C_BASE" "$(git -C "$T19C_REPO" rev-parse "origin/staging^")" "T19c: resume candidate has exact remote parent"
+
+printf '\n=== T20: applying the diagnostics full procedure makes the story dispatchable\n'
+printf '    again — proven through a REAL admission-boundary call, not a bare rm+[[ -f ]] ===\n'
+# G2 remediation: the previous T19d/T19e asserted "dispatchable again" via
+# `rm -f X` then `[[ ! -f X ]]` — an assertion that can only fail if `rm`
+# itself fails, proving nothing about the admission boundary. This block
+# resolves the hold path through _admission_hold_path, asserts hold state
+# through _admission_hold_active (not [[ -f ]]), and — after applying the
+# diagnostic's full procedure (backlog reset lands on origin/staging while
+# checked out on the TARGET branch, per the diagnostic's own "fresh checkout
+# of staging" framing and T19/T19c above; only THEN does the explicit last
+# step, hold removal, apply) — drives a REAL admission-boundary call
+# (_prepare_pre_qa_admission / _admit_current_candidate) and asserts it
+# actually runs the admission, at both the pre_qa and final boundaries.
+# _journal_persist_lifecycle is overridden with a no-op success double: the
+# real function projects onto the REMOTE target branch via a separate
+# PROJECT_DIR fetch + journal mechanism and never touches the candidate
+# repo's own worktree copy of the backlog file — T1-T19 above already
+# exercise that real remote-fetching substrate. This block is only about the
+# admission boundary's own hold-guard control flow (does it run the
+# admission or not), so the double just needs to succeed. A double that
+# writes the field into the candidate repo's OWN tracked backlog file (as
+# daemon-state-machine.test.sh's double does, against an untracked standalone
+# YAML fixture there) would leave the candidate's git worktree dirty here —
+# verified experimentally: it broke _reconcile_admission_base's
+# clean-working-tree check on the very next boundary call, which is exactly
+# the "dispatchable again" property this block exists to prove. Sidecar
+# presence/absence is deliberately NOT re-varied here either: reading
+# _prepare_pre_qa_admission/_admit_current_candidate shows the sidecar only
+# ever affects _write_admission_diagnostic's rendered phase_target string
+# (already covered by T19/T19c's real backlog-persistence assertions), never
+# the hold-guard control flow this block proves.
+DISPATCH_LIB="$SCRIPT_DIR/../daemon-dispatch.sh"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+# shellcheck source=../daemon-dispatch.sh
+source "$DISPATCH_LIB"
+_journal_persist_lifecycle() {
+  return 0
+}
+T20_ADMIT_LOG="$TEST_ROOT/t20-admit.log"
+_run_local_admission() {
+  printf 'run\n' >> "$T20_ADMIT_LOG"
+  LOCAL_ADMISSION_OUTCOME="blocked:execution_failed"
+  return 1
+}
+
+# ── T20a: pre_qa boundary ────────────────────────────────────────────────
+T20A_REPO="$(setup_repo t20a)"
+BACKLOG_FILE="$T20A_REPO/$BACKLOG_REL"
+T20A_LOCKS="$T20A_REPO/.gaai/project/contexts/backlog/.delivery-locks"
+mkdir -p "$T20A_LOCKS"
+
+# Apply the diagnostic's steps 1-3 (fresh checkout of the target, reset,
+# publish) while still on `staging` — exactly as T19 does.
+bash "$SCHEDULER" --set-field A status in_progress "$BACKLOG_FILE" >/dev/null \
+  || fail "T20a: --set-field status applied"
+bash "$SCHEDULER" --set-field A phase_status implemented "$BACKLOG_FILE" >/dev/null \
+  || fail "T20a: --set-field phase_status applied"
+(
+  cd "$T20A_REPO" || exit 1
+  git add "$BACKLOG_REL" && git commit -q -m "chore(A): resume after admission hold [pre_qa]" && git push -q origin HEAD:staging
+)
+assert_eq 0 "$?" "T20a: resume commit+push exits 0"
+assert_contains "$(remote_backlog "$T20A_REPO")" 'phase_status: implemented' "T20a: reset phase_status lands on target"
+
+# Now branch off the (just-reset) target for the story's own candidate —
+# the admission boundary operates on this candidate, never on the reset
+# commit itself.
+git -C "$T20A_REPO" checkout -q -b story/T20A
+printf 'change\n' > "$T20A_REPO/change.txt"
+git -C "$T20A_REPO" add -A && git -C "$T20A_REPO" commit -q -m "story change"
+T20A_HEAD="$(git -C "$T20A_REPO" rev-parse HEAD)"
+
+LOCK_DIR="$T20A_LOCKS" _write_admission_hold A pre_qa "$T20A_HEAD" blocked:command_timed_out "" "" \
+  || fail "T20a: hold write setup succeeded"
+if LOCK_DIR="$T20A_LOCKS" _admission_hold_active A pre_qa; then
+  pass "T20a: hold is active before removal (_admission_hold_active)"
+else
+  fail "T20a: hold not active immediately after writing it"
+fi
+: > "$T20_ADMIT_LOG"
+LOCK_DIR="$T20A_LOCKS" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission A trace-t20a-held "$T20A_REPO" >/tmp/t20a-held.out 2>&1 || true
+if [[ ! -s "$T20_ADMIT_LOG" ]] && grep -q "ADMISSION-HOLD" /tmp/t20a-held.out; then
+  pass "T20a: still held — zero admission executions (step 4 not yet applied)"
+else
+  fail "T20a: held boundary ran an admission or did not report the hold"
+fi
+
+# Step 4, last: remove the hold — resolved through _admission_hold_path.
+rm -f "$(LOCK_DIR="$T20A_LOCKS" _admission_hold_path A pre_qa)"
+if LOCK_DIR="$T20A_LOCKS" _admission_hold_active A pre_qa; then
+  fail "T20a: hold still active after its explicit removal"
+else
+  pass "T20a: hold is inactive after removal (_admission_hold_active, not [[ -f ]])"
+fi
+: > "$T20_ADMIT_LOG"
+LOCK_DIR="$T20A_LOCKS" TARGET_BRANCH=staging \
+  _prepare_pre_qa_admission A trace-t20a-free "$T20A_REPO" >/tmp/t20a-free.out 2>&1 || true
+if [[ -s "$T20_ADMIT_LOG" ]]; then
+  pass "T20a: the story is dispatchable again — the real pre_qa admission boundary ran"
+else
+  fail "T20a: pre_qa boundary did not run the admission after hold removal"
+fi
+
+# ── T20b: final boundary, the same proof ────────────────────────────────
+T20B_REPO="$(setup_repo t20b)"
+BACKLOG_FILE="$T20B_REPO/$BACKLOG_REL"
+T20B_LOCKS="$T20B_REPO/.gaai/project/contexts/backlog/.delivery-locks"
+mkdir -p "$T20B_LOCKS"
+
+bash "$SCHEDULER" --set-field A status in_progress "$BACKLOG_FILE" >/dev/null \
+  || fail "T20b: --set-field status applied"
+bash "$SCHEDULER" --set-field A phase_status qa_passed "$BACKLOG_FILE" >/dev/null \
+  || fail "T20b: --set-field phase_status applied"
+(
+  cd "$T20B_REPO" || exit 1
+  git add "$BACKLOG_REL" && git commit -q -m "chore(A): resume after admission hold [final]" && git push -q origin HEAD:staging
+)
+assert_eq 0 "$?" "T20b: resume commit+push exits 0"
+assert_contains "$(remote_backlog "$T20B_REPO")" 'phase_status: qa_passed' "T20b: reset phase_status (final-boundary target) lands on target"
+
+git -C "$T20B_REPO" checkout -q -b story/T20B
+printf 'change\n' > "$T20B_REPO/change.txt"
+git -C "$T20B_REPO" add -A && git -C "$T20B_REPO" commit -q -m "story change"
+T20B_HEAD="$(git -C "$T20B_REPO" rev-parse HEAD)"
+
+LOCK_DIR="$T20B_LOCKS" _write_admission_hold A final "$T20B_HEAD" blocked:command_timed_out "" "" \
+  || fail "T20b: hold write setup succeeded"
+: > "$T20_ADMIT_LOG"
+LOCK_DIR="$T20B_LOCKS" TARGET_BRANCH=staging \
+  _admit_current_candidate final A trace-t20b-held "$T20B_REPO" >/tmp/t20b-held.out 2>&1 || true
+if [[ ! -s "$T20_ADMIT_LOG" ]] && grep -q "ADMISSION-HOLD" /tmp/t20b-held.out; then
+  pass "T20b: still held at the final boundary — zero admission executions"
+else
+  fail "T20b: held final boundary ran an admission or did not report the hold"
+fi
+rm -f "$(LOCK_DIR="$T20B_LOCKS" _admission_hold_path A final)"
+if LOCK_DIR="$T20B_LOCKS" _admission_hold_active A final; then
+  fail "T20b: hold still active after its explicit removal"
+else
+  pass "T20b: hold is inactive after removal at the final boundary (_admission_hold_active)"
+fi
+: > "$T20_ADMIT_LOG"
+LOCK_DIR="$T20B_LOCKS" TARGET_BRANCH=staging \
+  _admit_current_candidate final A trace-t20b-free "$T20B_REPO" >/tmp/t20b-free.out 2>&1 || true
+if [[ -s "$T20_ADMIT_LOG" ]]; then
+  pass "T20b: the story is dispatchable again at the final boundary — the real admission boundary ran"
+else
+  fail "T20b: final boundary did not run the admission after hold removal"
+fi
+
+rm -f /tmp/t20a-held.out /tmp/t20a-free.out /tmp/t20b-held.out /tmp/t20b-free.out
+unset -f _run_local_admission
+unset T20_ADMIT_LOG
+
 printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
 printf 'RESULTS: %s passed, %s failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 printf '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
