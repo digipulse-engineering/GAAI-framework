@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+-: The monitor states the daemon's lifecycle before anything
+-: an inconclusive timeout admission goes to a human, never to implementation
 -: The presentation UI is created by a successful launch and
 - fix: the Running counter starts at the current phase, not at claim time
 -: A settled lifecycle can be disposed of without hand-editing

@@ -42,6 +42,11 @@ cp "$SCRIPTS_DIR/daemon-monitor-top.sh" "$SCRIPTS_DIR/daemon-monitor-tail.sh" \
    "$PROJ/.gaai/core/scripts/"
 chmod 0755 "$PROJ/.gaai/core/scripts/daemon-monitor-top.sh" \
            "$PROJ/.gaai/core/scripts/daemon-monitor-tail.sh"
+# Tolerates absence on the exact base revision, before the library exists — the
+# new rows below then fail on their own assertions instead of aborting the suite.
+cp "$SCRIPTS_DIR/lib/daemon-monitor-lifecycle.sh" "$PROJ/.gaai/core/scripts/lib/" 2>/dev/null || true
+[[ -f "$PROJ/.gaai/core/scripts/lib/daemon-monitor-lifecycle.sh" ]] && \
+  chmod 0644 "$PROJ/.gaai/core/scripts/lib/daemon-monitor-lifecycle.sh"
 git -C "$PROJ" add -A >/dev/null 2>&1
 git -C "$PROJ" commit -qm "panes" >/dev/null 2>&1
 git -C "$PROJ" push -q origin staging 2>/dev/null
@@ -54,6 +59,14 @@ PID_FILE="$PROJ/.gaai/project/contexts/backlog/.delivery-locks/.daemon.pid"
 LOG_FILE="$PROJ/.gaai/project/contexts/backlog/.delivery-daemon.log"
 
 owner_field() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+
+# Lifecycle-banner fixtures (this Story). The top pane's own attested command
+# roots (never the restricted `gaai_run` sandbox PATH, which proves only that
+# the privileged entry rebuilds its own) so `git`/`tmux` resolve exactly as
+# they do for a pane inherited from the real presentation server.
+TOP="$PROJ/.gaai/core/scripts/daemon-monitor-top.sh"
+CONFIG_FILE="$PROJ/.gaai/project/contexts/backlog/.delivery-locks/.daemon-config"
+ENTRY_PATH='/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin'
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Probe server (an unrelated tmux server AC2 proves untouched) + pty harness
@@ -111,6 +124,96 @@ poll_until() {
     sleep 1; _i=$(( _i + 1 ))
   done
   return 1
+}
+
+# top_frame <label> [interpreter args...] — run the shipped top pane detached
+# on $PROBE_SOCK in a real pty sized so no rendered line wraps, poll up to 20s
+# for the first rendered frame, capture that VISIBLE frame (never scrollback —
+# the pane clears every iteration, so scrollback would mix frames), kill the
+# session and print the frame.
+top_frame() {
+  local _label="$1"; shift
+  local _cmd
+  if [[ "$#" -eq 0 ]]; then
+    _cmd="'$TOP' '$CONFIG_FILE' '$LOG_FILE'"
+  else
+    _cmd="$* '$TOP' '$CONFIG_FILE' '$LOG_FILE'"
+  fi
+  tmux -f "$PROBE_CONF" -S "$PROBE_SOCK" new-session -d -s "$_label" -x 200 -y 50 \
+    "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C $_cmd" 2>/dev/null
+  local _i=0 _frame=""
+  while [[ "$_i" -lt 20 ]]; do
+    _frame="$(tmux -f /dev/null -S "$PROBE_SOCK" capture-pane -p -t "$_label" 2>/dev/null)"
+    [[ "$_frame" == *"DAEMON "* ]] && break
+    sleep 1; _i=$(( _i + 1 ))
+  done
+  tmux -f /dev/null -S "$PROBE_SOCK" kill-session -t "=$_label" 2>/dev/null || true
+  printf '%s' "$_frame"
+}
+
+# status_field <key> — read-only, taken AFTER a frame with no mutation in
+# between, never invoked by a pane. The harness's own parity oracle.
+status_field() {
+  gaai_run "$ROOT" "$START" --status 2>/dev/null | sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" | head -1
+}
+
+# expected_banner <state> <verdict> — the mapping the observer must mirror.
+expected_banner() {
+  local _state="$1" _verdict="$2"
+  case "$_verdict" in
+    live)
+      case "$_state" in
+        running) printf 'DAEMON RUNNING' ;;
+        pending|bound) printf 'DAEMON STARTING' ;;
+        *) printf 'DAEMON AMBIGUOUS' ;;
+      esac
+      ;;
+    settled) printf 'DAEMON STOPPED' ;;
+    *) printf 'DAEMON AMBIGUOUS' ;;
+  esac
+}
+
+# assert_parity <label> <frame> — the banner's state/verdict must equal what
+# `daemon-start.sh --status` reports for the same sandbox lifecycle.
+assert_parity() {
+  local _label="$1" _frame="$2" _state _verdict _expected _first
+  _state="$(status_field state)"
+  _verdict="$(status_field verdict)"
+  _expected="$(expected_banner "$_state" "$_verdict")"
+  _first="$(printf '%s\n' "$_frame" | grep -m1 'DAEMON ' | tr -d '\r')"
+  case "$_first" in
+    *"$_expected"*) pass "$_label: banner ($_first) matches --status ($_state/$_verdict)" ;;
+    *) fail "$_label: banner ($_first) does not match --status ($_state/$_verdict -> expected $_expected)" ;;
+  esac
+  if [[ "$_expected" == "DAEMON RUNNING" ]]; then
+    local _pid _attempt
+    _pid="$(status_field 'daemon pid')"
+    _attempt="$(status_field attempt)"
+    if [[ -n "$_pid" && "$_first" == *"daemon pid $_pid"* ]]; then
+      pass "$_label: pid matches --status"
+    else
+      fail "$_label: pid mismatch (frame='$_first' status pid='$_pid')"
+    fi
+    if [[ -n "$_attempt" && "$_first" == *"attempt $_attempt"* ]]; then
+      pass "$_label: attempt matches --status"
+    else
+      fail "$_label: attempt mismatch (frame='$_first' status attempt='$_attempt')"
+    fi
+  fi
+}
+
+# write_stale_config — a recognisable config file, written BEFORE a launch so
+# a caller can `sleep 1` and prove the new attempt's readiness is strictly
+# newer without any hardcoded timestamp literal.
+write_stale_config() {
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cat > "$CONFIG_FILE" <<'STALE_EOF'
+BRANCH=stale-branch
+MODEL=stale-model
+CONCURRENT=9
+MAX_TURNS=999
+LAUNCHER=stale-launcher
+STALE_EOF
 }
 
 mon_alive() { tmux -f /dev/null -S "$MON_SOCK" has-session -t "=$MON_SESS" 2>/dev/null; }
@@ -446,10 +549,274 @@ while IFS= read -r _sh; do
   OUT="$(pty_run "ds-$_shname" "$_sh" --noprofile --norc -p "$START")"
   echo "$OUT" | grep -q 'Daemon started' && pass "DS-$_shname-1: daemon started under $_shname" || fail "DS-$_shname-1: no 'Daemon started' under $_shname: $OUT"
   mon_alive && pass "DS-$_shname-2: presentation UI created under $_shname" || fail "DS-$_shname-2: no presentation UI under $_shname"
+  _frame="$(top_frame "ds-frame-$_shname" "$_sh" --noprofile --norc -p)"
+  echo "$_frame" | grep -qE "^[[:space:]]*DAEMON RUNNING" && pass "DS-$_shname-5: lifecycle banner renders DAEMON RUNNING under $_shname" || fail "DS-$_shname-5: unexpected frame under $_shname: $_frame"
   OUT="$(gaai_run "$ROOT" "$_sh" --noprofile --norc -p "$START" --stop 2>&1)"
   echo "$OUT" | grep -q '✅ Daemon stopped. Log truncated.' && pass "DS-$_shname-3: full stop path under $_shname" || fail "DS-$_shname-3: unexpected stop output under $_shname: $OUT"
   mon_alive && fail "DS-$_shname-4: presentation server survives stop under $_shname" || pass "DS-$_shname-4: presentation server torn down under $_shname"
 done <<< "$SHELLS"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 4 — AC1: the lifecycle banner's first line, and its parity with
+# `daemon-start.sh --status` (harness-only; never invoked by a pane)
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== C1: DAEMON RUNNING — live daemon, pid + attempt, parity ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_child_pid="$(owner_field "$OWNER_FILE" child_pid)"
+_attempt="$(owner_field "$OWNER_FILE" attempt)"
+_frame="$(top_frame C1)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON RUNNING" && pass "C1-1: first line is DAEMON RUNNING" || fail "C1-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "daemon pid $_child_pid" && pass "C1-2: carries daemon pid $_child_pid" || fail "C1-2: pid not found: $_frame"
+echo "$_frame" | grep -q "attempt $_attempt" && pass "C1-3: carries attempt $_attempt" || fail "C1-3: attempt not found: $_frame"
+assert_parity "C1-4" "$_frame"
+
+echo ""
+echo "=== C2: DAEMON STARTING — state=bound ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.c2.tmp"
+sed 's/^state=running$/state=bound/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_attempt="$(owner_field "$OWNER_FILE" attempt)"
+_frame="$(top_frame C2)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON STARTING" && pass "C2-1: first line is DAEMON STARTING" || fail "C2-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "attempt $_attempt" && pass "C2-2: carries attempt $_attempt" || fail "C2-2: attempt not found: $_frame"
+assert_parity "C2-3" "$_frame"
+
+echo ""
+echo "=== C3: DAEMON STARTING — state=pending ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.c3.tmp"
+sed 's/^state=running$/state=pending/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_attempt="$(owner_field "$OWNER_FILE" attempt)"
+_frame="$(top_frame C3)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON STARTING" && pass "C3-1: first line is DAEMON STARTING" || fail "C3-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "attempt $_attempt" && pass "C3-2: carries attempt $_attempt" || fail "C3-2: attempt not found: $_frame"
+assert_parity "C3-3" "$_frame"
+
+echo ""
+echo "=== C4: DAEMON STOPPED — no lifecycle at all ==="
+scenario_reset
+_frame="$(top_frame C4)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON STOPPED" && pass "C4-1: first line is DAEMON STOPPED" || fail "C4-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "daemon pid" && fail "C4-2: unexpectedly carries a pid" || pass "C4-2: no pid rendered"
+echo "$_frame" | grep -q "attempt " && fail "C4-3: unexpectedly carries an attempt" || pass "C4-3: no attempt rendered"
+assert_parity "C4-4" "$_frame"
+
+echo ""
+echo "=== C5: DAEMON STOPPED — pending record with no server (authority's settled shortcut) ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+rm -f "$DSOCK" 2>/dev/null
+_owner_tmp="$ROOT/owner.c5.tmp"
+sed 's/^state=running$/state=pending/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_frame="$(top_frame C5)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON STOPPED" && pass "C5-1: first line is DAEMON STOPPED" || fail "C5-1: unexpected frame: $_frame"
+assert_parity "C5-2" "$_frame"
+
+echo ""
+echo "=== C6: DAEMON AMBIGUOUS — corrupt record ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+printf 'garbage\n' > "$OWNER_FILE"
+_frame="$(top_frame C6)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON AMBIGUOUS" && pass "C6-1: first line is DAEMON AMBIGUOUS" || fail "C6-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "process_authority_invalid" && pass "C6-2: carries process_authority_invalid" || fail "C6-2: missing token: $_frame"
+echo "$_frame" | grep -q "operator_disposition_required" && pass "C6-3: carries operator_disposition_required" || fail "C6-3: missing token: $_frame"
+assert_parity "C6-4" "$_frame"
+
+echo ""
+echo "=== C7: DAEMON AMBIGUOUS — daemon server killed, record still says running ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+_frame="$(top_frame C7)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON AMBIGUOUS" && pass "C7-1: first line is DAEMON AMBIGUOUS" || fail "C7-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "process_authority_invalid" && pass "C7-2: carries process_authority_invalid" || fail "C7-2: missing token: $_frame"
+echo "$_frame" | grep -q "operator_disposition_required" && pass "C7-3: carries operator_disposition_required" || fail "C7-3: missing token: $_frame"
+assert_parity "C7-4" "$_frame"
+
+echo ""
+echo "=== C8: DAEMON AMBIGUOUS — server incarnation mismatch behind a live server ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.c8.tmp"
+sed 's/^server_incarnation=.*/server_incarnation=bogus-incarnation/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_frame="$(top_frame C8)"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON AMBIGUOUS" && pass "C8-1: first line is DAEMON AMBIGUOUS" || fail "C8-1: unexpected frame: $_frame"
+echo "$_frame" | grep -q "process_authority_invalid" && pass "C8-2: carries process_authority_invalid" || fail "C8-2: missing token: $_frame"
+echo "$_frame" | grep -q "operator_disposition_required" && pass "C8-3: carries operator_disposition_required" || fail "C8-3: missing token: $_frame"
+assert_parity "C8-4" "$_frame"
+
+echo ""
+echo "=== C9: DAEMON AMBIGUOUS — identity unresolvable (init against a non-repository root) ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_c9_nogit="$ROOT/not-a-repo"
+mkdir -p "$_c9_nogit"
+_c9_out="$(bash -c '
+  source "$1/.gaai/core/scripts/lib/daemon-monitor-lifecycle.sh"
+  _gaai_mon_lifecycle_init "$2" 2>/dev/null
+  _gaai_mon_lifecycle_refresh
+  printf "INIT=%s STATE=%s VERDICT=%s BANNER=%s\n" \
+    "$_GAAI_MON_INITIALIZED" "$_GAAI_MON_STATE" "$_GAAI_MON_VERDICT" "$_GAAI_MON_BANNER"
+' _ "$PROJ" "$_c9_nogit")"
+echo "$_c9_out" | grep -q "INIT=0" && pass "C9-1: observer failed to initialize against a non-repository root" || fail "C9-1: unexpected init result: $_c9_out"
+echo "$_c9_out" | grep -q "VERDICT=ambiguous" && pass "C9-2: verdict is ambiguous, never settled, on unresolvable identity" || fail "C9-2: unexpected verdict: $_c9_out"
+echo "$_c9_out" | grep -q "BANNER=DAEMON AMBIGUOUS" && pass "C9-3: uninitialized observer renders DAEMON AMBIGUOUS, not a liveness claim (PC-1 regression)" || fail "C9-3: unexpected banner: $_c9_out"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 5 — AC1: `.daemon-config` is attributed to the current attempt or
+# labelled historical/pending/absent, at every banner state
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== D1: config attribution — historical (written before this attempt's readiness) ==="
+scenario_reset
+write_stale_config
+sleep 1
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_frame="$(top_frame D1)"
+_leak=0
+for _v in stale-branch stale-model stale-launcher; do echo "$_frame" | grep -q "$_v" && _leak=1; done
+[[ "$_leak" -eq 0 ]] && pass "D1-1: no stale config value rendered" || fail "D1-1: a stale value leaked: $_frame"
+echo "$_frame" | grep -q "previous lifecycle" && pass "D1-2: attribution labelled historical" || fail "D1-2: no historical attribution: $_frame"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON RUNNING" && pass "D1-3: banner still renders" || fail "D1-3: no banner: $_frame"
+
+echo ""
+echo "=== D2: config attribution — current (touched after this attempt's readiness) ==="
+scenario_reset
+write_stale_config
+sleep 1
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+sleep 1
+touch "$CONFIG_FILE"
+_frame="$(top_frame D2)"
+echo "$_frame" | grep -q "stale-branch" && pass "D2-1: BRANCH value rendered" || fail "D2-1: BRANCH missing: $_frame"
+echo "$_frame" | grep -q "stale-model" && pass "D2-2: MODEL value rendered" || fail "D2-2: MODEL missing: $_frame"
+echo "$_frame" | grep -q "Config: current" && pass "D2-3: attribution labelled current" || fail "D2-3: no current attribution: $_frame"
+
+echo ""
+echo "=== D3: config attribution — pending (readiness-to-configuration interval) ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+rm -f "$CONFIG_FILE"
+_frame="$(top_frame D3)"
+echo "$_frame" | grep -q "pending for this attempt" && pass "D3-1: attribution labelled pending" || fail "D3-1: no pending attribution: $_frame"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON RUNNING" && pass "D3-2: banner still renders" || fail "D3-2: no banner: $_frame"
+
+echo ""
+echo "=== D4: config attribution — not current under STARTING ==="
+scenario_reset
+write_stale_config
+sleep 1
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.d4.tmp"
+sed 's/^state=running$/state=bound/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_frame="$(top_frame D4)"
+_leak=0
+for _v in stale-branch stale-model stale-launcher; do echo "$_frame" | grep -q "$_v" && _leak=1; done
+[[ "$_leak" -eq 0 ]] && pass "D4-1: no stale config value rendered" || fail "D4-1: a stale value leaked: $_frame"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON STARTING" && pass "D4-2: banner still renders" || fail "D4-2: no banner: $_frame"
+
+echo ""
+echo "=== D5: config attribution — not current under STOPPED ==="
+scenario_reset
+write_stale_config
+_frame="$(top_frame D5)"
+_leak=0
+for _v in stale-branch stale-model stale-launcher; do echo "$_frame" | grep -q "$_v" && _leak=1; done
+[[ "$_leak" -eq 0 ]] && pass "D5-1: no stale config value rendered" || fail "D5-1: a stale value leaked: $_frame"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON STOPPED" && pass "D5-2: banner still renders" || fail "D5-2: no banner: $_frame"
+
+echo ""
+echo "=== D6: config attribution — not current under AMBIGUOUS ==="
+scenario_reset
+write_stale_config
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+printf 'garbage\n' > "$OWNER_FILE"
+_frame="$(top_frame D6)"
+_leak=0
+for _v in stale-branch stale-model stale-launcher; do echo "$_frame" | grep -q "$_v" && _leak=1; done
+[[ "$_leak" -eq 0 ]] && pass "D6-1: no stale config value rendered" || fail "D6-1: a stale value leaked: $_frame"
+echo "$_frame" | grep -qE "^[[:space:]]*DAEMON AMBIGUOUS" && pass "D6-2: banner still renders" || fail "D6-2: no banner: $_frame"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 6 — AC1: the log pane is labelled live output only under RUNNING
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== E1: log pane label — live output under RUNNING ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_frame="$(top_frame E1)"
+echo "$_frame" | grep -q "live daemon output" && pass "E1-1: live-output label present" || fail "E1-1: missing live-output label: $_frame"
+echo "$_frame" | grep -q "last lifecycle" && fail "E1-2: last-lifecycle label unexpectedly present" || pass "E1-2: last-lifecycle label absent"
+
+echo ""
+echo "=== E2: log pane label — last lifecycle under STOPPED ==="
+scenario_reset
+_frame="$(top_frame E2)"
+echo "$_frame" | grep -q "last lifecycle" && pass "E2-1: last-lifecycle label present" || fail "E2-1: missing last-lifecycle label: $_frame"
+echo "$_frame" | grep -q "live daemon output" && fail "E2-2: live-output label unexpectedly present" || pass "E2-2: live-output label absent"
+
+echo ""
+echo "=== E3: log pane label — last lifecycle under STARTING ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+_owner_tmp="$ROOT/owner.e3.tmp"
+sed 's/^state=running$/state=bound/' "$OWNER_FILE" > "$_owner_tmp" && mv "$_owner_tmp" "$OWNER_FILE"
+_frame="$(top_frame E3)"
+echo "$_frame" | grep -q "last lifecycle" && pass "E3-1: last-lifecycle label present" || fail "E3-1: missing last-lifecycle label: $_frame"
+echo "$_frame" | grep -q "live daemon output" && fail "E3-2: live-output label unexpectedly present" || pass "E3-2: live-output label absent"
+
+echo ""
+echo "=== E4: log pane label — last lifecycle under AMBIGUOUS ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+printf 'garbage\n' > "$OWNER_FILE"
+_frame="$(top_frame E4)"
+echo "$_frame" | grep -q "last lifecycle" && pass "E4-1: last-lifecycle label present" || fail "E4-1: missing last-lifecycle label: $_frame"
+echo "$_frame" | grep -q "live daemon output" && fail "E4-2: live-output label unexpectedly present" || pass "E4-2: live-output label absent"
+
+echo ""
+echo "=== E5: log pane label — absent-log message is unchanged, no label added ==="
+scenario_reset
+gaai_run "$ROOT" "$START" >/dev/null 2>&1
+mv "$LOG_FILE" "$LOG_FILE.bak"
+_frame="$(top_frame E5)"
+mv "$LOG_FILE.bak" "$LOG_FILE"
+echo "$_frame" | grep -q "waiting for daemon log" && pass "E5-1: absent-log message unchanged" || fail "E5-1: missing waiting message: $_frame"
+echo "$_frame" | grep -q "live daemon output" && fail "E5-2: live-output label unexpectedly present with no log file" || pass "E5-2: no live-output label"
+echo "$_frame" | grep -q "last lifecycle" && fail "E5-3: last-lifecycle label unexpectedly present with no log file" || pass "E5-3: no last-lifecycle label"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Part 7 — end to end: the shipped wiring, not just the script run in isolation
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+echo "=== F1: the real -mon session's top pane renders DAEMON RUNNING ==="
+scenario_reset
+pty_run f1 "$START" >/dev/null
+if mon_alive; then
+  # The real session's pane defaults to a short headless height, shorter than
+  # this frame (banner + log tail) — the visible screen alone can scroll the
+  # banner off the top. A slice of recent scrollback covers one full frame
+  # without reaching back into an unrelated prior render.
+  _f1_i=0 _f1_frame=""
+  while [[ "$_f1_i" -lt 20 ]]; do
+    _f1_frame="$(tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -S -60 -t "=${MON_SESS}:0.0" 2>/dev/null)"
+    echo "$_f1_frame" | grep -q "DAEMON RUNNING" && break
+    sleep 1; _f1_i=$(( _f1_i + 1 ))
+  done
+  echo "$_f1_frame" | grep -q "DAEMON RUNNING" && pass "F1: the shipped -mon session's top pane renders DAEMON RUNNING" || fail "F1: unexpected frame: $_f1_frame"
+else
+  fail "F1: no presentation UI to inspect"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Summary
