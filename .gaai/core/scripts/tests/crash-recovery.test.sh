@@ -506,6 +506,54 @@ expect "recovery retry persistence failure retains the exact context without spa
 expect "recovery spawn failure keeps the durable retry and does not restore context" \
   test "$(cat "$TMP/settle-recovery-spawn-result")" = "1:absent:1:1"
 
+# The main loop must re-sample capacity after the periodic recovery scan: a
+# Story relaunched by recovery in the same cycle fills the slot, and both the
+# idle decision and the claims used the pre-scan count, leaving in_progress
+# rows no wrapper owned.
+python3 - "$DAEMON" "$TMP/capacity-after-recovery.sh" <<'PY'
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+start = text.index("  # Re-sample capacity after the recovery scan")
+full = text.index("after recovery. Waiting...", start)
+end = text.index("\n  fi\n", full) + len("\n  fi\n")
+recovery = text.index("forward_recovery_scan || _periodic_recovery_rc=$?")
+idle = text.index('if (( active > 0 )); then', start)
+assert recovery < start < idle, "re-sample must sit after the recovery scan and before the idle decision"
+with open(sys.argv[2], "w", encoding="utf-8") as out:
+    out.write("capacity_after_recovery() {\n  for _cap_once in 1; do\n")
+    out.write(text[start:end])
+    out.write('    echo "resampled active=$active"\n  done\n  echo "idle=$empty_idle_polls"\n}\n')
+PY
+expect "capacity re-sample sits after the recovery scan and before the idle decision" \
+  test -s "$TMP/capacity-after-recovery.sh"
+for cap_case in "1:1:full" "0:1:open" "ambiguous:1:ambiguous"; do
+  IFS=: read -r cap_active cap_max cap_expect <<< "$cap_case"
+  cap_out=$(
+    # shellcheck disable=SC1090
+    source "$TMP/capacity-after-recovery.sh"
+    MAX_CONCURRENT=$cap_max; POLL_INTERVAL=0
+    RED=""; BLUE=""; NC=""
+    log(){ printf '%s\n' "$*"; }
+    sleep(){ :; }
+    active_count(){ [[ "$cap_active" == ambiguous ]] && return 1; echo "$cap_active"; }
+    active=0; empty_idle_polls=4
+    capacity_after_recovery
+  )
+  case "$cap_expect" in
+    full) expect "capacity re-sampled after recovery: a filled slot publishes no claim" \
+            test "$cap_out" = "$(printf 'Slots full (1/1) after recovery. Waiting...\nidle=0')" ;;
+    open) expect "capacity re-sampled after recovery: a free slot proceeds with the fresh count" \
+            test "$cap_out" = "$(printf 'resampled active=0\nidle=4')" ;;
+    ambiguous) expect "capacity re-sampled after recovery: ambiguous ownership skips the cycle entirely" \
+            bash -c 'grep -q "capacity ownership is ambiguous after recovery" <<< "$1" && ! grep -q "resampled" <<< "$1"' _ "$cap_out" ;;
+  esac
+done
+# A published claim that is then held still consumes the cycle's slot budget,
+# so a held claim is never followed by a second claim in the same cycle.
+expect "claim budget counts published claims, not only launches" \
+  bash -c 'grep -q "(( launched >= available_slots || claimed >= available_slots )) && break" "$1" && awk "/pre_launch_mark_in_progress \"\\\$story_id\"; then/{f=1} f&&/claimed=\\\$\\(\\( claimed \\+ 1 \\)\\)/{print \"ok\"; exit}" "$1" | grep -q ok' _ "$DAEMON"
+
 python3 - "$DAEMON" "$TMP/settle-main-boundary.sh" <<'PY'
 import sys
 

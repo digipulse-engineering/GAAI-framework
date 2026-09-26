@@ -5799,6 +5799,24 @@ while true; do
     last_recovery_scan_ts=$(date +%s)
   fi
 
+  # Re-sample capacity after the recovery scan, before the idle decision and any
+  # claim. The count above was taken before the periodic recovery scan, which may have relaunched a Story into a free slot
+  # in this same cycle (a relaunch returns only once its lock exists, so a
+  # fresh count sees it). Claiming against the stale count published claims
+  # for Stories no slot could run, leaving in_progress rows no wrapper owned.
+  if ! active=$(active_count); then
+    log "${RED}[FORWARD-RECOVERY] capacity ownership is ambiguous after recovery — skipping cycle${NC}"
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
+  if (( active >= MAX_CONCURRENT )); then
+    empty_idle_polls=0  # not idle — recovery just filled the slot
+    log "${BLUE}Slots full ($active/$MAX_CONCURRENT) after recovery. Waiting...${NC}"
+    sleep "$POLL_INTERVAL"
+    continue
+  fi
+
+
   # ── Cycle housekeeping — runs whether or not a Story is ready ─────────────
   # Placed BEFORE the ready-Story evaluation on purpose: the idle branch below
   # ends its cycle with `sleep; continue`, so anything after the launch loop
@@ -5879,10 +5897,11 @@ print("\n".join(values))
   # Launch deliveries up to available slots
   available_slots=$(( MAX_CONCURRENT - active ))
   launched=0
+  claimed=0   # published claims, launched or not: a held claim still uses a slot
 
   while IFS= read -r story_id; do
     [[ -z "$story_id" ]] && continue
-    (( launched >= available_slots )) && break
+    (( launched >= available_slots || claimed >= available_slots )) && break
 
     if is_locked "$story_id"; then
       log "${BLUE}$story_id already in progress (local lock). Skipping.${NC}"
@@ -5976,6 +5995,7 @@ print("\n".join(values))
       fi
       continue
     fi
+    claimed=$(( claimed + 1 ))
 
     # The claim changes target authority. Pin and admit that new object before
     # probing or repairing the post-claim worktree.
