@@ -300,6 +300,49 @@ NODE
 [[ $? -eq 0 ]] && pass 'normal completion and timeout kill the process group; cancellation stays distinct' \
   || fail 'timeout/cancellation executor contract'
 
+# A command group outlives nothing that ends the executor on its own: a hangup,
+# or a caller that disappears without one, must take the running group with it
+# rather than leave it reparented to init.
+LONG_PLAN="$ROOT/long-plan.json"
+node -e 'require("fs").writeFileSync(process.argv[1], JSON.stringify({ status:"resolved",
+  selected_commands:[{ id:"long", argv:["bash","-c",`sleep 60 & echo $! > "${process.argv[2]}"; wait`],
+    timeout_seconds:60, output_limit_bytes:64, descriptor_digest:"d", configuration_digest:"c" }] }))' \
+  "$LONG_PLAN" "$ROOT/long.pid"
+_gone_within() {
+  local pid="$1" tries=0
+  while kill -0 "$pid" 2>/dev/null; do
+    (( tries++ < 100 )) || return 1
+    sleep 0.05
+  done
+}
+# The launcher mirrors the adapter's invocation: a command substitution whose
+# `exec` leaves no subshell between the caller and the executor (Bash 3.2 would
+# otherwise fork one, and a surviving subshell keeps the executor's parent pid).
+if grep -qF 'results_digest=$(exec node "$executor" --mode execute' "$SCRIPT_DIR/lib/local-admission.sh"; then
+  pass 'the adapter execs the executor inside its command substitution'
+else fail 'the adapter leaves a subshell between the caller and the executor'; fi
+for loss in hangup caller; do
+  rm -f "$ROOT/long.pid" "$ROOT/long-$loss.json"
+  /bin/bash -c 'digest=$(exec node "$1" --mode execute --plan "$2" --repo "$3" --output "$4" 2>/dev/null); :' \
+    _ "$EXECUTOR" "$LONG_PLAN" "$ROOT" "$ROOT/long-$loss.json" &
+  launcher=$!
+  tries=0
+  while [[ ! -s "$ROOT/long.pid" ]] && (( tries++ < 100 )); do sleep 0.05; done
+  exec_pid=$(pgrep -P "$launcher" 2>/dev/null | head -1); cmd_pid=$(cat "$ROOT/long.pid" 2>/dev/null)
+  if [[ -z "$exec_pid" || -z "$cmd_pid" ]] || ! ps -o command= -p "$exec_pid" | grep -q '^node '; then
+    fail "$loss: the executor is not the launcher's direct child, or its command never started"
+    kill -9 "$launcher" "$exec_pid" "$cmd_pid" 2>/dev/null; wait "$launcher" 2>/dev/null; continue
+  fi
+  if [[ "$loss" == hangup ]]; then kill -HUP "$exec_pid"; else kill -9 "$launcher"; fi
+  wait "$launcher" 2>/dev/null
+  if _gone_within "$cmd_pid" && _gone_within "$exec_pid" && [[ ! -e "$ROOT/long-$loss.json" ]]; then
+    pass "$loss: the executor ends its running command group and records no result"
+  else
+    fail "$loss: command group or executor survived (cmd=$cmd_pid exec=$exec_pid)"
+    kill -9 "$cmd_pid" "$exec_pid" 2>/dev/null
+  fi
+done
+
 # The corpus suite that installs an executor shim honouring GAAI_QA_REPORT_PATH
 # must never inherit that pointer from the process that runs it.
 if grep -qE '^unset GAAI_QA_REPORT_PATH GAAI_QA_VERDICT_PATH GAAI_PLAN_PATH' "$SCRIPT_DIR/tests/daemon-state-machine.test.sh"; then
