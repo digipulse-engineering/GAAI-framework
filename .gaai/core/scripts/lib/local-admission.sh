@@ -171,7 +171,9 @@ _run_local_admission() {
     || { LOCAL_ADMISSION_OUTCOME="blocked:policy_limits_invalid"; _local_admission_cleanup "$scratch"; return 1; }
   binding_digest=$(node -e 'const p=require(process.argv[1]);process.stdout.write(p.binding_digest)' "$plan")
   seal_plan="$plan"; seal_binding="$binding_digest"
-  if ! results_digest=$(node "$executor" --mode execute --plan "$plan" --repo "$repo" --output "$results"); then
+  # `exec`: Bash 3.2 otherwise forks an intermediate subshell here, which can
+  # outlive a killed caller and hide that loss from the executor's parent check.
+  if ! results_digest=$(exec node "$executor" --mode execute --plan "$plan" --repo "$repo" --output "$results"); then
     LOCAL_ADMISSION_OUTCOME="blocked:execution_failed"
     _local_admission_reject_with_plan "$executor" "$boundary" "$story" "$plan" "$results" \
       "$LOCAL_ADMISSION_OUTCOME" "$limit" "$receipt_dir" || true

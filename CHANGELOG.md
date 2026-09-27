@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: end the running command group when the executor loses its caller
 -: A stopped or unverified daemon is never rendered as a live
 - fix: re-sample capacity after the recovery scan, before any claim
 -: The monitor states the daemon's lifecycle before anything

@@ -36,6 +36,38 @@ function terminate(child) {
   } catch { /* already exited */ }
 }
 
+// Each command runs in a process group of its own, so nothing that ends this
+// executor reaches it. A delivery wrapper killed mid-gate takes its terminal
+// down with it; the hangup ends the executor, and the command group — a whole
+// corpus run with its lease heartbeat — is reparented to init and keeps
+// running, holding the lease the next gate waits on. The executor therefore
+// owns the lifetime of the groups it starts: they are tracked while they run
+// and ended when the executor is told to stop or finds its caller gone.
+const running = new Set();
+
+export function abandonOnCallerLoss({ intervalMs = 1000, exit = code => process.exit(code) } = {}) {
+  const caller = process.ppid;
+  const signals = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+  const abandon = code => {
+    for (const child of running) terminate(child);
+    running.clear();
+    exit(code);
+  };
+  const handlers = Object.entries(signals).map(([name, code]) => {
+    const handler = () => abandon(code);
+    process.on(name, handler);
+    return [name, handler];
+  });
+  // The caller can also vanish without a hangup reaching this process; its
+  // children are then reparented, which changes the parent pid.
+  const timer = setInterval(() => { if (process.ppid !== caller) abandon(129); }, intervalMs);
+  timer.unref();
+  return () => {
+    clearInterval(timer);
+    for (const [name, handler] of handlers) process.removeListener(name, handler);
+  };
+}
+
 export function executeCommand(command, { cwd, signal, keep = [] } = {}) {
   return new Promise(resolve => {
     const started = Date.now();
@@ -48,9 +80,11 @@ export function executeCommand(command, { cwd, signal, keep = [] } = {}) {
       cwd, env: gateEnvironment(process.env, keep), shell: false, detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe']
     });
+    running.add(child);
     const finish = (code, childSignal) => {
       if (settled) return;
       settled = true; clearTimeout(timer); signal?.removeEventListener('abort', cancel); terminate(child);
+      running.delete(child);
       const outcome = forced || (childSignal ? 'cancelled' : code === 0 ? 'passed' : 'failed');
       resolve({ command_id: command.id, descriptor_digest: command.descriptor_digest,
         configuration_digest: command.configuration_digest, outcome,
@@ -161,7 +195,10 @@ async function main() {
   await writeFile(args.output, bytes, { mode: 0o600, flag: 'wx' });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(error => {
-  process.stderr.write(`${JSON.stringify({ status: 'rejected', reason: error.reason || error.message || 'executor_error' })}\n`);
-  process.exitCode = error.reason === 'receipt_too_large' ? 3 : 2;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  abandonOnCallerLoss();
+  main().catch(error => {
+    process.stderr.write(`${JSON.stringify({ status: 'rejected', reason: error.reason || error.message || 'executor_error' })}\n`);
+    process.exitCode = error.reason === 'receipt_too_large' ? 3 : 2;
+  });
+}
