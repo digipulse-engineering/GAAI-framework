@@ -70,6 +70,20 @@ if _run_local_admission pre_qa TST-LA "$REPO" staging "$RECEIPTS" >/dev/null; th
   else fail 'pre-QA privacy or argv execution contract'; fi
 else fail "pre-QA expected PASS, got $LOCAL_ADMISSION_OUTCOME"; fi
 
+if node - "$PRE" <<'NODE'
+const fs = require('fs');
+const receipt = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const keys = ['schema_version','boundary','story_id','candidate','binding_digest','selected_surface_ids',
+  'selected_command_ids','results','outcome','publication_admitted','created_at','receipt_digest'];
+const results = ['command_id','descriptor_digest','configuration_digest','outcome','exit_code','signal',
+  'duration_ms','stdout_bytes','stderr_bytes','stdout_truncated','stderr_truncated'];
+const exact = (value, names) => JSON.stringify(Object.keys(value).sort()) === JSON.stringify(names.sort());
+if (receipt.schema_version !== '1.0.0' || !exact(receipt, keys)
+    || !receipt.results.every(result => exact(result, results))) process.exit(1);
+NODE
+then pass 'real invocation-bearing shell run preserves exact ordinary receipt schema'
+else fail 'ordinary shell receipt leaked composite execution metadata'; fi
+
 SCRIPT_ALIAS="$ROOT/scripts-alias"
 ALIAS_RECEIPT="$RECEIPTS/.local-admission-TST-ALIAS-pre_qa.json"
 ln -s "$SCRIPT_DIR" "$SCRIPT_ALIAS"
@@ -318,9 +332,11 @@ _gone_within() {
 # The launcher mirrors the adapter's invocation: a command substitution whose
 # `exec` leaves no subshell between the caller and the executor (Bash 3.2 would
 # otherwise fork one, and a surviving subshell keeps the executor's parent pid).
-if grep -qF 'results_digest=$(exec node "$executor" --mode execute' "$SCRIPT_DIR/lib/local-admission.sh"; then
-  pass 'the adapter execs the executor inside its command substitution'
-else fail 'the adapter leaves a subshell between the caller and the executor'; fi
+EXEC_SUBSTITUTIONS=$(grep -Ec '[a-z_]+_digest=\$\(exec node "\$executor" --mode execute' "$SCRIPT_DIR/lib/local-admission.sh")
+if [[ "$EXEC_SUBSTITUTIONS" -eq 2 ]] \
+  && ! grep -Eq '[a-z_]+_digest=\$\(node "\$executor" --mode execute' "$SCRIPT_DIR/lib/local-admission.sh"; then
+  pass 'every execution path execs the executor inside its command substitution'
+else fail "an execution path leaves a subshell between the caller and the executor (direct=$EXEC_SUBSTITUTIONS)"; fi
 for loss in hangup caller; do
   rm -f "$ROOT/long.pid" "$ROOT/long-$loss.json"
   /bin/bash -c 'digest=$(exec node "$1" --mode execute --plan "$2" --repo "$3" --output "$4" 2>/dev/null); :' \
@@ -420,6 +436,10 @@ GS_OUT="$(/bin/bash "$GS" "$GSDIR" 2>&1)"
 if printf '%s' "$GS_OUT" | grep -q residue; then
   pass 'gate-status calls a dead publisher residue rather than a binding'
 else fail "gate-status treated residue as a live binding: ${GS_OUT}"; fi
+
+if node --test "$SCRIPT_DIR/tests/local-admission-applicability.test.mjs"; then
+  pass 'content applicability, immutable provenance and reconciliation race regressions'
+else fail 'local-admission applicability regressions'; fi
 
 printf '\nResults: %s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

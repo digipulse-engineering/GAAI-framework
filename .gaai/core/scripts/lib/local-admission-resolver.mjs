@@ -189,7 +189,7 @@ function normalizeDiff(raw, maxPaths) {
 }
 
 export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyPath, riskInputs,
-  environment }) {
+  environment, invocation }) {
   try {
     if (!text(repo) || !text(baseRef) || !/^[0-9a-f]{40}$/.test(baseSha)
         || !/^[0-9a-f]{40}$/.test(headSha) || !safePath(policyPath)
@@ -214,6 +214,30 @@ export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyP
     if (remote !== policy.repository.remote) fail('repository_mismatch');
     if (runGit(repo, ['status', '--porcelain=v1', '--untracked-files=all', '--', '.',
       ':(exclude,top).delivery-logs/**'], max).length) fail('candidate_unsealed');
+    return calculateAdmissionInputs({ repo, baseRef, baseSha, headSha, policyPath, riskInputs,
+      environment, invocation, policy, remote });
+  } catch (error) {
+    const reason = error instanceof AdmissionError ? error.reason : 'resolver_error';
+    return { status: 'rejected', reason, summary: { schema_version: VERSION, outcome: reason,
+      ...(error instanceof AdmissionError ? error.details : {}) } };
+  }
+}
+
+// Read-only historical reconstruction, not an admission entrypoint. The caller
+// must verify the recorded environment digest's continuity; it cannot recreate
+// past process facts from the observer. Live admission above never uses this.
+export function reconstructAdmissionInputs({ repo, baseRef, baseSha, headSha, policyPath,
+  riskInputs, invocation, policy, environmentDigest }) {
+  if (!/^[0-9a-f]{64}$/.test(environmentDigest)
+      || !/^[0-9a-f]{40}$/.test(baseSha) || !/^[0-9a-f]{40}$/.test(headSha)) fail('input_invalid');
+  validatePolicy(policy, Buffer.byteLength(canonical(policy)), baseRef);
+  return calculateAdmissionInputs({ repo, baseRef, baseSha, headSha, policyPath, riskInputs,
+    invocation, policy, remote: policy.repository.remote, environmentDigest });
+}
+
+function calculateAdmissionInputs({ repo, baseRef, baseSha, headSha, policyPath, riskInputs,
+  environment, invocation, policy, remote, environmentDigest }) {
+    const max = policy.limits.max_diff_bytes;
     const rawDiff = runGit(repo, ['diff', '--name-status', '-M', '-z', baseSha, headSha], max, 'diff_unresolvable');
     if (rawDiff.length > max) fail('diff_too_large');
     const { entries, paths } = normalizeDiff(rawDiff, policy.limits.max_changed_paths);
@@ -308,7 +332,7 @@ export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyP
       policy_version: policy.policy_version, policy_digest: digest(canonical(policy)),
       selector_digest: digest(canonical({ selectors: policy.selectors, exhaustive: policy.exhaustive_command_ids,
         broadening_patterns: policy.broadening_patterns })),
-      environment_digest: digest(canonical(facts)),
+      environment_digest: environmentDigest || digest(canonical(facts)),
       command_digests: commands.map(({ id, descriptor_digest, configuration_digest }) =>
         ({ id, descriptor_digest, configuration_digest })) };
     const summary = { schema_version: VERSION, outcome: 'resolved', repository_digest: binding.repository_digest,
@@ -316,17 +340,17 @@ export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyP
       changed_path_count: paths.length, rename_count: entries.filter(item => item.status.startsWith('R')).length,
       selected_surface_ids: [...surfaces].sort(), selected_command_ids: commands.map(item => item.id) };
     return { status: 'resolved', binding, binding_digest: summary.binding_digest,
+      ...(invocation ? { invocation,
+        resolution_inputs: { policy_path: policyPath, risk_inputs: riskInputs ?? null } } : {}),
       selected_commands: commands, environment_passthrough: passthroughNames, limits: { max_receipt_bytes: policy.limits.max_receipt_bytes,
-        max_result_bytes: policy.limits.max_result_bytes }, summary };
-  } catch (error) {
-    const reason = error instanceof AdmissionError ? error.reason : 'resolver_error';
-    return { status: 'rejected', reason, summary: { schema_version: VERSION, outcome: reason,
-      ...(error instanceof AdmissionError ? error.details : {}) } };
-  }
+        max_result_bytes: policy.limits.max_result_bytes,
+        ...(invocation ? { max_policy_bytes: policy.limits.max_policy_bytes,
+          max_diff_bytes: policy.limits.max_diff_bytes } : {}) }, summary };
 }
 
 function parseArgs(argv) {
-  const allowed = ['repo', 'base-ref', 'base-sha', 'head-sha', 'policy', 'risk-inputs', 'output'];
+  const allowed = ['repo', 'base-ref', 'base-sha', 'head-sha', 'policy', 'risk-inputs', 'output',
+    'invocation-id', 'story-id', 'boundary'];
   if (argv.length % 2 !== 0) fail('input_invalid');
   const options = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -350,7 +374,9 @@ async function main() {
     catch { riskInputs = {}; }
   }
   const result = resolveLocalAdmission({ repo: args.repo, baseRef: args['base-ref'],
-    baseSha: args['base-sha'], headSha: args['head-sha'], policyPath: args.policy, riskInputs });
+    baseSha: args['base-sha'], headSha: args['head-sha'], policyPath: args.policy, riskInputs,
+    ...(args['invocation-id'] ? { invocation: { id: args['invocation-id'],
+      story_id: args['story-id'], boundary: args.boundary } } : {}) });
   if (!args.output) { process.stderr.write('{"status":"rejected","reason":"input_invalid"}\n'); process.exitCode = 2; return; }
   await writeFile(args.output, `${JSON.stringify(result)}\n`, { mode: 0o600, flag: 'wx' });
   process.stdout.write(`${JSON.stringify(result.summary)}\n`);
