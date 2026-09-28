@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- test: cover process-tree termination with real processes
 -: preserve admission across lifecycle-only base advances
 - fix: end the running command group when the executor loses its caller
 -: A stopped or unverified daemon is never rendered as a live
