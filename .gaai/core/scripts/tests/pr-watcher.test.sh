@@ -1113,6 +1113,9 @@ S20_ACK_LANDED_OUTPUT=$(s20_run "$S20_VALID_REPO" "$S20_ACK_LANDED_STATE" "$S20_
 S20_ACK_LANDED_RC=$?
 set -e
 S20_ACK_LANDED_SETTLEMENT="$S20_ACK_LANDED_STATE/external-merge-settlements/.external-merge-WATCHER-STORY-1.json"
+if [[ ! -f "$S20_ACK_LANDED_SETTLEMENT" ]]; then
+  printf 'S20-ACK-LANDED missing settlement: rc=%s output=%s\n' "$S20_ACK_LANDED_RC" "$S20_ACK_LANDED_OUTPUT" >&2
+fi
 S20_ACK_LANDED_COMMIT=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1])).commit_sha)' \
   "$S20_ACK_LANDED_SETTLEMENT")
 S20_ACK_LANDED_REMOTE=$("$S20_REAL_GIT" --git-dir="$S20_VALID_REMOTE" rev-parse refs/heads/staging)
@@ -1768,6 +1771,12 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════════════
+if ADMISSION_WATCHER_E2E=1 ADMISSION_TEST_BASH="$BASH" node --test \
+    --test-name-pattern='watcher real producer' "$SCRIPT_DIR/local-admission-applicability.test.mjs"; then
+  pass "real shell ordinary/composite receipts traverse current and immutable legacy watchers"
+else
+  fail "real shell producer-to-watcher compatibility or exact integration"
+fi
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  RESULTS: $PASS_COUNT passed, $FAIL_COUNT failed, $SKIP_COUNT skipped"
