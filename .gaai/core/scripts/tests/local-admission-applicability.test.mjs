@@ -817,20 +817,23 @@ test('caller loss during refreshed execution kills the executor and its command 
   const gate = fx.launch();
   t.after(() => { try { gate.kill('SIGKILL'); } catch {} });
   const pidPath = join(fx.root, 'refresh-pids.json');
-  const waitUntil = async predicate => {
-    const deadline = Date.now() + 5000;
+  // Liveness bounds, not timing assertions: reaching the refreshed command runs a
+  // whole gate (fetch, resolve, execute, re-resolve), which takes several seconds
+  // on a loaded host; teardown waits out the executor's once-a-second parent check.
+  const waitUntil = async (predicate, ms) => {
+    const deadline = Date.now() + ms;
     while (Date.now() < deadline) {
       if (predicate()) return true;
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     return false;
   };
-  assert.equal(await waitUntil(() => existsSync(pidPath)), true, 'refreshed command did not start');
+  assert.equal(await waitUntil(() => existsSync(pidPath), 120000), true, 'refreshed command did not start');
   const pids = JSON.parse(readFileSync(pidPath, 'utf8'));
   assert.equal(pids.executor > 0 && pids.command > 0 && pids.child > 0, true);
   gate.kill('SIGKILL');
   const gone = pid => { try { process.kill(pid, 0); return false; } catch { return true; } };
-  assert.equal(await waitUntil(() => gone(pids.executor) && gone(pids.command) && gone(pids.child)), true,
+  assert.equal(await waitUntil(() => gone(pids.executor) && gone(pids.command) && gone(pids.child), 15000), true,
     `refreshed execution survived caller loss: ${JSON.stringify(pids)}`);
   assert.equal(existsSync(fx.receipt), false, 'caller loss produced a conventional receipt');
   const marker = readdirSync(fx.receipts).find(name => name.endsWith('.inflight.json'));
