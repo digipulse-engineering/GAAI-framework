@@ -64,6 +64,10 @@ BACKLOG = '.gaai/project/contexts/backlog/active.backlog.yaml'
 POLICY = '.gaai/project/ci/local-admission.json'
 SCHEDULER = '.gaai/core/scripts/backlog-scheduler.sh'
 CANON = '.gaai/core/scripts/lib/local-admission-executor.mjs'
+APPLICABILITY = '.gaai/core/scripts/lib/local-admission-applicability.mjs'
+RESOLVER = '.gaai/core/scripts/lib/local-admission-resolver.mjs'
+TEST_GATE = '.gaai/core/scripts/lib/test-gate.sh'
+ADMISSION_HELPERS = (CANON,APPLICABILITY,RESOLVER,TEST_GATE)
 DAEMON = '.gaai/core/scripts/delivery-daemon.sh'
 YAML_BOUNDARY = '.gaai/core/scripts/lib/yaml-runtime.sh'
 VENDOR_DIR = '.gaai/core/vendor/pyyaml/6.0.3'
@@ -79,6 +83,8 @@ MAX_SAFE_INTEGER = (1 << 53) - 1
 RECEIPT_KEYS = {'schema_version','boundary','story_id','candidate','binding_digest',
   'selected_surface_ids','selected_command_ids','results','outcome','publication_admitted',
   'created_at','receipt_digest'}
+COMPOSITE_KEYS = RECEIPT_KEYS | {'invocation_id','resolution_inputs','original_execution',
+  'refreshed_execution','applicability','provenance'}
 BINDING_KEYS = {'project_id','repository_digest','base_ref','base_sha','head_sha',
   'normalized_diff_digest','dependency_digest','risk_digest','policy_version','policy_digest',
   'selector_digest','environment_digest','command_digests'}
@@ -322,12 +328,13 @@ def prove_checkout(repo,endpoint,expected=None):
   declared=[rel for rel in RUNTIME_TUPLE if git(repo,'ls-tree','--name-only',remote,'--',rel)]
   if declared and len(declared)!=len(RUNTIME_TUPLE): halt(4,'authority_unavailable')
   if declared: normalize_vendor_modes(repo)
-  for rel in (DAEMON,SCHEDULER,CANON)+(RUNTIME_TUPLE if declared else ()):
+  for rel in (DAEMON,SCHEDULER)+ADMISSION_HELPERS+(RUNTIME_TUPLE if declared else ()):
     path=repo/rel
     try: fs=os.lstat(path)
     except OSError: halt(4,'authority_unavailable')
     row=git(repo,'ls-tree',remote,'--',rel).split()
-    if not stat.S_ISREG(fs.st_mode) or stat.S_ISLNK(fs.st_mode) or len(row)<3 or row[1]!='blob' or row[0] not in ('100644','100755'):
+    if not stat.S_ISREG(fs.st_mode) or stat.S_ISLNK(fs.st_mode) or fs.st_uid!=os.geteuid() or fs.st_mode&0o022 \
+        or len(row)<3 or row[1]!='blob' or row[0] not in ('100644','100755'):
       halt(4,'authority_unavailable')
     if bool(fs.st_mode&0o111)!=(row[0]=='100755') or git(repo,'hash-object','--no-filters','--',str(path))!=row[2]:
       halt(4,'authority_unavailable')
@@ -353,12 +360,15 @@ def immutable_helpers(repo,revision,state_root):
   os.chmod(directory,0o700)
   result={}
   layout=((SCHEDULER,'core/scripts/backlog-scheduler.sh',0o700),
-          (CANON,'canonicalizer.mjs',0o600),
+          *((rel,rel.removeprefix('.gaai/'),0o600) for rel in ADMISSION_HELPERS),
           (YAML_BOUNDARY,'core/scripts/lib/yaml-runtime.sh',0o600),
           (VENDOR_ARCHIVE,'core/vendor/pyyaml/6.0.3/pyyaml-runtime.pyz',EXACT_VENDOR_MODE),
           (VENDOR_MANIFEST,'core/vendor/pyyaml/6.0.3/PROVENANCE.json',EXACT_VENDOR_MODE),
           (VENDOR_LICENCE,'core/vendor/pyyaml/6.0.3/LICENSE',EXACT_VENDOR_MODE))
   for rel,name,mode in layout:
+    row=git(repo,'ls-tree',revision,'--',rel).split()
+    if len(row)<3 or row[1]!='blob' or row[0] not in ('100644','100755'):
+      halt(4,'authority_unavailable')
     data=target_blob(repo,revision,rel); path=directory/name
     if path.parent!=directory:
       path.parent.mkdir(parents=True,exist_ok=True)
@@ -415,15 +425,31 @@ def node_canonical(helper,raw):
   try: return out.rsplit('\n',1)
   except ValueError: halt(3,'proof_invalid')
 
-def validate_receipt(repo,raw,remote_url,canon_helper):
-  try: receipt=json.loads(raw.decode())
+def unique_json_pairs(pairs):
+  result={}
+  for key,value in pairs:
+    if key in result: raise ValueError('duplicate key')
+    result[key]=value
+  return result
+
+def verify_composite(repo,raw,helpers,repository,max_bytes,merge_sha=''):
+  code="""import fs from'node:fs';import{pathToFileURL}from'node:url';const m=await import(pathToFileURL(process.argv[2]).href);const [repo,project_id,remote,base_ref,max,merge]=process.argv.slice(3);const r=m.verifyCompositeReceipt({repo,raw:fs.readFileSync(0),repository:{project_id,remote,base_ref},baseRef:base_ref,maxBytes:Number(max),...(merge?{mergeSha:merge}:{})});if(r.status!=='verified')process.exit(3);"""
+  command(['node','--input-type=module','-e',code,'watch-once',str(helpers[APPLICABILITY]),str(repo),
+    repository['project_id'],repository['remote'],repository['base_ref'],str(max_bytes),merge_sha],
+    input_bytes=raw,timeout=api_timeout,rc=3)
+
+def validate_receipt(repo,raw,remote_url,helpers):
+  try: receipt=json.loads(raw.decode(),object_pairs_hook=unique_json_pairs)
   except Exception: halt(3,'proof_invalid')
-  if not isinstance(receipt,dict) or set(receipt)!=RECEIPT_KEYS: halt(3,'proof_invalid')
-  body,claimed=node_canonical(canon_helper,raw)
+  if not isinstance(receipt,dict): halt(3,'proof_invalid')
+  version=receipt.get('schema_version')
+  if version not in ('1.0.0','2.0.0') or set(receipt)!=(COMPOSITE_KEYS if version=='2.0.0' else RECEIPT_KEYS):
+    halt(3,'proof_invalid')
+  body,claimed=node_canonical(helpers[CANON],raw)
   if not HEX64.fullmatch(claimed or '') or digest(body)!=claimed or receipt['receipt_digest']!=claimed \
       or raw!=(canonical(receipt)+'\n').encode(): halt(3,'proof_invalid')
   candidate=receipt.get('candidate')
-  if not isinstance(candidate,dict) or set(candidate)!=BINDING_KEYS or receipt['schema_version']!='1.0.0' \
+  if not isinstance(candidate,dict) or set(candidate)!=BINDING_KEYS \
       or receipt['boundary']!='final' or receipt['story_id']!=sid or receipt['outcome']!='pass' \
       or receipt['publication_admitted'] is not True or receipt['binding_digest']!=digest(canonical(candidate)):
     halt(3,'proof_invalid')
@@ -444,7 +470,7 @@ def validate_receipt(repo,raw,remote_url,canon_helper):
       or selected!=[c['id'] for c in commands] or selected!=[r.get('command_id') for r in results]: halt(3,'proof_invalid')
   for index,result in enumerate(results):
     command_entry=commands[index]
-    if set(result or {})!=RESULT_KEYS or result.get('outcome')!='passed' \
+    if set(result or {})!=(RESULT_KEYS|{'execution'} if version=='2.0.0' else RESULT_KEYS) or result.get('outcome')!='passed' \
         or result.get('command_id')!=command_entry['id'] \
         or result.get('descriptor_digest')!=command_entry['descriptor_digest'] \
         or result.get('configuration_digest')!=command_entry['configuration_digest'] \
@@ -462,7 +488,11 @@ def validate_receipt(repo,raw,remote_url,canon_helper):
       or digest(canonical(base_policy))!=candidate['policy_digest']:
     halt(3,'proof_invalid')
   ensure_commit(repo,base); ensure_commit(repo,head)
-  git(repo,'merge-base','--is-ancestor',base,head,rc=3)
+  if version=='1.0.0':
+    git(repo,'merge-base','--is-ancestor',base,head,rc=3)
+  else:
+    if receipt['resolution_inputs'].get('policy_path')!=POLICY: halt(3,'proof_invalid')
+    verify_composite(repo,raw,helpers,configured,base_policy['limits']['max_receipt_bytes'])
   return receipt,candidate,claimed,created,base_policy
 
 def story_block(raw):
@@ -493,7 +523,7 @@ def github(repo_id,pr_url):
   except Exception: halt(3,'proof_invalid')
   return value
 
-def validate_github(repo,value,repo_id,pr_url,candidate,started,receipt_created):
+def validate_github(repo,value,repo_id,pr_url,candidate,started,receipt_created,receipt,raw,helpers,base_policy):
   if value.get('state') in ('OPEN','CLOSED') and not value.get('mergedAt'): halt(2,'not_merged')
   url=re.fullmatch(r'https://github\.com/([^/]+/[^/]+)/pull/([1-9][0-9]*)',pr_url)
   merge=value.get('mergeCommit') or {}; head_repo=value.get('headRepository') or {}
@@ -505,8 +535,13 @@ def validate_github(repo,value,repo_id,pr_url,candidate,started,receipt_created)
   created=parse_time(value.get('createdAt')); merged=parse_time(value.get('mergedAt'))
   if not (started<=receipt_created<=merged and created<=merged): halt(3,'proof_invalid')
   merge_sha=merge['oid']; parents=git(repo,'show','-s','--format=%P',merge_sha,rc=3).split()
-  if parents!=[candidate['base_sha']] or git(repo,'rev-parse',f'{merge_sha}^{{tree}}',rc=3)!=git(repo,'rev-parse',f"{candidate['head_sha']}^{{tree}}",rc=3):
+  if parents!=[candidate['base_sha']]:
     halt(3,'proof_invalid')
+  if receipt['schema_version']=='1.0.0':
+    if git(repo,'rev-parse',f'{merge_sha}^{{tree}}',rc=3)!=git(repo,'rev-parse',f"{candidate['head_sha']}^{{tree}}",rc=3):
+      halt(3,'proof_invalid')
+  else:
+    verify_composite(repo,raw,helpers,base_policy['repository'],base_policy['limits']['max_receipt_bytes'],merge_sha)
   return merge_sha,canonical({k:value.get(k) for k in ('url','number','state','createdAt','mergedAt','baseRefName','headRefOid','headRepository','isCrossRepository','mergeCommit')})
 
 def decode_b64(value):
@@ -716,19 +751,19 @@ try:
     helper_dir,helpers=immutable_helpers(repo,current,state_root)
     receipt_path=state_root/'local-admission-receipts'/f'.local-admission-{sid}-final.json'
     receipt_raw,receipt_identity=read_bound(receipt_path,max_bytes)
-    receipt,candidate,receipt_digest,receipt_created,base_policy=validate_receipt(repo,receipt_raw,remote_url,helpers[CANON])
+    receipt,candidate,receipt_digest,receipt_created,base_policy=validate_receipt(repo,receipt_raw,remote_url,helpers)
     backlog=target_blob(repo,current,BACKLOG); state=backlog_state(backlog)
     pending=(state['status'],state['phase_status'],state['pr_status'])==('in_progress','qa_passed','pending_review')
     terminal=(state['status'],state['phase_status'],state['pr_status'])==('done','done','merged')
     if not pending and not terminal: halt(3,'proof_invalid','status,phase_status,pr_status')
     started=parse_time(state['started_at']); repo_id=base_policy['repository']['project_id']; pr_url=state['pr_url']
-    gh1=github(repo_id,pr_url); merge_sha,gh_tuple=validate_github(repo,gh1,repo_id,pr_url,candidate,started,receipt_created)
+    gh1=github(repo_id,pr_url); merge_sha,gh_tuple=validate_github(repo,gh1,repo_id,pr_url,candidate,started,receipt_created,receipt,receipt_raw,helpers,base_policy)
     git(repo,'merge-base','--is-ancestor',merge_sha,current,rc=3)
     # Effect-edge revalidation binds the retained descriptor read, target-held
     # helpers, backlog bytes and GitHub tuple immediately before settlement.
     if bind_origin(repo)!=(bound_remote_url,bound_endpoint): halt(3,'proof_invalid')
     edge=prove_checkout(repo,bound_endpoint,current); revalidate_name(receipt_path,receipt_identity)
-    gh2=github(repo_id,pr_url); merge2,tuple2=validate_github(repo,gh2,repo_id,pr_url,candidate,started,receipt_created)
+    gh2=github(repo_id,pr_url); merge2,tuple2=validate_github(repo,gh2,repo_id,pr_url,candidate,started,receipt_created,receipt,receipt_raw,helpers,base_policy)
     if bind_origin(repo)!=(bound_remote_url,bound_endpoint): halt(3,'proof_invalid')
     final_edge=prove_checkout(repo,bound_endpoint,current); edge_backlog=target_blob(repo,final_edge,BACKLOG)
     revalidate_name(receipt_path,receipt_identity)
