@@ -138,6 +138,7 @@ QA_PROMPT="$TMPDIR_TEST/qa-prompt.md"
 FIX_QA_SCHEMA_PATH="$REPO_ROOT/.gaai/core/schemas/qa-verdict.v1.schema.json"
 FIX_QA_VERDICT_PATH="/tmp/gaai-fixture-worktree/.gaai/project/contexts/artefacts/qa-reports/T-CTXFIX.qa-verdict.json"
 FIX_QA_EXPECTED_SURFACES_PATH="/tmp/gaai-fixture-worktree/expected-surfaces.json"
+FIX_QA_ADMISSION_EVIDENCE_PATH="/tmp/gaai-fixture-locks/.qa-admission-evidence-T-CTXFIX.json"
 _expand_daemon_prompt_template "$QA_TEMPLATE" "$QA_PROMPT" \
   "GAAI_STORY_PATH=$FIX_STORY_PATH" "GAAI_PLAN_PATH=$FIX_PLAN_PATH" \
   "GAAI_IMPL_REPORT_PATH=/tmp/gaai-fixture-worktree/.gaai/project/contexts/artefacts/impl-reports/T-CTXFIX.impl-report.md" \
@@ -145,6 +146,7 @@ _expand_daemon_prompt_template "$QA_TEMPLATE" "$QA_PROMPT" \
   "GAAI_QA_SCHEMA_PATH=$FIX_QA_SCHEMA_PATH" \
   "GAAI_QA_VERDICT_PATH=$FIX_QA_VERDICT_PATH" \
   "GAAI_QA_EXPECTED_SURFACES_PATH=$FIX_QA_EXPECTED_SURFACES_PATH" \
+  "GAAI_QA_ADMISSION_EVIDENCE_PATH=$FIX_QA_ADMISSION_EVIDENCE_PATH" \
   "GAAI_EPIC_PATH=$FIX_EPIC_PATH" \
   "GAAI_BASE_REF=origin/staging" \
   "GAAI_WORKTREE_PATH=$FIX_WORKTREE" \
@@ -164,6 +166,11 @@ if grep -qF "$FIX_QA_SCHEMA_PATH" "$QA_PROMPT" && grep -qF "$FIX_QA_VERDICT_PATH
   pass "T4c: QA prompt carries resolved GAAI_QA_SCHEMA_PATH/GAAI_QA_VERDICT_PATH/GAAI_QA_EXPECTED_SURFACES_PATH values (DEC-200)"
 else
   fail "T4c: QA prompt missing one or more resolved DEC-200 two-axis handoff path values"
+fi
+if grep -qF "$FIX_QA_ADMISSION_EVIDENCE_PATH" "$QA_PROMPT"; then
+  pass "T4d: QA prompt carries resolved GAAI_QA_ADMISSION_EVIDENCE_PATH value"
+else
+  fail "T4d: QA prompt missing resolved GAAI_QA_ADMISSION_EVIDENCE_PATH value"
 fi
 
 # executor-invariance: same QA prompt file, both executors, byte-identical stdin (DEC-200 D6 / DEC-190 D3)
