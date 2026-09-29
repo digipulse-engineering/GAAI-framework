@@ -859,6 +859,18 @@ for (const scenario of ['last_race', 'dirty_refresh', 'refresh_failure', 'final_
   } else assert.match(result.stdout, /blocked:command_failed/);
 });
 
+test('shell pre_qa keeps its composite receipt when the base advances again after sealing', async t => {
+  const fx = await shellFixture(t, 'pre_qa', 'last_race');
+  const result = fx.run();
+  assert.match(result.stdout, /GATE=0\|pass\|/, result.stderr);
+  assert.match(result.stdout, new RegExp(`base_advanced=[0-9a-f]{40} pinned_base=${fx.newBase} candidate=unchanged`));
+  const receipt = JSON.parse(readFileSync(fx.receipt, 'utf8'));
+  assert.equal(receipt.outcome, 'pass');
+  assert.equal(receipt.publication_admitted, false);
+  assert.equal(receipt.candidate.base_sha, fx.newBase);
+  assert.equal(receipt.original_execution.binding.base_sha, fx.oldBase);
+});
+
 test('retention write failure removes current PASS and reports no retained evidence', async t => {
   const fx = await shellFixture(t, 'final', 'persistence_failure');
   const result = fx.run();

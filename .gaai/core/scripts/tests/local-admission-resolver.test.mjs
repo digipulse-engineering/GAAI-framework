@@ -243,6 +243,25 @@ test('stale identity, dirty candidates and missing configuration never resolve',
   assert.equal(resolve(wrongRemote).reason, 'repository_mismatch');
 });
 
+test('a pinned base resolves only as an ancestor of the advanced remote base, with the original binding', async t => {
+  const fx = await fixture(t);
+  const pinned = () => resolveLocalAdmission({ ...fx, baseRef: 'staging', policyPath: POLICY_PATH,
+    environment: ENVIRONMENT, pinnedBase: true });
+  const original = resolve(fx);
+  assert.equal(original.status, 'resolved');
+  const advanced = git(fx.repo, 'commit-tree', `${fx.baseSha}^{tree}`, '-p', fx.baseSha, '-m', 'advance');
+  git(fx.repo, 'update-ref', 'refs/remotes/origin/staging', advanced);
+  assert.equal(resolve(fx).reason, 'candidate_stale');
+  assert.equal(pinned().status, 'resolved');
+  assert.equal(pinned().binding_digest, original.binding_digest);
+  const rewritten = git(fx.repo, 'commit-tree', `${fx.baseSha}^{tree}`, '-m', 'rewritten history');
+  git(fx.repo, 'update-ref', 'refs/remotes/origin/staging', rewritten);
+  assert.equal(pinned().reason, 'candidate_stale');
+  git(fx.repo, 'update-ref', 'refs/remotes/origin/staging', advanced);
+  await put(fx.repo, 'src/untracked.mjs', 'export {};\n');
+  assert.equal(pinned().reason, 'candidate_unsealed');
+});
+
 test('symlink and gitlink-like configuration modes fail closed before content binding', async t => {
   const external = join(tmpdir(), `gaai-external-${process.pid}-${Date.now()}.json`);
   t.after(() => rm(external, { force: true }));
@@ -282,7 +301,8 @@ test('CLI writes the internal plan privately and emits only its bounded summary'
   assert.doesNotMatch(run.stdout, /argv|tests\/unit/);
   assert.equal(JSON.parse(await readFile(output, 'utf8')).status, 'resolved');
   assert.equal((await stat(output)).mode & 0o077, 0);
-  for (const invalid of [args.slice(0, -2), args.with(3, '--repo'), args.with(1, '--unknown')]) {
+  for (const invalid of [args.slice(0, -2), args.with(3, '--repo'), args.with(1, '--unknown'),
+    [...args, '--pinned-base', 'yes']]) {
     const rejected = spawnSync(process.execPath, invalid, { encoding: 'utf8' });
     assert.equal(rejected.status, 2);
     assert.match(rejected.stderr, /input_invalid/);
