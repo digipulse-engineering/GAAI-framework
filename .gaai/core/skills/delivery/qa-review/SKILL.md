@@ -17,6 +17,7 @@ inputs:
   - codebase  (working tree)
   - contexts/rules/**
   - contexts/memory/**  (optional — past bugs, regressions, risks)
+  - pre-QA admission evidence  (optional — the daemon's verified account of the deterministic local admission on this candidate)
 outputs:
   - qa_report  (PASS | FAIL)
 ---
@@ -65,9 +66,30 @@ Activate after implementation is complete. This is a **hard quality gate**.
 - Any broken rule → FAIL
 
 ### 4. Regression Scan
+
+**Scope first — consume the pre-QA admission instead of repeating it.** When the delivery runtime
+hands you a verified account of the deterministic local admission that passed on this exact
+candidate (in the daemon: `$GAAI_QA_ADMISSION_EVIDENCE_PATH`) and it reports `consumable: true`,
+the commands it lists are proven regression evidence for this candidate. Cite them; do not re-run
+them, do not run any other command the admission policy declares (its selector policy is the
+regression authority for what the diff affects), and do not run a broader sweep. Limit your own
+execution to the Story's own suites — the test files the diff adds or changes and those the Story
+or PLAN names as its verification. When a command you would run is identical to a policy command:
+a selected, passed one is cited and never re-run, whoever names it; an unselected one is not run as
+a whole — run the Story's own test files within it by a targeted invocation, and record a finding
+if you judge the whole lane necessary; a Step 5 command not already proven always runs. The
+account's `declared_commands` is the policy's full command set; an entry not among the proven
+`commands` is an unselected one. When the account is absent, unreadable or `consumable: false`,
+perform the full scan below and state why. The admission never decides a verdict on its own; Steps 1-3 and 5-8 apply
+unchanged.
 - **Broken tests → FAIL — but only a *new* breakage is a regression.** A regression is a test that fails on this change yet passed on the pre-change baseline. Before failing on a red test, establish whether it is pre-existing: re-run it on the base branch / the story's fork-point, or consult known-failing context. A test already red on the baseline and unrelated to this story's changed surface is **not** a regression — record it as pre-existing and do **not** FAIL/ESCALATE on it. A failure this story caused, or in a test that exercises the surface this story changed, **is** a regression → FAIL. Do not weaken this by labelling a genuinely new failure "pre-existing" — verify, don't assume.
 - Behavior drift → FAIL
 - Known risk patterns from memory → FAIL
+- **Long-running commands:** start them with output redirected to a file and wait with one
+  blocking wait per call sized just under the executor's per-call time ceiling (about nine minutes
+  where that ceiling is ten); if the executor cuts a wait short, size the next one to fit. Never
+  poll with repeated short sleeps — each costs a turn and can exhaust the phase's budget before a
+  verdict is written.
 - **Large command output:** redirect test-runner output to a file (e.g. `/tmp/test-output.txt`)
   and inspect via `grep`/`tail`/`rg`. **NEVER use the Read tool on a file expected to exceed
   ~256KB** — it has a hard 256KB ceiling that burns a turn and returns no content. On an
@@ -77,6 +99,9 @@ Activate after implementation is complete. This is a **hard quality gate**.
 ### 5. Build / Type / Lint Integrity
 
 Test runners that transpile (vitest, jest, ts-jest, swc, esbuild, babel) execute code WITHOUT type checking — a green test suite does not prove the code compiles. Static-type or linter errors in test files, fixtures, and adjacent modules will pass tests locally and only surface at deploy time.
+
+Pre-QA admission evidence does not replace this step. Only a command identical to a selected,
+passed admission command counts as already run; every other static-analysis command below runs.
 
 Identify and run the project's full static-analysis gate for every workspace package whose files were modified (directly or via type/dep propagation):
 - TypeScript: `tsc --noEmit` (or `pnpm typecheck` / equivalent script)

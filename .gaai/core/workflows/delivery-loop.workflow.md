@@ -193,6 +193,7 @@ Env vars set by `handle_qa_phase()` in `daemon-dispatch.sh`:
 | `$GAAI_QA_SCHEMA_PATH` | Path to `.gaai/core/schemas/qa-verdict.v1.schema.json` (DEC-200) |
 | `$GAAI_QA_VERDICT_PATH` | Output path for the JSON sidecar `{id}.qa-verdict.json` (DEC-200) |
 | `$GAAI_QA_EXPECTED_SURFACES_PATH` | Path to a daemon-materialized JSON array — the exact surface set the JSON sidecar's `changed_surface_inventory` must equal one-to-one (DEC-200) |
+| `$GAAI_QA_ADMISSION_EVIDENCE_PATH` | Path to the daemon's verified account of the pre-QA local admission on this exact candidate (`consumable`, `reason`, proven commands) — outside the worktree, evidence only, never authority |
 | `$GAAI_EPIC_PATH` | Path to `{epic}.epic.md` |
 | `$GAAI_BASE_REF` | Git ref for diff comparison |
 | `$GAAI_DELIVERY_LOG_FILE` | Per-story log path |

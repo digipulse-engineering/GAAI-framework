@@ -5287,6 +5287,44 @@ _qa_verdict_resolve() {
   return 0
 }
 
+# ── Pre-QA admission evidence for the QA agent ────────────────────────────
+# Runs the read-only verifier once, after the pre-QA gate passed and before
+# QA writes anything into the worktree, and leaves its account in
+# GAAI_QA_ADMISSION_EVIDENCE (a JSON file in the marker dir, outside the
+# worktree). The account tells QA whether the gate's receipt is usable as
+# regression evidence for the exact candidate; it authorizes nothing. A
+# verifier that cannot run degrades to "not consumable", which is today's
+# full regression scan — it never blocks or delays the spawn.
+# Args: story_id worktree_path base_ref
+GAAI_QA_ADMISSION_EVIDENCE=""
+_qa_admission_evidence() {
+  local story_id="$1" worktree_path="$2" base_ref="$3"
+  local lib_dir evidence summary="" rc=0
+  # A fresh path per invocation: a run that cannot write leaves QA a missing
+  # file (full scan), never an earlier cycle's account. Older ones are pruned.
+  rm -f "$(_marker_dir)/.qa-admission-evidence-${story_id}".* 2>/dev/null || true
+  evidence="$(_marker_dir)/.qa-admission-evidence-${story_id}.$(date +%s).$$.${RANDOM}.json"
+  GAAI_QA_ADMISSION_EVIDENCE="$evidence"
+  mkdir -p "$(_marker_dir)" 2>/dev/null || true
+  lib_dir=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+  summary=$(node "${lib_dir}/lib/qa-admission-evidence.mjs" \
+      --receipt "${GAAI_ADMISSION_RECEIPT:-}" --story-id "$story_id" --repo "$worktree_path" \
+      --admitted-head "${GAAI_ADMITTED_SHA:-}" --admitted-base "${GAAI_ADMITTED_BASE_SHA:-}" \
+      --qa-base-ref "$base_ref" \
+      --policy "${GAAI_LOCAL_ADMISSION_POLICY_PATH:-.gaai/project/ci/local-admission.json}" \
+      --output "$evidence" 2>/dev/null) || rc=$?
+  if (( rc != 0 )) || [[ "$summary" != consumable=* || ! -s "$evidence" ]]; then
+    ( umask 077
+      printf '{"schema_version":1,"story_id":"%s","consumable":false,"reason":"verifier_failed","receipt_path":null,"evaluated_at":"%s"}\n' \
+        "$story_id" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "${evidence}.tmp.$$" \
+        && mv -f "${evidence}.tmp.$$" "$evidence"
+    ) 2>/dev/null || rm -f "${evidence}.tmp.$$" 2>/dev/null || true
+    summary="consumable=false reason=verifier_failed receipt=none digest=none head=none selected=none"
+  fi
+  echo "[QA-ADMISSION] story=${story_id} ${summary} evidence=${evidence}"
+  return 0
+}
+
 handle_qa_phase() {
   local story_id="$1" trace_id="$2"
   local ts t_start_ms t_end_ms duration_ms
@@ -5389,6 +5427,7 @@ handle_qa_phase() {
   if ! _prepare_pre_qa_admission "$story_id" "$trace_id" "$worktree_path"; then
     return 0
   fi
+  _qa_admission_evidence "$story_id" "$worktree_path" "$base_ref"
 
   # ── Ensure output directories exist ──────────────────────────────────────
   mkdir -p "$(dirname "$qa_report_path")"
@@ -5426,6 +5465,7 @@ handle_qa_phase() {
     "GAAI_QA_SCHEMA_PATH=${qa_schema_path}" \
     "GAAI_QA_VERDICT_PATH=${qa_verdict_path}" \
     "GAAI_QA_EXPECTED_SURFACES_PATH=${expected_surfaces_path}" \
+    "GAAI_QA_ADMISSION_EVIDENCE_PATH=${GAAI_QA_ADMISSION_EVIDENCE}" \
     "GAAI_EPIC_PATH=${epic_path}" \
     "GAAI_BASE_REF=${base_ref}" \
     "GAAI_WORKTREE_PATH=${worktree_path}" \
@@ -5442,6 +5482,7 @@ handle_qa_phase() {
       "GAAI_QA_SCHEMA_PATH=${qa_schema_path}" \
       "GAAI_QA_VERDICT_PATH=${qa_verdict_path}" \
       "GAAI_QA_EXPECTED_SURFACES_PATH=${expected_surfaces_path}" \
+      "GAAI_QA_ADMISSION_EVIDENCE_PATH=${GAAI_QA_ADMISSION_EVIDENCE}" \
       "GAAI_EPIC_PATH=${epic_path}" \
       "GAAI_BASE_REF=${base_ref}" \
       "GAAI_WORKTREE_PATH=${worktree_path}" \
@@ -5579,6 +5620,7 @@ handle_qa_phase() {
   GAAI_QA_SCHEMA_PATH="$qa_schema_path" \
   GAAI_QA_VERDICT_PATH="$qa_verdict_path" \
   GAAI_QA_EXPECTED_SURFACES_PATH="$expected_surfaces_path" \
+  GAAI_QA_ADMISSION_EVIDENCE_PATH="$GAAI_QA_ADMISSION_EVIDENCE" \
   GAAI_EPIC_PATH="$epic_path" \
   GAAI_BASE_REF="$base_ref" \
   GAAI_DELIVERY_LOG_FILE="$log_path" \

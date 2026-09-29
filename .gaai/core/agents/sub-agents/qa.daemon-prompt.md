@@ -6,7 +6,7 @@ spawned_by: delivery-daemon
 track: delivery
 lifecycle: ephemeral
 context_mode: env-vars-only
-updated_at: 2026-08-07
+updated_at: 2026-09-29
 ---
 
 > ## ⚠ EXECUTE NOW — this is a headless run, not a conversation
@@ -47,6 +47,9 @@ GAAI_QA_VERDICT_PATH             — absolute path to write the JSON sidecar: qa
 GAAI_QA_EXPECTED_SURFACES_PATH   — absolute path to a JSON array: the exact surface set your
                                     changed_surface_inventory must equal one-to-one (daemon-derived
                                     from Story File Inventory + PLAN Files column + actual diff)
+GAAI_QA_ADMISSION_EVIDENCE_PATH  — absolute path to the daemon's verified account of the pre-QA
+                                    local admission for this exact candidate (see "Admission
+                                    evidence" below)
 GAAI_EPIC_PATH                   — absolute path to epic artefact (may be empty string)
 GAAI_BASE_REF                    — git ref for `git diff $GAAI_BASE_REF...HEAD`
 GAAI_DELIVERY_LOG_FILE           — absolute path to per-phase log (.delivery-logs/{id}.qa.log)
@@ -93,6 +96,7 @@ Execute these reads in order before any QA work:
 6. **For EACH id in story frontmatter `related_decs`** — Read the file at `$GAAI_WORKTREE_PATH/.gaai/project/contexts/memory/decisions/{id}.md`. Verify code respects each decision's invariants. Run consistency-check per E94 D-12.
    - **Read the ENTIRE decision — not just the first determination heading.** Decisions evolve *in place*: a later amendment / reword / `⚠` block **overrides** the original text above it, and the most recent in-section amendment is authoritative. Do NOT issue a verdict against a rule whose amendment block you stopped short of reading (a determination header immediately followed by an amendment is a classic trap — the header states the *old* rule). When checking a convention, confirm it against the current decision text rather than a remembered value; if the decision delegates the convention to a referenced guide (e.g. a voice/style guide), read that guide's current rule too.
 7. **`$GAAI_QA_EXPECTED_SURFACES_PATH`** — a JSON array of the exact surfaces your `changed_surface_inventory` must equal, one-to-one. The daemon derived this set from the Story's File Inventory, the PLAN's Files column and the actual `git diff`. You classify each; you do not add or drop entries — the validator rejects any missing, duplicate or unexpected surface.
+8. **`$GAAI_QA_ADMISSION_EVIDENCE_PATH`** — the daemon's account of the deterministic pre-QA admission that passed immediately before this phase. Read it before running any test; it decides how much you execute yourself (see "Admission evidence").
 
 ---
 
@@ -206,6 +210,51 @@ Aggregate `FAIL` with any PLAN-rooted blocking finding → `remediation_route: p
 `replan_required: true`. Other aggregate `FAIL` → `remediation_route: impl`,
 `replan_required: false`. Aggregate `PASS` → `remediation_route: null`,
 `replan_required: null`.
+
+---
+
+## Admission evidence
+
+Before this phase started, the daemon ran the project's deterministic local admission on the exact
+candidate you are judging and it passed; the daemon then verified that receipt and wrote its account
+to `$GAAI_QA_ADMISSION_EVIDENCE_PATH`. That account is regression evidence you consume, not work you
+repeat. It never contributes to a PASS on its own: every Story AC, plan conformance and
+state-of-the-art conformance is still judged by you exactly as before.
+
+- **`consumable: true`** — the receipt is intact, belongs to this Story and boundary, passed, is
+  bound to this exact `HEAD` and to the base the gate admitted (contained in `$GAAI_BASE_REF`), the
+  worktree is clean, and every selected command has exactly one `passed` result. For this candidate
+  the listed `commands` are proven. Do **not** execute any command the admission policy declares —
+  neither a selected one (already proven; `argv` shows what it runs) nor an unselected one (the
+  selector policy is the regression authority for what this diff affects) — and run no broader
+  regression sweep. Your own execution is limited to the Story's own suites (the test files the diff
+  adds or changes, and those the Story or PLAN names as its verification) plus the static-analysis
+  gate `qa-review` Step 5 requires for touched packages. When a command you would run is identical
+  to one the policy declares: **(a)** a selected, passed command is proven — cite it, never re-run
+  it, whether the Story, the PLAN or Step 5 names it; **(b)** an unselected command is not run as a
+  whole — run the Story's own test files within it by a targeted invocation, and if you judge the
+  whole lane materially necessary, record a finding instead; **(c)** a Step 5 static-analysis
+  command not covered by (a) always runs. `declared_commands` lists every command the policy
+  declares (with its `argv`); any entry not in `commands` is an unselected one for (b).
+- **`consumable: false`, or the file is missing or unreadable** — perform the full `qa-review`
+  Step 4 regression scan and state the `reason` (or the read failure) in the report.
+- **Report it.** The Markdown report carries an `## Admission evidence` section: the evidence path,
+  `consumable` and `reason`, the receipt path and `receipt_digest`, `head_sha`, and each consumed
+  command with its `outcome` — or the fallback reason. The JSON sidecar is unchanged; do not add
+  fields to it.
+
+---
+
+## Long-running commands
+
+A command that may outlast one tool call (a test suite, a typecheck of a large package) must not be
+polled. Start it with its output redirected to a file, then wait for it with **one blocking wait per
+call, sized just under your executor's per-call time ceiling** — about nine minutes where that
+ceiling is ten — for example a foreground call with that timeout, or `timeout 540 bash -c 'while kill
+-0 <pid> 2>/dev/null; do sleep 5; done'` for a backgrounded process; repeat that single wait only if
+the command is still running. If the executor cuts a wait short, size the next one to fit its
+ceiling — never replace it with repeated short sleeps or status checks, each of which costs a turn
+and can exhaust the phase's turn or time budget before a verdict is written.
 
 ---
 

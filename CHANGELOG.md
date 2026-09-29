@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+-: QA consumes the verified pre-QA admission instead of re-running it
 -: stop the daemon staling its own PR and dirtying its worktree
 -: keep pre-QA evidence when only the base advanced
 - test: give the refreshed caller-loss case liveness bounds, not a 5s race
