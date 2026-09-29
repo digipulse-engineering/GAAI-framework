@@ -4,7 +4,9 @@
 #
 # A gate binds (base, head, policy, risk, environment) and then runs its selected
 # commands for tens of minutes. Advancing the base inside that window invalidates
-# the receipt and discards the delivery cycle, however well the commands did.
+# a final receipt and discards the delivery cycle, however well the commands did.
+# A pre-QA receipt survives a base-only advance that leaves the admission policy
+# unchanged; a policy change or any candidate change still discards it.
 # Nothing published that a binding was live, so whoever was about to merge could
 # not know what it would cost. This reads the advisory marker the gate writes for
 # exactly as long as it holds one.
@@ -19,7 +21,7 @@
 #
 # Exit status:
 #   0  no gate is bound — advancing the target is safe as far as admission goes
-#   2  at least one gate is bound; merging now will discard that cycle
+#   2  at least one gate is bound; merging now may discard that cycle (see above)
 #   1  the state directory could not be read
 #
 # The marker is advisory. It grants no authority, gates nothing, and its absence
@@ -86,7 +88,12 @@ PY
   fi
 
   found=1
-  [[ "$QUIET" -eq 1 ]] || echo "BOUND: ${story} ${boundary} on base ${base}${elapsed} — merging to the target now discards this cycle"
+  if [[ "$boundary" == pre_qa ]]; then
+    consequence="a base-only merge keeps this pre-QA evidence unless it changes the admission policy"
+  else
+    consequence="merging to the target now discards this cycle"
+  fi
+  [[ "$QUIET" -eq 1 ]] || echo "BOUND: ${story} ${boundary} on base ${base}${elapsed} — ${consequence}"
 done
 
 if [[ "$found" -eq 1 ]]; then

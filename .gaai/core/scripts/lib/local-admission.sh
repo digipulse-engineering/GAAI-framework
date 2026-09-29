@@ -114,12 +114,36 @@ _local_admission_note_stale() {
 
 _local_admission_resolve() {
   local resolver="$1" repo="$2" base_ref="$3" base_sha="$4" head_sha="$5"
-  local policy="$6" risk="$7" output="$8"
+  local policy="$6" risk="$7" output="$8" pinned_base="${9:-}"
   local args=(--repo "$repo" --base-ref "$base_ref" --base-sha "$base_sha"
     --head-sha "$head_sha" --policy "$policy" --output "$output")
   [[ -n "$risk" ]] && args+=(--risk-inputs "$risk")
+  [[ "$pinned_base" == true ]] && args+=(--pinned-base true)
   [[ -n "${invocation_id:-}" ]] && args+=(--invocation-id "$invocation_id" --story-id "$story" --boundary "$boundary")
   node "$resolver" "${args[@]}"
+}
+
+# A pre-QA PASS admits only semantic-QA spend on one exact candidate, so a base
+# that advanced while the checks ran does not make that evidence wrong about the
+# candidate. It is kept only when the admission policy file is byte-identical on
+# the pinned and the current base (a policy change could require other checks)
+# and re-resolving the current candidate against the pinned base reproduces the
+# original binding exactly: an unchanged HEAD, a Git-visible clean tree and the
+# same governed inputs. Anything else still fails. The final boundary always
+# re-binds the exact current base before publication.
+_local_admission_base_pinned() {
+  local resolver="$1" repo="$2" base_ref="$3" pinned_base="$4" policy="$5" risk="$6"
+  local output="$7" expected="$8" current_head summary binding
+  current_head=$(git -C "$repo" rev-parse HEAD 2>/dev/null) || return 1
+  local pinned_policy current_policy
+  pinned_policy=$(git -C "$repo" rev-parse --verify -q "${pinned_base}:${policy}" 2>/dev/null) || return 1
+  current_policy=$(git -C "$repo" rev-parse --verify -q "refs/remotes/origin/${base_ref}:${policy}" 2>/dev/null) || return 1
+  [[ -n "$pinned_policy" && "$pinned_policy" == "$current_policy" ]] || return 1
+  rm -f "$output" 2>/dev/null || return 1  # the resolver creates its output exclusively
+  summary=$(_local_admission_resolve "$resolver" "$repo" "$base_ref" "$pinned_base" "$current_head" \
+    "$policy" "$risk" "$output" true 2>/dev/null) || true
+  binding=$(node -e 'const s=JSON.parse(process.argv[1]||"{}");process.stdout.write(s.binding_digest||"")' "$summary" 2>/dev/null) || binding=""
+  [[ -n "$binding" && "$binding" == "$expected" ]]
 }
 
 # Preserve original successful executions inside an explicitly non-current
@@ -165,7 +189,7 @@ _local_admission_retain() {
 _run_local_admission() {
   local boundary="$1" story="$2" repo="$3" base_ref="$4" receipt_dir="$5"
   local lib_dir resolver executor policy risk limit result_limit result_bytes limits scratch plan fresh verify results target_receipt seal_plan seal_binding
-  local applicability invocation_id proof refresh_results reconciled=0 proof_reason tmp_receipt refresh_digest compose_rc seal_base
+  local applicability invocation_id proof refresh_results reconciled=0 proof_reason tmp_receipt refresh_digest compose_rc seal_base pinned
   local base_sha head_sha binding_digest results_digest fresh_base fresh_head fresh_summary fresh_binding verify_summary verify_binding reason outcome
   LOCAL_ADMISSION_OUTCOME="blocked:unknown"; LOCAL_ADMISSION_RECEIPT_PATH=""
   case "$boundary" in pre_qa|final) ;; *) LOCAL_ADMISSION_OUTCOME="blocked:boundary_invalid"; return 1 ;; esac
@@ -186,7 +210,7 @@ _run_local_admission() {
     || { LOCAL_ADMISSION_OUTCOME="blocked:temporary_storage_unavailable"; return 1; }
   chmod 700 "$scratch" 2>/dev/null || { LOCAL_ADMISSION_OUTCOME="blocked:temporary_storage_unavailable"; _local_admission_cleanup "$scratch"; return 1; }
   plan="$scratch/plan.json"; fresh="$scratch/fresh.json"; verify="$scratch/verify.json"; results="$scratch/results.json"
-  proof="$scratch/applicability.json"; refresh_results="$scratch/refresh-results.json"
+  proof="$scratch/applicability.json"; refresh_results="$scratch/refresh-results.json"; pinned="$scratch/pinned.json"
   invocation_id=$(node -e 'process.stdout.write(require("crypto").randomUUID())') \
     || { LOCAL_ADMISSION_OUTCOME="blocked:execution_identity_failed"; _local_admission_cleanup "$scratch"; return 1; }
   # Node canonicalizes symlinked entrypoint paths before exposing import.meta.url.
@@ -249,6 +273,13 @@ _run_local_admission() {
           if [[ "$result_bytes" -gt "$result_limit" ]]; then outcome="blocked:results_too_large"
           else outcome=$(node -e 'const r=require(process.argv[1]);const o=r.find(x=>x.outcome!=="passed")?.outcome;process.stdout.write(o?`blocked:command_${o}`:"pass")' "$refresh_results"); fi
         else outcome="blocked:execution_failed"; fi
+      elif [[ "$boundary" == pre_qa && -n "$fresh_base" && "$fresh_base" != "$base_sha" ]] \
+          && _local_admission_base_pinned "$resolver" "$repo" "$base_ref" "$base_sha" \
+               "$policy" "$risk" "$pinned" "$binding_digest"; then
+        seal_plan="$plan"; seal_binding="$binding_digest"; seal_base="$base_sha"
+        outcome=$(node -e 'const r=require(process.argv[1]);const o=r.find(x=>x.outcome!=="passed")?.outcome;process.stdout.write(o?`blocked:command_${o}`:"pass")' "$results")
+        printf '[LOCAL-ADMISSION] story=%s boundary=%s base_advanced=%s pinned_base=%s candidate=unchanged\n' \
+          "$story" "$boundary" "$fresh_base" "$base_sha"
       else
         _local_admission_note_stale "$receipt_dir" "$story" "$boundary" post_run \
           "$binding_digest" "$fresh_binding" "$fresh" \
@@ -296,7 +327,13 @@ _run_local_admission() {
       "$policy" "$risk" "$verify" 2>/dev/null || true)
     verify_binding=$(node -e 'const s=JSON.parse(process.argv[1]||"{}");process.stdout.write(s.binding_digest||"")' "$verify_summary" 2>/dev/null || true)
   fi
-  if [[ -z "${verify_binding:-}" || "$verify_binding" != "$seal_binding" ]]; then
+  if [[ -z "${verify_binding:-}" || "$verify_binding" != "$seal_binding" ]] \
+      && ! { [[ "$boundary" == pre_qa && "$reason" == currentness_changed \
+                && -n "${fresh_base:-}" && "$fresh_base" != "$seal_base" ]] \
+             && _local_admission_base_pinned "$resolver" "$repo" "$base_ref" "$seal_base" \
+                  "$policy" "$risk" "$pinned" "$seal_binding" \
+             && printf '[LOCAL-ADMISSION] story=%s boundary=%s base_advanced=%s pinned_base=%s candidate=unchanged\n' \
+                  "$story" "$boundary" "$fresh_base" "$seal_base"; }; then
     _local_admission_note_stale "$receipt_dir" "$story" "$boundary" post_seal \
       "$seal_binding" "${verify_binding:-}" "$verify" \
       "$seal_base" "$head_sha" "$fresh_base" "$fresh_head" || true

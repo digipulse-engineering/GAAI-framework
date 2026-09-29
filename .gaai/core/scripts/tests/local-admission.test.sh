@@ -214,6 +214,51 @@ if ! _run_local_admission final TST-BASE "$REPO" staging "$RECEIPTS" >/dev/null 
 else fail "base-currentness outcome=$LOCAL_ADMISSION_OUTCOME note=$(cut -c1-160 "$BASE_NOTE" 2>/dev/null)"; fi
 git -C "$REPO" push -q --force origin "$BASE_SHA:staging"
 git -C "$REPO" fetch -q origin staging
+
+# The same base advance at the pre-QA boundary: that PASS admits only semantic-QA
+# spend on this exact candidate, so it stands, bound to the base the checks ran on.
+PIN_NOTE="$RECEIPTS/.local-admission-TST-PIN-pre_qa.stale.json"
+# Run in this shell (not a command substitution) so the outcome and receipt
+# path it sets are the ones the assertions read.
+_run_local_admission pre_qa TST-PIN "$REPO" staging "$RECEIPTS" > "$ROOT/pin.out" 2>&1
+PIN_RC=$?; PIN_OUT="$(cat "$ROOT/pin.out")"
+if [[ "$PIN_RC" -eq 0 && "$LOCAL_ADMISSION_OUTCOME" == pass && ! -e "$PIN_NOTE" \
+    && "$(node -e 'const r=require(process.argv[1]);process.stdout.write(`${r.candidate.base_sha}|${r.candidate.head_sha}|${r.publication_admitted}`)' "$LOCAL_ADMISSION_RECEIPT_PATH")" \
+       == "$BASE_SHA|$(git -C "$REPO" rev-parse HEAD)|false" \
+    && "$PIN_OUT" == *"base_advanced=$(git -C "$ADVANCE" rev-parse HEAD) pinned_base=$BASE_SHA candidate=unchanged"* ]]; then
+  pass 'pre-QA keeps its evidence when only the base advanced, bound to the base the checks ran on'
+else fail "pre-QA base pin outcome=$LOCAL_ADMISSION_OUTCOME note=$(cut -c1-160 "$PIN_NOTE" 2>/dev/null)"; fi
+git -C "$REPO" push -q --force origin "$BASE_SHA:staging"
+git -C "$REPO" fetch -q origin staging
+
+# A base advance that changes the admission policy could require other checks,
+# so the pre-QA pin refuses it.
+git -C "$ADVANCE" reset -q --hard HEAD~1
+printf '\n' >> "$ADVANCE/$POLICY_REL"
+git -C "$ADVANCE" add -A; git -C "$ADVANCE" commit -qm policy-advance
+if ! _run_local_admission pre_qa TST-PIN-POLICY "$REPO" staging "$RECEIPTS" >/dev/null 2>&1 \
+  && [[ "$LOCAL_ADMISSION_OUTCOME" == blocked:stale_evidence && -z "$LOCAL_ADMISSION_RECEIPT_PATH" ]]; then
+  pass 'pre-QA base pin refuses a base advance that changed the admission policy'
+else fail "pre-QA base pin with policy change outcome=$LOCAL_ADMISSION_OUTCOME"; fi
+git -C "$ADVANCE" reset -q --hard HEAD~1
+printf '# advanced during check\n' >> "$ADVANCE/docs/readme.md"
+git -C "$ADVANCE" add -A; git -C "$ADVANCE" commit -qm base-advance
+git -C "$REPO" push -q --force origin "$BASE_SHA:staging"
+git -C "$REPO" fetch -q origin staging
+
+# A candidate that changes while the base advances is still stale at pre-QA.
+git -C "$REPO" switch -qC story/base-advance-mutate
+cat >> "$REPO/checks/unit.sh" <<'EOF'
+printf mutation >> src/mutated.txt
+EOF
+git -C "$REPO" add -A; git -C "$REPO" commit -qm advancing-and-mutating-command
+if ! _run_local_admission pre_qa TST-PIN-MUT "$REPO" staging "$RECEIPTS" >/dev/null \
+  && [[ "$LOCAL_ADMISSION_OUTCOME" == blocked:stale_evidence && -z "$LOCAL_ADMISSION_RECEIPT_PATH" ]]; then
+  pass 'pre-QA base pin refuses a candidate that also changed during the run'
+else fail "pre-QA base pin with mutation outcome=$LOCAL_ADMISSION_OUTCOME"; fi
+git -C "$REPO" reset -q --hard HEAD; rm -f "$REPO/src/mutated.txt"
+git -C "$REPO" push -q --force origin "$BASE_SHA:staging"
+git -C "$REPO" fetch -q origin staging
 unset GAAI_ADVANCE_REPO
 
 git -C "$REPO" switch -q staging; git -C "$REPO" reset -q --hard origin/staging

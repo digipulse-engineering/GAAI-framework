@@ -189,7 +189,7 @@ function normalizeDiff(raw, maxPaths) {
 }
 
 export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyPath, riskInputs,
-  environment, invocation }) {
+  environment, invocation, pinnedBase = false }) {
   try {
     if (!text(repo) || !text(baseRef) || !/^[0-9a-f]{40}$/.test(baseSha)
         || !/^[0-9a-f]{40}$/.test(headSha) || !safePath(policyPath)
@@ -210,7 +210,14 @@ export function resolveLocalAdmission({ repo, baseRef, baseSha, headSha, policyP
     const actualHead = runGit(repo, ['rev-parse', 'HEAD^{commit}'], max).toString().trim();
     const actualBase = runGit(repo, ['rev-parse', `refs/remotes/origin/${baseRef}^{commit}`], max).toString().trim();
     const remote = runGit(repo, ['remote', 'get-url', 'origin'], max).toString().trim();
-    if (actualHead !== headSha || actualBase !== baseSha) fail('candidate_stale');
+    if (actualHead !== headSha) fail('candidate_stale');
+    // A pinned base is the base a pre-QA run's checks executed on: it may trail
+    // the remote ref, but only as its ancestor (the base advanced; it was not
+    // rewritten). Every other input is resolved exactly as for a current base.
+    if (actualBase !== baseSha) {
+      if (!pinnedBase) fail('candidate_stale');
+      runGit(repo, ['merge-base', '--is-ancestor', baseSha, actualBase], max, 'candidate_stale');
+    }
     if (remote !== policy.repository.remote) fail('repository_mismatch');
     if (runGit(repo, ['status', '--porcelain=v1', '--untracked-files=all', '--', '.',
       ':(exclude,top).delivery-logs/**'], max).length) fail('candidate_unsealed');
@@ -350,7 +357,7 @@ function calculateAdmissionInputs({ repo, baseRef, baseSha, headSha, policyPath,
 
 function parseArgs(argv) {
   const allowed = ['repo', 'base-ref', 'base-sha', 'head-sha', 'policy', 'risk-inputs', 'output',
-    'invocation-id', 'story-id', 'boundary'];
+    'invocation-id', 'story-id', 'boundary', 'pinned-base'];
   if (argv.length % 2 !== 0) fail('input_invalid');
   const options = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -361,6 +368,7 @@ function parseArgs(argv) {
   }
   if (!['repo', 'base-ref', 'base-sha', 'head-sha', 'policy', 'output']
     .every(key => Object.hasOwn(options, key))) fail('input_invalid');
+  if (Object.hasOwn(options, 'pinned-base') && options['pinned-base'] !== 'true') fail('input_invalid');
   return options;
 }
 
@@ -375,6 +383,7 @@ async function main() {
   }
   const result = resolveLocalAdmission({ repo: args.repo, baseRef: args['base-ref'],
     baseSha: args['base-sha'], headSha: args['head-sha'], policyPath: args.policy, riskInputs,
+    pinnedBase: args['pinned-base'] === 'true',
     ...(args['invocation-id'] ? { invocation: { id: args['invocation-id'],
       story_id: args['story-id'], boundary: args.boundary } } : {}) });
   if (!args.output) { process.stderr.write('{"status":"rejected","reason":"input_invalid"}\n'); process.exitCode = 2; return; }
