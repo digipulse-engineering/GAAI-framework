@@ -6836,6 +6836,44 @@ ${qa_snippet}"
     fi
   fi
 
+  # The PR identity is written only with the terminal projection. If a previous
+  # run published this exact head and its PR merged before that projection was
+  # written, re-admitting would first incorporate a target that already holds
+  # the squash (an empty candidate diff) and stall. Recognise that PR by the
+  # exact head this worktree still carries and reconcile it first.
+  local _landed_head _landed_pr _landed_rc=0
+  _landed_head=$(git -C "$worktree_path" rev-parse HEAD 2>/dev/null || true)
+  if [[ "$_landed_head" =~ ^[0-9a-f]{40}$ ]]; then
+    # Bound to the configured target: the same head merged into another branch
+    # proves nothing about this Story.
+    _landed_pr=$(gh pr list --state merged --head "$branch" --base "${TARGET_BRANCH:-staging}" \
+      --json url,number,headRefOid \
+      --jq ".[] | select(.headRefOid == \"${_landed_head}\") | \"\(.url) \(.number)\"" 2>/dev/null) \
+      || _landed_rc=$?
+    if (( _landed_rc != 0 )); then
+      # An unanswered lookup is not "no merged PR": admitting now could
+      # incorporate the squash and lose the head this lookup needs. Retry later.
+      echo "[ERROR] ${story_id} handle_commit_phase: merged-PR lookup unavailable — phase stays qa_passed [class=GITHUB_UNAVAILABLE]"
+      _emit_commit_routing_record "$story_id" "$trace_id" "error" "blocked:github_unavailable" "0" "" "false" || true
+      return 1
+    fi
+    _landed_pr=$(printf '%s\n' "$_landed_pr" | head -1)
+    if [[ "$_landed_pr" =~ ^(https://[^[:space:]]+)\ ([0-9]+)$ ]]; then
+      local _landed_url="${BASH_REMATCH[1]}" _landed_number="${BASH_REMATCH[2]}"
+      echo "[INFO] ${story_id} handle_commit_phase: ${_landed_url} already merged this head (${_landed_head}) into ${TARGET_BRANCH:-staging} — reconciling to done before admission"
+      _journal_persist_lifecycle "$story_id" dispatch.commit \
+        pr_url "$_landed_url" pr_number "$_landed_number" \
+        pr_status merged phase_status done status done || return 1
+      # Triage before routing, as on the normal terminal path: once the row is
+      # done, a later retry skips this Story and could not run it.
+      TRIAGE_RESULT="no triage — reason: no_delta"
+      _run_triage_for_story "$story_id" || true
+      echo "[TRIAGE] ${story_id} result: ${TRIAGE_RESULT}"
+      _emit_commit_routing_record "$story_id" "$trace_id" "daemon-bash" "null" "0" "$_landed_url" "false" || return 1
+      return 0
+    fi
+  fi
+
   # Final deterministic admission runs after every candidate/base mutation.
   # Its exact SHA is the only object the publication loop may push.
   if ! _admit_current_candidate final "$story_id" "$trace_id" "$worktree_path"; then
@@ -6980,7 +7018,13 @@ work, not as a reviewed result."
       MERGED)
         # AC3: PR already merged (including squash-merge, which Guard 1 misses)
         echo "[INFO] ${story_id} handle_commit_phase: selected PR ($pr_url) is MERGED — reconciling to done without merge"
-        _journal_persist_lifecycle "$story_id" dispatch.commit \
+        # The PR identity is persisted only with a terminal projection; a PR
+        # rediscovered after a crash must carry it into this one too.
+        local _merged_pr_number
+        _merged_pr_number=$(gh pr view "$pr_url" --json number --jq .number 2>/dev/null || true)
+        local _merged_pr_fields=(pr_url "$pr_url")
+        [[ -n "$_merged_pr_number" ]] && _merged_pr_fields+=(pr_number "$_merged_pr_number")
+        _journal_persist_lifecycle "$story_id" dispatch.commit "${_merged_pr_fields[@]}" \
           pr_status merged phase_status done status done || return 1
         _emit_commit_routing_record "$story_id" "$trace_id" "daemon-bash" "null" "0" "$pr_url" "false"
         return 0
@@ -7046,21 +7090,25 @@ work, not as a reviewed result."
     fi
   fi  # end _skip_pr_create guard
 
-  # ── Persist pr_url + pr_number (AC2) ─────────────────────────────────────
+  # ── Resolve pr_number (AC2) ──────────────────────────────────────────────
   # Resolve metadata from the exact selected URL, not from the head branch:
   # one branch can have PRs to multiple bases, and the merge endpoint must be
-  # identity-bound to the same PR that the CI gate observed. Persist before
-  # merge so the PR watcher can reconcile the durable server-side result.
+  # identity-bound to the same PR that the CI gate observed.
+  #
+  # pr_url and pr_number are persisted with the terminal projection below, not
+  # here. Persisting them here pushed a journal commit to the target between PR
+  # creation and the hosted check, so the target no longer matched the PR's base
+  # and every daemon-created PR was refused as blocked:stale_base. After a crash
+  # before the terminal projection, Guard 2 rediscovers the PR from its branch.
+  local pr_number=""
   if [[ -n "$pr_url" ]]; then
-    local pr_number
     pr_number=$(gh pr view "$pr_url" --json number --jq .number 2>/dev/null || true)
-    if [[ -n "$pr_number" ]]; then
-      _journal_persist_lifecycle "$story_id" dispatch.commit \
-        pr_url "$pr_url" pr_number "$pr_number" || return 1
-    else
-      _journal_persist_lifecycle "$story_id" dispatch.commit pr_url "$pr_url" || return 1
-    fi
   fi
+  # Every lifecycle write from here on happens after the hosted check, so it
+  # can carry the PR identity without moving the base that check compares.
+  local pr_fields=()
+  [[ -n "$pr_url" ]] && pr_fields+=(pr_url "$pr_url")
+  [[ -n "$pr_number" ]] && pr_fields+=(pr_number "$pr_number")
 
   # ── Base-held current hosted authority (controller-first, fail closed) ────
   local authority_human_required=false commit_outcome="null"
@@ -7073,7 +7121,13 @@ work, not as a reviewed result."
     return 1
   fi
   local gate_rc=0
-  _run_merge_test_gate "$story_id" "$worktree_path" "$qa_report_path" "$pr_url" "$pushed_head_sha" || gate_rc=$?
+  # The hosted gate runs after the exact candidate was pushed, so its audit must
+  # not touch the tracked QA report: that dirtied the worktree and recovery then
+  # held the Story as integrity_unverified. The audit goes to the ignored
+  # per-worktree delivery log instead.
+  local merge_gate_audit="${worktree_path}/.delivery-logs/${story_id}.merge-gate.md"
+  mkdir -p "${worktree_path}/.delivery-logs" 2>/dev/null || true
+  _run_merge_test_gate "$story_id" "$worktree_path" "$merge_gate_audit" "$pr_url" "$pushed_head_sha" || gate_rc=$?
   if [[ "$gate_rc" -eq 2 ]]; then
     authority_human_required=true
     commit_outcome="$TEST_GATE_OUTCOME"
@@ -7091,7 +7145,7 @@ work, not as a reviewed result."
     echo "[ERROR] ${story_id} handle_commit_phase: ${TEST_GATE_OUTCOME} cannot be resolved by retry; stalling for the operator [class=TEST_GATE_POLICY_MISMATCH]"
     local stall_persistence_mode="none" stall_marker
     stall_marker=$(_commit_policy_stall_marker_path "$story_id")
-    if _journal_persist_lifecycle "$story_id" dispatch.commit phase_status commit_stalled; then
+    if _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status commit_stalled; then
       stall_persistence_mode="backlog"
     elif _write_commit_policy_stall_marker "$story_id" "$TEST_GATE_OUTCOME"; then
       stall_persistence_mode="marker"
@@ -7134,7 +7188,7 @@ work, not as a reviewed result."
     merge_exit=$?
     if [[ "$merge_exit" -eq 2 ]]; then
       echo "[ERROR] ${story_id} handle_commit_phase: PR head moved during merge; refusing authorization [class=TEST_GATE_BLOCKED]"
-      _journal_persist_lifecycle "$story_id" dispatch.commit phase_status failed || return 1
+      _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status failed || return 1
       if declare -F notify_escalation_inline >/dev/null 2>&1; then
         notify_escalation_inline "$story_id" "test_gate_head_moved" \
           "PR head no longer matches tested commit ${pushed_head_sha} for ${pr_url}"
@@ -7142,13 +7196,15 @@ work, not as a reviewed result."
       _emit_commit_routing_record "$story_id" "$trace_id" "error" "TEST_GATE_BLOCKED" "0" "$pr_url" "false"
       return 1
     elif [[ "$merge_exit" -eq 3 ]]; then
-      echo "[ERROR] ${story_id} handle_commit_phase: blocked:stale_base during final merge recheck [class=TEST_GATE_BLOCKED]"
-      _journal_persist_lifecycle "$story_id" dispatch.commit phase_status failed || return 1
+      # The target advanced after publication. Nothing is wrong with the
+      # candidate: keep qa_passed so recovery re-runs this phase, which
+      # incorporates the new base and re-admits before publishing again.
+      echo "[ERROR] ${story_id} handle_commit_phase: blocked:stale_base during final merge recheck — phase stays qa_passed for re-admission [class=TEST_GATE_BLOCKED]"
       _emit_commit_routing_record "$story_id" "$trace_id" "error" "blocked:stale_base" "0" "$pr_url" "false"
       return 1
     elif [[ "$merge_exit" -eq 4 ]]; then
       echo "[ERROR] ${story_id} handle_commit_phase: ${MERGE_EXACT_OUTCOME} during final merge recheck [class=TEST_GATE_BLOCKED]"
-      _journal_persist_lifecycle "$story_id" dispatch.commit phase_status failed || return 1
+      _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status failed || return 1
       _emit_commit_routing_record "$story_id" "$trace_id" "error" "$MERGE_EXACT_OUTCOME" "0" "$pr_url" "false"
       return 1
     fi
@@ -7174,7 +7230,7 @@ work, not as a reviewed result."
             return 1
           fi
           local resolved_gate_rc=0
-          _run_merge_test_gate "$story_id" "$worktree_path" "$qa_report_path" \
+          _run_merge_test_gate "$story_id" "$worktree_path" "$merge_gate_audit" \
             "$pr_url" "$resolved_head_sha" || resolved_gate_rc=$?
           if [[ "$resolved_gate_rc" -eq 2 ]]; then
             authority_human_required=true
@@ -7205,7 +7261,7 @@ work, not as a reviewed result."
             merge_exit=0  # fall through to post-merge path below
           elif [[ "$resolve_merge_exit" -eq 2 ]]; then
             echo "[ERROR] ${story_id} handle_commit_phase: PR head moved after conflict resolution [class=TEST_GATE_BLOCKED]"
-            _journal_persist_lifecycle "$story_id" dispatch.commit phase_status failed || return 1
+            _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status failed || return 1
             if declare -F notify_escalation_inline >/dev/null 2>&1; then
               notify_escalation_inline "$story_id" "test_gate_head_moved" \
                 "PR head no longer matches re-tested commit ${pushed_head_sha} for ${pr_url}"
@@ -7214,18 +7270,21 @@ work, not as a reviewed result."
             return 1
           elif [[ "$resolve_merge_exit" -eq 3 || "$resolve_merge_exit" -eq 4 ]]; then
             echo "[ERROR] ${story_id} handle_commit_phase: resolved head failed final live tuple recheck: ${MERGE_EXACT_OUTCOME} [class=TEST_GATE_BLOCKED]"
-            _journal_persist_lifecycle "$story_id" dispatch.commit phase_status failed || return 1
+            # A stale base (3) stays qa_passed for re-admission; other rechecks fail.
+            if [[ "$resolve_merge_exit" -ne 3 ]]; then
+              _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status failed || return 1
+            fi
             _emit_commit_routing_record "$story_id" "$trace_id" "error" "$MERGE_EXACT_OUTCOME" "0" "$pr_url" "false"
             return 1
           else
             echo "[ERROR] ${story_id} handle_commit_phase: exact-head merge failed after resolve [class=AUTO_MERGE_FAILED]"
             _emit_commit_routing_record "$story_id" "$trace_id" "error" "AUTO_MERGE_FAILED" "0" "$pr_url" "false"
-            _journal_persist_lifecycle "$story_id" dispatch.commit phase_status escalated || return 1
+            _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status escalated || return 1
             return 1
           fi
         else
           # auto-resolve aborted or exhausted: escalate (NOT failed)
-          _journal_persist_lifecycle "$story_id" dispatch.commit phase_status escalated || return 1
+          _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status escalated || return 1
           return 1
         fi
       fi
@@ -7233,7 +7292,7 @@ work, not as a reviewed result."
         # Non-conflict failure (network, rate-limit, branch protection).
         echo "[ERROR] ${story_id} handle_commit_phase: exact-head merge failed [class=AUTO_MERGE_FAILED]"
         _emit_commit_routing_record "$story_id" "$trace_id" "error" "AUTO_MERGE_FAILED" "0" "$pr_url" "false"
-        _journal_persist_lifecycle "$story_id" dispatch.commit phase_status escalated || return 1
+        _journal_persist_lifecycle "$story_id" dispatch.commit ${pr_fields[@]+"${pr_fields[@]}"} phase_status escalated || return 1
         return 1
       fi
     fi
@@ -7243,7 +7302,7 @@ work, not as a reviewed result."
   local pr_status_val
   [[ "$auto_merge_applied" == "true" ]] && pr_status_val="merged" || pr_status_val="pending_review"
   if ! _journal_persist_lifecycle "$story_id" dispatch.commit \
-      pr_status "$pr_status_val" phase_status done status done; then
+      ${pr_fields[@]+"${pr_fields[@]}"} pr_status "$pr_status_val" phase_status done status done; then
     echo "[ERROR] ${story_id} handle_commit_phase: durable terminal projection failed [class=SCHEDULER_FAILURE]"
     _emit_commit_routing_record "$story_id" "$trace_id" "error" "SCHEDULER_FAILURE" "0" "$pr_url" "$auto_merge_applied"
     return 1

@@ -112,7 +112,14 @@ case "$subcmd" in
     action="${1:-}"; shift
     case "$action" in
       list)
-        echo "${GH_PR_STALE_URL:-}"
+        # `--state merged` is the pre-admission landed-head lookup; it answers
+        # with what its --jq filter would print ("<url> <number>") or nothing.
+        if [[ "$*" == *"--state merged"* ]]; then
+          [[ "${GH_PR_LANDED_FAIL:-false}" == true ]] && exit 1
+          echo "${GH_PR_LANDED:-}"
+        else
+          echo "${GH_PR_STALE_URL:-}"
+        fi
         ;;
       view)
         _target="${1:-}"; shift
@@ -200,6 +207,9 @@ _ensure_worktree_deps_fresh()  { return 0; }
 _check_worktree_integrity()    { return 0; }
 _recover_worktree_safe_base()  { return 1; }
 _admit_current_candidate()     {
+  if [[ "${GAAI_TEST_ADMISSION_FORBIDDEN:-false}" == true ]]; then
+    echo "ADMISSION-CALLED" >>"$GH_CALL_LOG"; return 1
+  fi
   GAAI_ADMITTED_SHA=$(git -C "$4" rev-parse HEAD)
   GAAI_ADMITTED_BASE_SHA=$(git -C "$4" rev-parse origin/staging)
   if [[ "${GAAI_TEST_MOVE_BASE_AFTER_ADMISSION:-false}" == true ]]; then
@@ -232,6 +242,7 @@ _auto_resolve_pr_conflicts()   { [[ "${GAAI_TEST_AUTO_RESOLVE_SUCCESS:-false}" =
 _journal_persist_lifecycle() {
   local story_id="$1" _writer="$2" field value
   shift 2
+  [[ -n "${ORDER_LOG:-}" ]] && printf 'JOURNAL|%s\n' "$*" >>"$ORDER_LOG"
   while (( $# >= 2 )); do
     field="$1"; value="$2"; shift 2
     "$SCHEDULER" --set-field "$story_id" "$field" "$value" "$BACKLOG_FILE" >/dev/null \
@@ -244,6 +255,7 @@ _journal_persist_lifecycle() {
 # to authorize their merge assertions. The dedicated controller suite covers
 # the full REST state machine and fail-closed outcomes.
 _run_merge_test_gate() {
+  [[ -n "${ORDER_LOG:-}" ]] && printf 'GATE|%s\n' "$3" >>"$ORDER_LOG"
   TEST_GATE_AUTH_PR_NUMBER=""; TEST_GATE_AUTH_REPOSITORY_ID=""; TEST_GATE_AUTH_REPOSITORY_NAME=""
   TEST_GATE_AUTH_BASE_REF=""; TEST_GATE_AUTH_BASE_SHA=""; TEST_GATE_AUTH_HEAD_REF=""; TEST_GATE_AUTH_HEAD_SHA=""
   TEST_GATE_AUTH_WORKFLOW_ID=""; TEST_GATE_AUTH_RUN_ID=""; TEST_GATE_AUTH_RUN_NUMBER=""
@@ -359,6 +371,14 @@ if grep -qE "gh api --method PUT .*pulls/98/merge|gh pr merge" "$GH_CALL_LOG"; t
   fail "T2a: merge was called even though selected PR is MERGED"
 else
   pass "T2a: merge endpoint NOT called"
+fi
+
+echo "T2c: a rediscovered MERGED PR carries its identity into the row"
+T2_PR_URL=$(grep -A 12 "id: ${SID2}" "$BACKLOG_FILE" | grep "pr_url:" | head -1 | awk '{print $2}' | tr -d '"' || true)
+if [[ "$T2_PR_URL" == "$STALE_T2" ]]; then
+  pass "T2c: pr_url persisted with the MERGED reconcile"
+else
+  fail "T2c: pr_url='${T2_PR_URL}' after the MERGED reconcile (expected ${STALE_T2})"
 fi
 
 echo "T2b: phase_status=done after MERGED reconcile"
@@ -512,6 +532,12 @@ if [[ "$T5_PHASE" == "failed" ]]; then
 else
   fail "T5b: phase_status='${T5_PHASE}' (expected failed)"
 fi
+T5_PR_URL=$(grep -A 12 "id: ${SID5}" "$BACKLOG_FILE" | grep "pr_url:" | head -1 | awk '{print $2}' | tr -d '"' || true)
+if [[ "$T5_PR_URL" == "$OPEN_URL_T5" ]]; then
+  pass "T5c: a failed exit after the hosted check keeps the PR identity"
+else
+  fail "T5c: failed exit lost the PR identity (pr_url='${T5_PR_URL}')"
+fi
 
 unset GH_MERGE_EXIT GH_MERGE_STDERR GH_PR_STATE_AFTER_MERGE \
   GH_PR_HEAD_SHA_AFTER_MERGE
@@ -586,11 +612,20 @@ export GAAI_TEST_AUTHORITY_OUTCOME=hosted_then_human GAAI_TEST_AUTHORITY_CALL_CO
 export GAAI_TEST_AUTO_RESOLVE_SUCCESS=true GAAI_MERGE_AUTHORITY_MERGE_RETRIES=1 \
   GAAI_MERGE_AUTHORITY_RETRY_SLEEP_SEC=0
 : >"$GH_CALL_LOG"; : >"$ROUTING_CAPTURE"; : >"$NOTIFY_CAPTURE"
+ORDER_LOG="$SANDBOX/order-t8.log"; : >"$ORDER_LOG"
 
 set +e
 handle_commit_phase "$SID8" "trace-t8"
 T8_RC=$?
 set -e
+T8_GATES=$(grep -c '^GATE|' "$ORDER_LOG" || true)
+T8_TRACKED=$(grep '^GATE|' "$ORDER_LOG" | grep -vc "/.delivery-logs/${SID8}.merge-gate.md$" || true)
+unset ORDER_LOG
+if [[ "$T8_GATES" -ge 2 && "$T8_TRACKED" -eq 0 ]]; then
+  pass "T8b: the post-resolution hosted recheck also audits to the ignored delivery log"
+else
+  fail "T8b: hosted gate audits=$T8_GATES, outside the delivery log=$T8_TRACKED"
+fi
 T8_PHASE=$(grep -A 10 "id: ${SID8}" "$BACKLOG_FILE" | grep "phase_status:" | head -1 | awk '{print $2}')
 T8_PUTS=$(grep -cE 'gh api --method PUT .*pulls/[0-9]+/merge' "$GH_CALL_LOG" || true)
 if [[ "$T8_RC" -eq 0 && "$T8_PHASE" == done && "$T8_PUTS" -eq 1 \
@@ -661,6 +696,9 @@ set -e
 T10_PHASE=$(grep -A 10 "id: ${SID10}" "$BACKLOG_FILE" | grep "phase_status:" | head -1 | awk '{print $2}')
 if [[ "$T10_RC" -ne 0 && "$T10_PHASE" == commit_stalled && -f "$T10_MARKER" ]]; then
   pass "T10a: deterministic block stalls at commit_stalled without clearing an operator marker"
+  grep -A 12 "id: ${SID10}" "$BACKLOG_FILE" | grep -q 'pr_url: "https://github.com/test/repo/pull/110"' \
+    && pass "T10d: commit_stalled keeps the PR identity" \
+    || fail "T10d: commit_stalled lost the PR identity"
 else
   fail "T10a: expected rc!=0, commit_stalled, and preserved marker (rc=$T10_RC phase='${T10_PHASE}' marker=$(test -f "$T10_MARKER" && echo yes || echo no))"
 fi
@@ -900,6 +938,148 @@ if grep -qE "pulls/96/merge|gh pr merge.*${STALE_T16}" "$GH_CALL_LOG"; then
   fail "T16c: merge attempted on the earlier cycle's PR"
 else
   pass "T16c: earlier cycle's PR never merged"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# T17/T18: nothing is written to the target between PR creation and the hosted
+# check (that write advanced the base and made every daemon PR stale_base), the
+# PR identity lands with the terminal projection, and the hosted gate audits to
+# the ignored delivery log instead of the tracked QA report.
+# ────────────────────────────────────────────────────────────────────────────
+echo "--- T17: no target write between PR creation and the hosted check ---"
+SID17="TST-PCS17"
+setup_story "$SID17"
+write_backlog "$SID17"
+export GH_PR_HEAD_SHA="$(git -C "$PROJ" rev-parse "story/$SID17")"
+export GH_PR_STALE_URL=""
+export GH_PR_FRESH_URL="https://github.com/test/repo/pull/117"
+export GH_PR_STATE="OPEN" GH_PR_NUMBER="117" GAAI_AUTO_MERGE_POLICY="off"
+unset GAAI_TEST_AUTHORITY_OUTCOME
+ORDER_LOG="$SANDBOX/order-t17.log"; : >"$ORDER_LOG"; : >"$GH_CALL_LOG"
+set +e
+handle_commit_phase "$SID17" "trace-t17"
+T17_RC=$?
+set -e
+T17_GATE_LINE=$(grep -n '^GATE|' "$ORDER_LOG" | head -1 | cut -d: -f1)
+T17_FIRST_JOURNAL=$(grep -n '^JOURNAL|' "$ORDER_LOG" | head -1 | cut -d: -f1)
+if [[ "$T17_RC" -eq 0 && -n "$T17_GATE_LINE" && -n "$T17_FIRST_JOURNAL" && "$T17_FIRST_JOURNAL" -gt "$T17_GATE_LINE" ]] \
+    && grep -qE '^JOURNAL\|pr_url https://github.com/test/repo/pull/117 pr_number 117 pr_status ' "$ORDER_LOG"; then
+  pass "T17: pr_url/pr_number persist only with the terminal projection, after the hosted check"
+else
+  fail "T17: target written before the hosted check or PR identity missing from the terminal batch (rc=$T17_RC) $(tr '\n' ';' <"$ORDER_LOG")"
+fi
+echo "--- T18: hosted gate audit stays out of the tracked QA report ---"
+T18_AUDIT=$(grep '^GATE|' "$ORDER_LOG" | head -1 | cut -d'|' -f2)
+if [[ "$T18_AUDIT" == */.delivery-logs/${SID17}.merge-gate.md && "$T18_AUDIT" != *qa-report* ]]; then
+  pass "T18: the post-push hosted gate audits to the ignored delivery log"
+else
+  fail "T18: hosted gate audit path is ${T18_AUDIT}"
+fi
+unset ORDER_LOG
+
+# ────────────────────────────────────────────────────────────────────────────
+# T19: a base that moved before the merge recheck keeps the Story resumable
+# ────────────────────────────────────────────────────────────────────────────
+echo "--- T19: stale_base at the merge recheck stays qa_passed ---"
+SID19="TST-PCS19"
+setup_story "$SID19"
+write_backlog "$SID19"
+export GH_PR_HEAD_SHA="$(git -C "$PROJ" rev-parse "story/$SID19")"
+export GH_PR_STALE_URL="https://github.com/test/repo/pull/119"
+export GH_PR_STATE="OPEN" GH_PR_NUMBER="119" GAAI_AUTO_MERGE_POLICY="on"
+unset GAAI_TEST_AUTHORITY_OUTCOME
+ORIGINAL_MERGE_CAPTURE="$(declare -f _merge_exact_pr_head_capture)"
+_merge_exact_pr_head_capture() { MERGE_EXACT_OUTCOME="blocked:stale_base"; return 3; }
+: >"$GH_CALL_LOG"; : >"$ROUTING_CAPTURE"
+set +e
+handle_commit_phase "$SID19" "trace-t19"
+T19_RC=$?
+set -e
+T19_PHASE=$(grep -A 10 "id: ${SID19}" "$BACKLOG_FILE" | grep "phase_status:" | head -1 | awk '{print $2}')
+if [[ "$T19_RC" -ne 0 && "$T19_PHASE" == qa_passed ]] && grep -q 'blocked:stale_base' "$ROUTING_CAPTURE"; then
+  pass "T19: stale_base at the merge recheck keeps qa_passed for re-admission"
+else
+  fail "T19: stale_base at the merge recheck ended rc=$T19_RC phase=$T19_PHASE"
+fi
+
+echo "--- T19b: stale_base at the resolved-head recheck stays qa_passed ---"
+SID19B="TST-PCS19B"
+setup_story "$SID19B"
+write_backlog "$SID19B"
+export GH_PR_HEAD_SHA="$(git -C "$PROJ" rev-parse "story/$SID19B")"
+export GH_PR_STALE_URL="https://github.com/test/repo/pull/129"
+export GH_PR_STATE="OPEN" GH_PR_NUMBER="129" GAAI_AUTO_MERGE_POLICY="on"
+export GH_PR_MERGEABLE_JSON='{"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY"}'
+export GAAI_TEST_AUTO_RESOLVE_SUCCESS=true
+unset GAAI_TEST_AUTHORITY_OUTCOME
+T19B_MERGE_CALLS=0
+_merge_exact_pr_head_capture() {
+  T19B_MERGE_CALLS=$(( T19B_MERGE_CALLS + 1 ))
+  if (( T19B_MERGE_CALLS == 1 )); then MERGE_EXACT_OUTCOME="merge_failed"; return 1; fi
+  MERGE_EXACT_OUTCOME="blocked:stale_base"; return 3
+}
+: >"$GH_CALL_LOG"; : >"$ROUTING_CAPTURE"
+set +e
+handle_commit_phase "$SID19B" "trace-t19b"
+T19B_RC=$?
+set -e
+unset GH_PR_MERGEABLE_JSON GAAI_TEST_AUTO_RESOLVE_SUCCESS
+eval "$ORIGINAL_MERGE_CAPTURE"   # later cases must see the real merge path
+T19B_PHASE=$(grep -A 10 "id: ${SID19B}" "$BACKLOG_FILE" | grep "phase_status:" | head -1 | awk '{print $2}')
+if [[ "$T19B_RC" -ne 0 && "$T19B_PHASE" == qa_passed && "$T19B_MERGE_CALLS" -eq 2 ]]; then
+  pass "T19b: stale_base at the resolved-head recheck keeps qa_passed"
+else
+  fail "T19b: resolved-head stale_base ended rc=$T19B_RC phase=$T19B_PHASE merge_calls=$T19B_MERGE_CALLS"
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# T20: this exact head already merged (crash before the terminal projection):
+# reconcile with the PR identity before admission, which would otherwise
+# incorporate a target already holding the squash.
+# ────────────────────────────────────────────────────────────────────────────
+echo "--- T20: an already-merged head is reconciled before admission ---"
+SID20="TST-PCS20"
+setup_story "$SID20"
+write_backlog "$SID20"
+export GH_PR_HEAD_SHA="$(git -C "$PROJ" rev-parse "story/$SID20")"
+export GH_PR_LANDED="https://github.com/test/repo/pull/120 120"
+export GH_PR_STALE_URL="" GH_PR_STATE="MERGED" GH_PR_NUMBER="120" GAAI_AUTO_MERGE_POLICY="off"
+export GAAI_TEST_ADMISSION_FORBIDDEN=true
+: >"$GH_CALL_LOG"
+set +e
+handle_commit_phase "$SID20" "trace-t20"
+T20_RC=$?
+set -e
+unset GH_PR_LANDED GAAI_TEST_ADMISSION_FORBIDDEN
+T20_ROW=$(grep -A 12 "id: ${SID20}" "$BACKLOG_FILE")
+if [[ "$T20_RC" -eq 0 ]] && ! grep -q 'ADMISSION-CALLED' "$GH_CALL_LOG" && ! grep -q 'gh pr create' "$GH_CALL_LOG" \
+    && grep -q 'gh pr list --state merged --head story/TST-PCS20 --base staging' "$GH_CALL_LOG" \
+    && grep -q 'pr_url: "https://github.com/test/repo/pull/120"' <<<"$T20_ROW" \
+    && grep -qE 'pr_number: "?120"?' <<<"$T20_ROW"; then
+  pass "T20: the landed head is reconciled with its PR identity and admission never runs"
+else
+  fail "T20: landed-head reconcile failed (rc=$T20_RC) $(tr '\n' ' ' <<<"$T20_ROW")"
+fi
+
+echo "--- T20b: an unanswered merged-PR lookup stops before admission ---"
+SID20B="TST-PCS20B"
+setup_story "$SID20B"
+write_backlog "$SID20B"
+export GH_PR_HEAD_SHA="$(git -C "$PROJ" rev-parse "story/$SID20B")"
+export GH_PR_LANDED_FAIL=true GAAI_TEST_ADMISSION_FORBIDDEN=true
+export GH_PR_STALE_URL="" GH_PR_STATE="OPEN" GH_PR_NUMBER="121" GAAI_AUTO_MERGE_POLICY="off"
+: >"$GH_CALL_LOG"; : >"$ROUTING_CAPTURE"
+set +e
+handle_commit_phase "$SID20B" "trace-t20b"
+T20B_RC=$?
+set -e
+unset GH_PR_LANDED_FAIL GAAI_TEST_ADMISSION_FORBIDDEN
+T20B_PHASE=$(grep -A 10 "id: ${SID20B}" "$BACKLOG_FILE" | grep "phase_status:" | head -1 | awk '{print $2}')
+if [[ "$T20B_RC" -ne 0 && "$T20B_PHASE" == qa_passed ]] && ! grep -q 'ADMISSION-CALLED' "$GH_CALL_LOG" \
+    && ! grep -q 'gh pr create' "$GH_CALL_LOG" && grep -q 'blocked:github_unavailable' "$ROUTING_CAPTURE"; then
+  pass "T20b: a failed lookup is retryable and never reaches admission"
+else
+  fail "T20b: failed lookup ended rc=$T20B_RC phase=$T20B_PHASE"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
