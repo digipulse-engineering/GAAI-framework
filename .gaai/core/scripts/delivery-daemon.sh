@@ -2887,6 +2887,104 @@ _forward_project() {
     _journal_persist_lifecycle "$sid" recovery.scan "$@"
 }
 
+# Read-only stall-context path builder — never creates .recovery-contexts,
+# unlike _forward_context_path. Diagnosis-only (AC2: never mutates).
+_forward_stall_context_readonly() {
+  local sid="$1"
+  _forward_sid_valid "$sid" || return 1
+  printf '%s/.recovery-contexts/recovery.scan.%s.json\n' "$LOCK_DIR" "$sid"
+}
+
+# The fixed check/resolution table (Story AC5). One line of operator-facing
+# text per check, with the concrete daemon paths for this story filled in.
+_forward_guard_resolution() {
+  local sid="$1" check="$2"
+  case "$check" in
+    state_dir_unavailable)
+      printf "Make %s a directory owned by the daemon user with mode 0700. No file move, no row change.\n" "$LOCK_DIR" ;;
+    config_invalid)
+      printf "Set GAAI_COMMIT_PHASE_RETRY_THRESHOLD (the variable the daemon reads) to a positive integer and restart the daemon. No row change.\n" ;;
+    content_digest_unavailable)
+      printf "Confirm that sha256sum or shasum is on the daemon's PATH, fetch origin/%s in the daemon home, and confirm that the worktree exists with a valid HEAD. No file move, no row change. If none of these explains it, preserve every file and escalate.\n" "$TARGET_BRANCH" ;;
+    state_invalid)
+      printf "Move aside %s/.commit-deaths-%s. The next scan reclassifies.\n" "$LOCK_DIR" "$sid" ;;
+    event_invalid)
+      printf "Move aside %s/.commit-retry-observation-%s. The next scan reclassifies.\n" "$LOCK_DIR" "$sid" ;;
+    no_history_retained_stall)
+      printf "Preserve every file, including the context, and escalate with the context path %s/.recovery-contexts/recovery.scan.%s.json. Do not reset the row: the policy-stall path refuses before any reset would be reached.\n" "$LOCK_DIR" "$sid" ;;
+    no_history)
+      printf "Reset the row's phase_status to implemented (status stays in_progress), published and verified. Pre-QA admission and QA re-run before the commit phase.\n" ;;
+    state_content_changed)
+      printf "Move aside %s/.commit-deaths-%s, then reset phase_status to implemented, published and verified. The changed content is re-admitted and re-QA'd. If a retained lifecycle run exists for the Story, move nothing and follow retained_run_invalid.\n" "$LOCK_DIR" "$sid" ;;
+    stall_content_changed)
+      printf "Move aside %s/.commit-deaths-%s, %s/.commit-retry-observation-%s and %s/.commit-retry-stalled-%s, and any forward_commit_stall context at %s/.recovery-contexts/recovery.scan.%s.json. Then reset phase_status to implemented, published and verified. The changed content is re-admitted and re-QA'd. If a retained lifecycle run exists for the Story, move nothing and follow retained_run_invalid.\n" \
+        "$LOCK_DIR" "$sid" "$LOCK_DIR" "$sid" "$LOCK_DIR" "$sid" "$LOCK_DIR" "$sid" ;;
+    event_mismatch)
+      printf "Move aside %s/.commit-retry-observation-%s. The next scan re-applies the recorded state.\n" "$LOCK_DIR" "$sid" ;;
+    snapshot_mismatch)
+      printf "No action. If it recurs on the next scan, stop the daemon and report a second writer; preserve every file.\n" ;;
+    context_path_unavailable)
+      printf "Make %s/.recovery-contexts a directory owned by the daemon user with mode 0700.\n" "$LOCK_DIR" ;;
+    stall_bind_failed)
+      printf "Confirm that no gaai-deliver-%s session, lock or runner exists, then move the context aside.\n" "$sid" ;;
+    stall_binding_mismatch)
+      printf "If a retained lifecycle run exists for the Story, or its ownership cannot be read decisively, preserve every file and follow retained_run_invalid. Otherwise move the stall context aside, and the next scan re-evaluates from the state.\n" ;;
+    retained_run_invalid)
+      printf "Preserve every file. No operator file action is safe; escalate with the named run-state path %s/.journal-runs/recovery.scan.%s.state.\n" "$LOCK_DIR" "$sid" ;;
+    state_publish_failed)
+      printf "Confirm free space and the owner-only mode of %s; preserve every file. The next scan retries without double counting.\n" "$LOCK_DIR" ;;
+    lifecycle_retire_failed)
+      printf "Preserve every file. The next scan retries; if it recurs, escalate with the named run-state path %s/.journal-runs/recovery.scan.%s.state.\n" "$LOCK_DIR" "$sid" ;;
+    projection_failed)
+      printf "No action. The next scan retries from the retained context; if it recurs, confirm that the daemon home can push to %s.\n" "$TARGET_BRANCH" ;;
+    reclassification_failed)
+      printf "No action. The next scan settles it.\n" ;;
+    context_retire_failed)
+      printf "Confirm the .recovery-contexts permissions. The next scan re-enters through the policy-stall hold.\n" ;;
+    state_cleanup_failed)
+      printf "After verifying that %s shows phase_status: commit_stalled, move aside the three commit-retry files in %s.\n" "$TARGET_BRANCH" "$LOCK_DIR" ;;
+    evidence_write_failed)
+      printf "Restore the daemon log and stderr sinks, then restart the daemon.\n" ;;
+    unclassified)
+      printf "Preserve every file and report the line.\n" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Emits the one diagnostic line for a failed operation (Story AC1). Always
+# returns 0: a diagnosis failure must never change the refusal it describes.
+_forward_guard_diag() {
+  local sid="$1" check="${2:-unclassified}" resolve
+  resolve=$(_forward_guard_resolution "$sid" "$check" 2>/dev/null) || {
+    check=unclassified
+    resolve=$(_forward_guard_resolution "$sid" unclassified 2>/dev/null) \
+      || resolve="Preserve every file and report the line."
+  }
+  log "[COMMIT-RETRY-GUARD] story=${sid} check=${check} resolve=${resolve}" \
+    2>/dev/null || true
+  return 0
+}
+
+# Classifies why _commit_retry_observe failed, purely by re-reading (AC2).
+# Refines the lib's no_history into no_history_retained_stall when a retained
+# forward_commit_stall context exists for this exact cycle (daemon-owned
+# knowledge the lib must not have).
+_forward_guard_observe_check() {
+  local sid="$1" wt="$2" check context row c_action
+  check=$(_commit_retry_diagnose "$sid" "$wt" "origin/${TARGET_BRANCH}" \
+    "${COMMIT_PHASE_RETRY_THRESHOLD:-3}" 2>/dev/null) || {
+    printf 'unclassified\n'; return 0; }
+  if [[ "$check" == no_history ]]; then
+    context=$(_forward_stall_context_readonly "$sid" 2>/dev/null)
+    if [[ -n "$context" && -e "$context" && ! -L "$context" ]] \
+        && row=$(forward_context_read "$context" 2>/dev/null); then
+      c_action=$(printf '%s' "$row" | cut -f12)
+      [[ "$c_action" == forward_commit_stall ]] && check=no_history_retained_stall
+    fi
+  fi
+  printf '%s\n' "$check"
+}
+
 # A repeated commit-phase outcome is a durable forward policy stall, never a
 # phase rewind or permission to buy another hosted attempt.  The observation
 # helper ignores daemon-authored bookkeeping and binds the decision to the
@@ -2902,27 +3000,35 @@ _forward_commit_retry_guard() {
   local _cd_event_digest _cd_state_digest
   local _cd_threshold="${COMMIT_PHASE_RETRY_THRESHOLD:-3}"
   observation=$(_commit_retry_observe "$sid" "$wt" \
-    "origin/${TARGET_BRANCH}" "$_cd_threshold") || return 1
+    "origin/${TARGET_BRANCH}" "$_cd_threshold") || {
+    _forward_guard_diag "$sid" "$(_forward_guard_observe_check "$sid" "$wt")"
+    return 1
+  }
   IFS='|' read -r _cd_new _cd_outcome _cd_progress <<< "$observation"
-  [[ "$_cd_new" =~ ^[1-9][0-9]*$ && -n "$_cd_outcome" ]] || return 1
-  snapshot=$(_commit_retry_state_snapshot "$sid") || return 1
+  [[ "$_cd_new" =~ ^[1-9][0-9]*$ && -n "$_cd_outcome" ]] || {
+    _forward_guard_diag "$sid" unclassified; return 1; }
+  snapshot=$(_commit_retry_state_snapshot "$sid") || {
+    _forward_guard_diag "$sid" snapshot_mismatch; return 1; }
   IFS='|' read -r _cd_state_count _cd_state_outcome _cd_state_progress \
     _cd_event_digest _cd_state_digest <<< "$snapshot"
   [[ "$_cd_state_count:$_cd_state_outcome:$_cd_state_progress" == \
       "$_cd_new:$_cd_outcome:$_cd_progress" \
       && "$_cd_event_digest" =~ ^[0-9a-f]{64}$ \
-      && "$_cd_state_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+      && "$_cd_state_digest" =~ ^[0-9a-f]{64}$ ]] || {
+    _forward_guard_diag "$sid" snapshot_mismatch; return 1; }
   if (( _cd_new < _cd_threshold )); then
     log "${GREEN}[FORWARD-RECOVERY] ${sid} commit outcome remains below containment policy — resume remains eligible${NC}"
     return 0
   fi
 
   local context row context_digest
-  context=$(_forward_context_path "$sid") || return 1
+  context=$(_forward_context_path "$sid") || {
+    _forward_guard_diag "$sid" context_path_unavailable; return 1; }
   row=$(_forward_bind_context "$context" "$sid" "$_FORWARD_SOURCE" \
     "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" none none none none \
     "$_cd_event_digest" "$_cd_state_digest" "$integrity" \
-    forward_commit_stall stall_pending phase_status=commit_stalled) || return 1
+    forward_commit_stall stall_pending phase_status=commit_stalled) || {
+    _forward_guard_diag "$sid" stall_bind_failed; return 1; }
   context_digest=${row##*$'\t'}
   _forward_resume_policy_stall "$sid" "$wt" "$context" "$context_digest" \
     "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
@@ -2946,26 +3052,35 @@ _forward_resume_policy_stall() {
   local _cd_event_digest _cd_state_digest
   local _cd_threshold="${COMMIT_PHASE_RETRY_THRESHOLD:-3}"
   observation=$(_commit_retry_observe "$sid" "$wt" \
-    "origin/${TARGET_BRANCH}" "$_cd_threshold") || return 1
+    "origin/${TARGET_BRANCH}" "$_cd_threshold") || {
+    _forward_guard_diag "$sid" "$(_forward_guard_observe_check "$sid" "$wt")"
+    return 1
+  }
   IFS='|' read -r _cd_new _cd_outcome _cd_progress <<< "$observation"
-  snapshot=$(_commit_retry_state_snapshot "$sid") || return 1
+  snapshot=$(_commit_retry_state_snapshot "$sid") || {
+    _forward_guard_diag "$sid" snapshot_mismatch; return 1; }
   IFS='|' read -r _cd_state_count _cd_state_outcome _cd_state_progress \
     _cd_event_digest _cd_state_digest <<< "$snapshot"
   [[ "$_cd_new" =~ ^[1-9][0-9]*$ && -n "$_cd_outcome" \
-      && "$_cd_progress" == stall_pending \
-      && "$_cd_state_count:$_cd_state_outcome:$_cd_state_progress" == \
-        "$_cd_new:$_cd_outcome:$_cd_progress" \
       && "$_cd_event_digest" =~ ^[0-9a-f]{64}$ \
-      && "$_cd_state_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+      && "$_cd_state_digest" =~ ^[0-9a-f]{64}$ ]] || {
+    _forward_guard_diag "$sid" unclassified; return 1; }
+  [[ "$_cd_progress" == stall_pending \
+      && "$_cd_state_count:$_cd_state_outcome:$_cd_state_progress" == \
+        "$_cd_new:$_cd_outcome:$_cd_progress" ]] || {
+    _forward_guard_diag "$sid" stall_binding_mismatch; return 1; }
   [[ "$expected_event" == none || "$expected_event" == "$_cd_event_digest" ]] \
-    || return 1
+    || { _forward_guard_diag "$sid" stall_binding_mismatch; return 1; }
   [[ "$expected_state" == none || "$expected_state" == "$_cd_state_digest" ]] \
-    || return 1
-  (( _cd_new >= _cd_threshold )) || return 1
+    || { _forward_guard_diag "$sid" stall_binding_mismatch; return 1; }
+  (( _cd_new >= _cd_threshold )) || {
+    _forward_guard_diag "$sid" stall_binding_mismatch; return 1; }
 
   if [[ -n "$retained_manifest" ]]; then
-    _forward_manifest_args "$retained_manifest" || return 1
-    [[ "$_FORWARD_INTENDED" == phase_status=commit_stalled ]] || return 1
+    _forward_manifest_args "$retained_manifest" || {
+      _forward_guard_diag "$sid" retained_run_invalid; return 1; }
+    [[ "$_FORWARD_INTENDED" == phase_status=commit_stalled ]] || {
+      _forward_guard_diag "$sid" retained_run_invalid; return 1; }
     local retained_token retained_source retained_token_digest retained_records_digest
     local retained_header="" retained_line
     retained_rows=""
@@ -2976,7 +3091,8 @@ _forward_resume_policy_stall() {
         retained_rows="${retained_rows}${retained_rows:+$'\n'}${retained_line}"
       fi
     done <<< "$retained_manifest"
-    [[ -n "$retained_header" && -n "$retained_rows" ]] || return 1
+    [[ -n "$retained_header" && -n "$retained_rows" ]] || {
+      _forward_guard_diag "$sid" retained_run_invalid; return 1; }
     IFS=$'\t' read -r retained_token retained_source retained_token_digest \
       retained_state_digest retained_records_digest \
       <<< "$retained_header"
@@ -2984,7 +3100,8 @@ _forward_resume_policy_stall() {
         && "$retained_token_digest" =~ ^[0-9a-f]{64}$ \
         && "$retained_state_digest" =~ ^[0-9a-f]{64}$ \
         && "$retained_records_digest" =~ ^[0-9a-f]{64}$ \
-        && "$retained_source" == "$bound_source" ]] || return 1
+        && "$retained_source" == "$bound_source" ]] || {
+      _forward_guard_diag "$sid" retained_run_invalid; return 1; }
     attempt_evidence="$retained_token_digest"
   fi
 
@@ -2992,42 +3109,51 @@ _forward_resume_policy_stall() {
     resume:resumable:qa_passed)
       [[ "$bound_source" == "$_FORWARD_SOURCE" \
           && "$bound_blob" == "$_FORWARD_BLOB" \
-          && "$bound_record" == "$_FORWARD_RECORD_DIGEST" ]] || return 1
+          && "$bound_record" == "$_FORWARD_RECORD_DIGEST" ]] || {
+        _forward_guard_diag "$sid" stall_binding_mismatch; return 1; }
       _forward_project "$sid" "$_FORWARD_SOURCE" phase_status commit_stalled \
-        || return 1
+        || { _forward_guard_diag "$sid" projection_failed; return 1; }
       ;;
     hold_operator:policy_stall:commit_stalled)
       if [[ "$retained_state_digest" != none ]]; then
         local _field _name _digest _value location
         while IFS=$'\t' read -r _field _name _digest _value location; do
-          [[ -n "$_field" && "$location" == applied ]] || return 1
+          [[ -n "$_field" && "$location" == applied ]] || {
+            _forward_guard_diag "$sid" retained_run_invalid; return 1; }
         done <<< "$retained_rows"
         _journal_retire_accepted_lifecycle "$sid" recovery.scan \
-          "$retained_state_digest" || return 1
+          "$retained_state_digest" || {
+          _forward_guard_diag "$sid" lifecycle_retire_failed; return 1; }
       fi
       ;;
-    *) return 1 ;;
+    *) _forward_guard_diag "$sid" unclassified; return 1 ;;
   esac
   rm -f "$_FORWARD_SNAPSHOT"
 
   local current_integrity=unknown current_plan=false
-  current_integrity=$(_forward_worktree_state "$sid" false) || return 1
+  current_integrity=$(_forward_worktree_state "$sid" false) || {
+    _forward_guard_diag "$sid" reclassification_failed; return 1; }
   _forward_plan_present "$sid" "$wt" && current_plan=true
-  _forward_classify "$sid" recovery "$current_integrity" "$current_plan" || return 1
+  _forward_classify "$sid" recovery "$current_integrity" "$current_plan" || {
+    _forward_guard_diag "$sid" reclassification_failed; return 1; }
   if [[ "$_FORWARD_ACTION:$_FORWARD_REASON:$_FORWARD_PHASE" != \
       "hold_operator:policy_stall:commit_stalled" ]] \
       || ! _lifecycle_snapshot_matches "$_FORWARD_SNAPSHOT" "$sid" \
         phase_status commit_stalled; then
+    _forward_guard_diag "$sid" reclassification_failed
     rm -f "$_FORWARD_SNAPSHOT"
     return 1
   fi
   forward_context_remove "$context" "$context_digest" || {
+    _forward_guard_diag "$sid" context_retire_failed
     rm -f "$_FORWARD_SNAPSHOT"; return 1; }
   _commit_retry_clear "$sid" "$_cd_state_digest" || {
+    _forward_guard_diag "$sid" state_cleanup_failed
     rm -f "$_FORWARD_SNAPSHOT"; return 1; }
   _forward_evidence_for_intention "$sid" accepted policy_stall "$attempt_evidence" \
     "$_FORWARD_SOURCE_DIGEST" "$_FORWARD_RECORD_DIGEST" \
-    phase_status=commit_stalled || return 4
+    phase_status=commit_stalled || {
+    _forward_guard_diag "$sid" evidence_write_failed; return 4; }
   log "[$(date '+%Y-%m-%dT%H:%M:%SZ')] ${sid} repeated commit outcome reached containment; phase field updated, relaunch inhibited"
   notify_escalation "$sid" "Commit-phase repeated failure — stalled" \
     "Repeated commit-phase failure reached containment; inspect candidate progress before an operator-owned reset"
@@ -3586,7 +3712,8 @@ _forward_recovery_one() {
             rm -f "$_FORWARD_SNAPSHOT"
             _forward_evidence_for_intention "$sid" retryable source_unavailable \
               none "$stale_policy_zero_digest" "$s_record" \
-              phase_status=commit_stalled || return 4
+              phase_status=commit_stalled || {
+              _forward_guard_diag "$sid" evidence_write_failed; return 4; }
             return 1
           fi
           _forward_resume_policy_stall "$sid" "$wt" "$context" "$s_digest" \
@@ -3597,7 +3724,8 @@ _forward_recovery_one() {
             [[ "$stale_policy_rc" -eq 4 ]] && return 4
             _forward_evidence_for_intention "$sid" retryable policy_stall none \
               "$stale_policy_source_digest" "$s_record" \
-              phase_status=commit_stalled || return 4
+              phase_status=commit_stalled || {
+              _forward_guard_diag "$sid" evidence_write_failed; return 4; }
             return 1
           fi
           return 0
@@ -3658,7 +3786,8 @@ _forward_recovery_one() {
         [[ "$adopted_policy_rc" -eq 4 ]] && return 4
         _forward_evidence_for_intention "$sid" retryable policy_stall none \
           "$adopted_policy_source_digest" "$adopted_policy_record_digest" \
-          phase_status=commit_stalled || return 4
+          phase_status=commit_stalled || {
+          _forward_guard_diag "$sid" evidence_write_failed; return 4; }
         return 1
       fi
       return 0
@@ -3740,7 +3869,8 @@ _forward_recovery_one() {
         [[ "$retained_policy_rc" -eq 4 ]] && return 4
         _forward_evidence_for_intention "$sid" retryable policy_stall \
           "$token_digest" "$retained_policy_source_digest" \
-          "$retained_policy_record_digest" phase_status=commit_stalled || return 4
+          "$retained_policy_record_digest" phase_status=commit_stalled || {
+          _forward_guard_diag "$sid" evidence_write_failed; return 4; }
         return 1
       fi
       return 0
@@ -3812,7 +3942,8 @@ _forward_recovery_one() {
       4) return 4 ;;
       *)
         _forward_evidence "$sid" blocked effect_inhibited none \
-          "$_FORWARD_SOURCE_DIGEST" "$_FORWARD_RECORD_DIGEST" none || return 4
+          "$_FORWARD_SOURCE_DIGEST" "$_FORWARD_RECORD_DIGEST" none || {
+          _forward_guard_diag "$sid" evidence_write_failed; return 4; }
         rm -f "$_FORWARD_SNAPSHOT" 2>/dev/null || true
         return 1
         ;;
