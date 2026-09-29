@@ -513,3 +513,107 @@ finally:
         close_opened(opened)
 PY
 }
+
+# Owner-only state directory check used by _commit_retry_diagnose (argv[1] = dir).
+_COMMIT_RETRY_DIR_CHECK_PY='
+import os, stat, sys
+try:
+    opened = os.lstat(sys.argv[1])
+    if (not stat.S_ISDIR(opened.st_mode) or opened.st_uid != os.geteuid()
+            or opened.st_mode & 0o077):
+        raise ValueError
+except (OSError, ValueError):
+    raise SystemExit(1)
+'
+
+# Read-only diagnosis for a failed _commit_retry_observe call. Re-reads the
+# same inputs the observer would and prints exactly one classification token.
+# Never publishes, retires, creates a directory or rewrites any state, event
+# or marker file — _commit_retry_observe, its raise conditions and every
+# caller decision stay exactly as they are.
+_commit_retry_diagnose() {
+  local story_id="${1:-}" worktree_path="${2:-}" base_ref="${3:-}"
+  local threshold="${4:-${COMMIT_PHASE_RETRY_THRESHOLD:-3}}"
+  local state event digest
+  _commit_retry_story_valid "$story_id" || return 1
+  if [[ ! "$threshold" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'config_invalid\n'
+    return 0
+  fi
+  (( threshold > 1000 )) && threshold=1000
+  # No heredoc inside a compound command here: `declare -f` re-serializes such a
+  # heredoc incorrectly (bash 3.2 for `<<X || ...`, bash 5.2 for `if ! ... <<X`),
+  # so a caller that saves and restores this function would run a corrupted body.
+  local dir_rc=0
+  python3 -c "$_COMMIT_RETRY_DIR_CHECK_PY" "${LOCK_DIR:?}" || dir_rc=$?
+  if (( dir_rc != 0 )); then
+    printf 'state_dir_unavailable\n'
+    return 0
+  fi
+  state=$(_commit_retry_state_path "$story_id") || return 1
+  event=$(_commit_retry_observation_path "$story_id") || return 1
+  if ! digest=$(_commit_retry_content_digest "$story_id" "$worktree_path" "$base_ref"); then
+    printf 'content_digest_unavailable\n'
+    return 0
+  fi
+  python3 - "$_COMMIT_RETRY_COMMON_PY" "$state" "$event" "$story_id" \
+    "$digest" "$threshold" <<'PY'
+import sys
+exec(sys.argv[1])
+state_path, event_path, story, content_digest, threshold_raw = sys.argv[2:]
+state_open = None
+event_open = None
+result = None
+try:
+    try:
+        state_open = read_once(state_path)
+    except (OSError, ValueError):
+        result = "state_invalid"
+    if result is None:
+        try:
+            event_open = read_once(event_path)
+        except (OSError, ValueError):
+            result = "event_invalid"
+    if result is None:
+        try:
+            previous = parse_state(state_open, story) if state_open else None
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            result = "state_invalid"
+    if result is None:
+        try:
+            event = parse_event(event_open, story) if event_open else None
+        except (ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+            result = "event_invalid"
+    if result is None:
+        if previous and previous["stall_pending"] == "1":
+            if content_digest != previous["content_digest"]:
+                result = "stall_content_changed"
+            elif event and (event["event_id"] != previous["last_event_id"]
+                            or event["digest"] != previous["last_event_digest"]
+                            or event["outcome"] != previous["outcome"]):
+                result = "event_mismatch"
+            else:
+                result = "state_publish_failed"
+        elif event is None:
+            if previous is None:
+                result = "no_history"
+            elif content_digest != previous["content_digest"]:
+                result = "state_content_changed"
+            else:
+                result = "state_publish_failed"
+        elif (previous and event["event_id"] == previous["last_event_id"]
+                and event["digest"] == previous["last_event_digest"]
+                and event["outcome"] != previous["outcome"]):
+            result = "event_mismatch"
+        else:
+            result = "state_publish_failed"
+    print(result)
+except (OSError, ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+finally:
+    if state_open:
+        close_opened(state_open)
+    if event_open:
+        close_opened(event_open)
+PY
+}

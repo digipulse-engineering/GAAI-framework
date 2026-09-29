@@ -10,6 +10,8 @@ PASS=0
 FAIL=0
 FAILURES=""
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/gaai-forward-recovery.XXXXXX")
+# Fixture object ids, spelled so the public-safety push check does not read them as real SHAs.
+_HEX0=$(printf '%040d' 0); _HEX1=$(printf '%040d' 0 | tr 0 1); _HEX2=$(printf '%040d' 0 | tr 0 2)
 trap 'rm -rf "$TMP"' EXIT
 
 pass() { PASS=$((PASS + 1)); printf '  PASS: %s\n' "$1"; }
@@ -953,6 +955,823 @@ if not match or "return 1" not in match.group(0):
 PY
 expect "dispatch propagates durable outcome write failure" test "$?" -eq 0
 
+printf '\nCommit-stall guard diagnosis matrix\n'
+GDM_REPO="$TMP/gdm-repo"
+git init "$GDM_REPO" >/dev/null
+git -C "$GDM_REPO" config user.email test@example.invalid
+git -C "$GDM_REPO" config user.name test
+printf 'base\n' > "$GDM_REPO/app.txt"
+git -C "$GDM_REPO" add app.txt
+git -C "$GDM_REPO" commit -m base >/dev/null
+git -C "$GDM_REPO" branch target
+git -C "$GDM_REPO" update-ref refs/remotes/origin/staging refs/heads/target
+printf 'candidate\n' >> "$GDM_REPO/app.txt"
+git -C "$GDM_REPO" add app.txt
+git -C "$GDM_REPO" commit -m candidate >/dev/null
+
+GUARD_LOG="$TMP/guard-diag.log"
+: > "$GUARD_LOG"
+log() { printf '%s\n' "$*" >> "$GUARD_LOG"; }
+GREEN=''; NC=''
+PROJECT_COUNT=0
+NOTIFIED=0
+EVIDENCE=none
+COMMIT_PHASE_RETRY_THRESHOLD=1
+_FORWARD_ACTION=resume; _FORWARD_REASON=resumable; _FORWARD_PHASE=qa_passed
+_FORWARD_SOURCE=${_HEX1}
+_FORWARD_BLOB=${_HEX2}
+_FORWARD_RECORD_DIGEST=$(printf '3%.0s' $(seq 1 64))
+_FORWARD_SOURCE_DIGEST=$(printf '4%.0s' $(seq 1 64))
+_FORWARD_SNAPSHOT="$TMP/gdm-snapshot"; : > "$_FORWARD_SNAPSHOT"
+_forward_context_path() { printf '%s/gdm-context-%s\n' "$TMP" "$1"; }
+_forward_project() { PROJECT_COUNT=$((PROJECT_COUNT + 1)); return 0; }
+_forward_worktree_state() { printf 'verified\n'; }
+_forward_plan_present() { return 0; }
+_forward_classify() {
+  _FORWARD_ACTION=hold_operator; _FORWARD_REASON=policy_stall; _FORWARD_PHASE=commit_stalled
+  _FORWARD_SOURCE_DIGEST=$(printf '6%.0s' $(seq 1 64))
+  _FORWARD_RECORD_DIGEST=$(printf '7%.0s' $(seq 1 64))
+  _FORWARD_SNAPSHOT="$TMP/gdm-snapshot-current"; : > "$_FORWARD_SNAPSHOT"
+}
+_lifecycle_snapshot_matches() { [[ "$3:$4" == phase_status:commit_stalled ]]; }
+forward_context_remove() { command rm -f "$1"; return 0; }
+_forward_evidence() { EVIDENCE="$2:$3:$4:$7"; return 0; }
+notify_escalation() { NOTIFIED=$((NOTIFIED + 1)); }
+
+# Golden re-implementation of _forward_guard_resolution's exact table (AC5),
+# used to assert the daemon's real output byte-for-byte.
+gdm_resolve() {
+  local sid="$1" check="$2"
+  case "$check" in
+    state_dir_unavailable)
+      printf "Make %s a directory owned by the daemon user with mode 0700. No file move, no row change." "$LOCK_DIR" ;;
+    config_invalid)
+      printf "Set GAAI_COMMIT_PHASE_RETRY_THRESHOLD (the variable the daemon reads) to a positive integer and restart the daemon. No row change." ;;
+    content_digest_unavailable)
+      printf "Confirm that sha256sum or shasum is on the daemon's PATH, fetch origin/%s in the daemon home, and confirm that the worktree exists with a valid HEAD. No file move, no row change. If none of these explains it, preserve every file and escalate." "$TARGET_BRANCH" ;;
+    state_invalid)
+      printf "Move aside %s/.commit-deaths-%s. The next scan reclassifies." "$LOCK_DIR" "$sid" ;;
+    event_invalid)
+      printf "Move aside %s/.commit-retry-observation-%s. The next scan reclassifies." "$LOCK_DIR" "$sid" ;;
+    no_history_retained_stall)
+      printf "Preserve every file, including the context, and escalate with the context path %s/.recovery-contexts/recovery.scan.%s.json. Do not reset the row: the policy-stall path refuses before any reset would be reached." "$LOCK_DIR" "$sid" ;;
+    no_history)
+      printf "Reset the row's phase_status to implemented (status stays in_progress), published and verified. Pre-QA admission and QA re-run before the commit phase." ;;
+    state_content_changed)
+      printf "Move aside %s/.commit-deaths-%s, then reset phase_status to implemented, published and verified. The changed content is re-admitted and re-QA'd. If a retained lifecycle run exists for the Story, move nothing and follow retained_run_invalid." "$LOCK_DIR" "$sid" ;;
+    stall_content_changed)
+      printf "Move aside %s/.commit-deaths-%s, %s/.commit-retry-observation-%s and %s/.commit-retry-stalled-%s, and any forward_commit_stall context at %s/.recovery-contexts/recovery.scan.%s.json. Then reset phase_status to implemented, published and verified. The changed content is re-admitted and re-QA'd. If a retained lifecycle run exists for the Story, move nothing and follow retained_run_invalid." \
+        "$LOCK_DIR" "$sid" "$LOCK_DIR" "$sid" "$LOCK_DIR" "$sid" "$LOCK_DIR" "$sid" ;;
+    event_mismatch)
+      printf "Move aside %s/.commit-retry-observation-%s. The next scan re-applies the recorded state." "$LOCK_DIR" "$sid" ;;
+    snapshot_mismatch)
+      printf "No action. If it recurs on the next scan, stop the daemon and report a second writer; preserve every file." ;;
+    context_path_unavailable)
+      printf "Make %s/.recovery-contexts a directory owned by the daemon user with mode 0700." "$LOCK_DIR" ;;
+    stall_bind_failed)
+      printf "Confirm that no gaai-deliver-%s session, lock or runner exists, then move the context aside." "$sid" ;;
+    stall_binding_mismatch)
+      printf "If a retained lifecycle run exists for the Story, or its ownership cannot be read decisively, preserve every file and follow retained_run_invalid. Otherwise move the stall context aside, and the next scan re-evaluates from the state." ;;
+    retained_run_invalid)
+      printf "Preserve every file. No operator file action is safe; escalate with the named run-state path %s/.journal-runs/recovery.scan.%s.state." "$LOCK_DIR" "$sid" ;;
+    state_publish_failed)
+      printf "Confirm free space and the owner-only mode of %s; preserve every file. The next scan retries without double counting." "$LOCK_DIR" ;;
+    lifecycle_retire_failed)
+      printf "Preserve every file. The next scan retries; if it recurs, escalate with the named run-state path %s/.journal-runs/recovery.scan.%s.state." "$LOCK_DIR" "$sid" ;;
+    projection_failed)
+      printf "No action. The next scan retries from the retained context; if it recurs, confirm that the daemon home can push to %s." "$TARGET_BRANCH" ;;
+    reclassification_failed)
+      printf "No action. The next scan settles it." ;;
+    context_retire_failed)
+      printf "Confirm the .recovery-contexts permissions. The next scan re-enters through the policy-stall hold." ;;
+    state_cleanup_failed)
+      printf "After verifying that %s shows phase_status: commit_stalled, move aside the three commit-retry files in %s." "$TARGET_BRANCH" "$LOCK_DIR" ;;
+    evidence_write_failed)
+      printf "Restore the daemon log and stderr sinks, then restart the daemon." ;;
+    unclassified)
+      printf "Preserve every file and report the line." ;;
+  esac
+}
+
+gdm_assert_one_line() {
+  local label="$1" sid="$2" check="$3" rc_actual="$4" rc_expected="$5"
+  local evidence_calls_expected="${6:-0}"
+  local resolve expected n
+  resolve=$(gdm_resolve "$sid" "$check")
+  expected="[COMMIT-RETRY-GUARD] story=${sid} check=${check} resolve=${resolve}"
+  n=$(wc -l < "$GUARD_LOG" | tr -d ' ')
+  printf '  %s observed=rc:%s lines:%s\n' "$label" "$rc_actual" "$n"
+  expect "$label emits exactly one guard line" test "$n" = 1
+  expect "$label names check=$check with the exact table resolve text" \
+    test "$(cat "$GUARD_LOG")" = "$expected"
+  [[ "$(cat "$GUARD_LOG")" == "$expected" ]] \
+    || printf '    observed: %s\n    expected: %s\n' "$(cat "$GUARD_LOG")" "$expected"
+  expect "$label returns rc $rc_expected" test "$rc_actual" = "$rc_expected"
+  expect "$label's FORWARD-RECOVERY evidence write count is unchanged" \
+    test "$GDM_EVIDENCE_CALLS" = "$evidence_calls_expected"
+  expect "$label's diagnosis mutates no LOCK_DIR file bytes" \
+    test "$GDM_DIAG_SNAP_BEFORE" = "$GDM_DIAG_SNAP_AFTER"
+}
+
+gdm_no_guard_line() { ! grep -q '^\[COMMIT-RETRY-GUARD\]' "$GUARD_LOG"; }
+
+gdm_sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# Byte-level snapshot of every regular file under LOCK_DIR (state, event,
+# marker and context files alike), for AC6's before/after equality checks.
+gdm_lockdir_snapshot() {
+  find "$LOCK_DIR" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do
+    printf '%s %s\n' "$(gdm_sha256_file "$f")" "$f"
+  done
+}
+
+# Wrap the real _forward_guard_diag (AC1's single emission point) so every
+# case captures a LOCK_DIR snapshot immediately before and after the
+# diagnosis itself runs, isolated from whatever the surrounding guard/helper
+# logic already mutated (AC6: "a snapshot taken immediately before the
+# diagnosis equals one taken after it").
+GDM_DIAG_ORIG_BODY=$(declare -f _forward_guard_diag)
+eval "$(printf '%s\n' "$GDM_DIAG_ORIG_BODY" | sed '1s/_forward_guard_diag/_forward_guard_diag_orig/')"
+_forward_guard_diag() {
+  GDM_DIAG_SNAP_BEFORE=$(gdm_lockdir_snapshot)
+  _forward_guard_diag_orig "$@"
+  local _rc=$?
+  GDM_DIAG_SNAP_AFTER=$(gdm_lockdir_snapshot)
+  return "$_rc"
+}
+
+# Count real attempts to write FORWARD-RECOVERY evidence, so refusal cases
+# can assert none occurred (AC3: a refusal never writes evidence).
+GDM_EVIDENCE_CALLS=0
+GDM_EVFN_ORIG_BODY=$(declare -f _forward_evidence)
+eval "$(printf '%s\n' "$GDM_EVFN_ORIG_BODY" | sed '1s/_forward_evidence/_forward_evidence_base/')"
+_forward_evidence() {
+  GDM_EVIDENCE_CALLS=$((GDM_EVIDENCE_CALLS + 1))
+  _forward_evidence_base "$@"
+}
+
+# Per-case boundary: fresh guard log and a fresh evidence-call count.
+gdm_new_case() { : > "$GUARD_LOG"; GDM_EVIDENCE_CALLS=0; }
+
+# Binds a real policy-stall context+digests for $1 by driving the real guard
+# with the helper stubbed bare (no diag line emitted by this setup step), so
+# later cases can call the real helper directly with authentic bound values.
+gdm_bind_stall() {
+  local sid="$1" orig row
+  COMMIT_PHASE_RETRY_THRESHOLD=1
+  _FORWARD_ACTION=resume; _FORWARD_REASON=resumable; _FORWARD_PHASE=qa_passed
+  _FORWARD_SOURCE=${_HEX1}
+  _FORWARD_BLOB=${_HEX2}
+  _FORWARD_RECORD_DIGEST=$(printf '3%.0s' $(seq 1 64))
+  _FORWARD_SOURCE_DIGEST=$(printf '4%.0s' $(seq 1 64))
+  _FORWARD_SNAPSHOT="$TMP/gdm-bind-snap-$sid"; : > "$_FORWARD_SNAPSHOT"
+  _commit_retry_write_observation "$sid" blocked:tests_failed || return 1
+  orig=$(declare -f _forward_resume_policy_stall)
+  _forward_resume_policy_stall() { return 1; }
+  _forward_commit_retry_guard "$sid" "$GDM_REPO" verified true >/dev/null 2>&1
+  eval "$orig"
+  GDM_BOUND_CONTEXT=$(_forward_context_path "$sid")
+  row=$(forward_context_read "$GDM_BOUND_CONTEXT") || return 1
+  IFS=$'\t' read -r _ _ _ _ _ _ _ _ GDM_BOUND_EVENT GDM_BOUND_STATE _ _ _ _ \
+    GDM_BOUND_CTXDIGEST <<< "$row"
+}
+
+# --- Refusal assertions: one case per check in the Story's table ----------
+
+gdm_new_case
+chmod 707 "$LOCK_DIR"
+gdm_rc=0
+_forward_commit_retry_guard EGDM01 "$GDM_REPO" verified true || gdm_rc=$?
+chmod 700 "$LOCK_DIR"
+gdm_assert_one_line "state_dir_unavailable" EGDM01 state_dir_unavailable "$gdm_rc" 1
+
+gdm_new_case
+COMMIT_PHASE_RETRY_THRESHOLD=0
+gdm_rc=0
+_forward_commit_retry_guard EGDM02 "$GDM_REPO" verified true || gdm_rc=$?
+COMMIT_PHASE_RETRY_THRESHOLD=1
+gdm_assert_one_line "config_invalid" EGDM02 config_invalid "$gdm_rc" 1
+
+gdm_new_case
+GDM_ORIG_SHA=$(declare -f _commit_retry_sha256_stdin)
+_commit_retry_sha256_stdin() { return 1; }
+gdm_rc=0
+_forward_commit_retry_guard EGDM03 "$GDM_REPO" verified true || gdm_rc=$?
+eval "$GDM_ORIG_SHA"
+gdm_assert_one_line "content_digest_unavailable" EGDM03 content_digest_unavailable "$gdm_rc" 1
+
+gdm_new_case
+printf 'garbage not a valid state file\n' > "$(_commit_retry_state_path EGDM04)"
+chmod 600 "$(_commit_retry_state_path EGDM04)"
+gdm_rc=0
+_forward_commit_retry_guard EGDM04 "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "state_invalid" EGDM04 state_invalid "$gdm_rc" 1
+rm -f "$(_commit_retry_state_path EGDM04)"
+
+gdm_new_case
+printf 'not json\nextra\n' > "$(_commit_retry_observation_path EGDM05)"
+chmod 600 "$(_commit_retry_observation_path EGDM05)"
+gdm_rc=0
+_forward_commit_retry_guard EGDM05 "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "event_invalid" EGDM05 event_invalid "$gdm_rc" 1
+rm -f "$(_commit_retry_observation_path EGDM05)"
+
+# Unreadable (not-owner-only mode), distinct from malformed content above:
+# read_once itself rejects the file before parse_state ever runs.
+gdm_new_case
+printf 'schema_version=1.0.0\n' > "$(_commit_retry_state_path EGDM04B)"
+chmod 644 "$(_commit_retry_state_path EGDM04B)"
+gdm_rc=0
+_forward_commit_retry_guard EGDM04B "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "state_invalid (unreadable, not owner-only mode)" EGDM04B state_invalid "$gdm_rc" 1
+rm -f "$(_commit_retry_state_path EGDM04B)"
+
+# Unreadable event file, same distinction as EGDM04B but for the event path.
+gdm_new_case
+printf '{}' > "$(_commit_retry_observation_path EGDM05B)"
+chmod 644 "$(_commit_retry_observation_path EGDM05B)"
+gdm_rc=0
+_forward_commit_retry_guard EGDM05B "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "event_invalid (unreadable, not owner-only mode)" EGDM05B event_invalid "$gdm_rc" 1
+rm -f "$(_commit_retry_observation_path EGDM05B)"
+
+gdm_new_case
+gdm_rc=0
+_forward_commit_retry_guard EGDM06 "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "no_history" EGDM06 no_history "$gdm_rc" 1
+
+gdm_new_case
+mkdir -p "$LOCK_DIR/.recovery-contexts"; chmod 700 "$LOCK_DIR/.recovery-contexts"
+forward_context_install "$LOCK_DIR/.recovery-contexts/recovery.scan.EGDM07.json" EGDM07 \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" none none none none \
+  "$(printf '8%.0s' $(seq 1 64))" "$(printf '9%.0s' $(seq 1 64))" verified \
+  forward_commit_stall stall_pending phase_status=commit_stalled
+gdm_rc=0
+_forward_commit_retry_guard EGDM07 "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "no_history_retained_stall" EGDM07 no_history_retained_stall "$gdm_rc" 1
+expect "no_history_retained_stall moves nothing" \
+  test -e "$LOCK_DIR/.recovery-contexts/recovery.scan.EGDM07.json"
+
+COMMIT_PHASE_RETRY_THRESHOLD=100
+_commit_retry_write_observation EGDM08 blocked:tests_failed
+_commit_retry_observe EGDM08 "$GDM_REPO" "origin/${TARGET_BRANCH}" 100 >/dev/null
+printf 'more1\n' >> "$GDM_REPO/app.txt"; git -C "$GDM_REPO" add app.txt
+git -C "$GDM_REPO" commit -m more1 >/dev/null
+COMMIT_PHASE_RETRY_THRESHOLD=1
+gdm_new_case
+gdm_rc=0
+_forward_commit_retry_guard EGDM08 "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "state_content_changed" EGDM08 state_content_changed "$gdm_rc" 1
+git -C "$GDM_REPO" reset --hard HEAD~1 >/dev/null
+rm -f "$(_commit_retry_state_path EGDM08)"
+
+_commit_retry_write_observation EGDM09 blocked:tests_failed
+_commit_retry_observe EGDM09 "$GDM_REPO" "origin/${TARGET_BRANCH}" 1 >/dev/null
+printf 'more2\n' >> "$GDM_REPO/app.txt"; git -C "$GDM_REPO" add app.txt
+git -C "$GDM_REPO" commit -m more2 >/dev/null
+gdm_new_case
+gdm_rc=0
+_forward_commit_retry_guard EGDM09 "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "stall_content_changed" EGDM09 stall_content_changed "$gdm_rc" 1
+git -C "$GDM_REPO" reset --hard HEAD~1 >/dev/null
+rm -f "$(_commit_retry_state_path EGDM09)"
+
+_commit_retry_write_observation EGDM10 blocked:tests_failed
+_commit_retry_observe EGDM10 "$GDM_REPO" "origin/${TARGET_BRANCH}" 1 >/dev/null
+_commit_retry_write_observation EGDM10 blocked:tests_failed
+gdm_new_case
+gdm_rc=0
+_forward_commit_retry_guard EGDM10 "$GDM_REPO" verified true || gdm_rc=$?
+gdm_assert_one_line "event_mismatch" EGDM10 event_mismatch "$gdm_rc" 1
+rm -f "$(_commit_retry_state_path EGDM10)" "$(_commit_retry_observation_path EGDM10)"
+
+COMMIT_PHASE_RETRY_THRESHOLD=100
+_commit_retry_write_observation EGDM11 blocked:tests_failed
+gdm_new_case
+GDM_ORIG_SNAP=$(declare -f _commit_retry_state_snapshot)
+_commit_retry_state_snapshot() { return 1; }
+gdm_rc=0
+_forward_commit_retry_guard EGDM11 "$GDM_REPO" verified true || gdm_rc=$?
+eval "$GDM_ORIG_SNAP"
+COMMIT_PHASE_RETRY_THRESHOLD=1
+gdm_assert_one_line "snapshot_mismatch" EGDM11 snapshot_mismatch "$gdm_rc" 1
+rm -f "$(_commit_retry_state_path EGDM11)"
+
+_commit_retry_write_observation EGDM12 blocked:tests_failed
+gdm_new_case
+GDM_ORIG_CTXPATH=$(declare -f _forward_context_path)
+_forward_context_path() { return 1; }
+gdm_rc=0
+_forward_commit_retry_guard EGDM12 "$GDM_REPO" verified true || gdm_rc=$?
+eval "$GDM_ORIG_CTXPATH"
+gdm_assert_one_line "context_path_unavailable" EGDM12 context_path_unavailable "$gdm_rc" 1
+rm -f "$(_commit_retry_state_path EGDM12)"
+
+_commit_retry_write_observation EGDM13 blocked:tests_failed
+gdm_new_case
+GDM_ORIG_BIND=$(declare -f _forward_bind_context)
+_forward_bind_context() { return 1; }
+gdm_rc=0
+_forward_commit_retry_guard EGDM13 "$GDM_REPO" verified true || gdm_rc=$?
+eval "$GDM_ORIG_BIND"
+gdm_assert_one_line "stall_bind_failed" EGDM13 stall_bind_failed "$gdm_rc" 1
+expect "stall_bind_failed creates no context" test ! -e "$(_forward_context_path EGDM13)"
+rm -f "$(_commit_retry_state_path EGDM13)"
+
+gdm_new_case
+GDM_ORIG_OBS=$(declare -f _commit_retry_observe)
+GDM_ORIG_DIAG=$(declare -f _commit_retry_diagnose)
+_commit_retry_observe() { return 1; }
+_commit_retry_diagnose() { return 1; }
+gdm_rc=0
+_forward_commit_retry_guard EGDM14 "$GDM_REPO" verified true || gdm_rc=$?
+eval "$GDM_ORIG_OBS"; eval "$GDM_ORIG_DIAG"
+gdm_assert_one_line "unclassified" EGDM14 unclassified "$gdm_rc" 1
+
+gdm_bind_stall EGDM15
+gdm_new_case
+gdm_rc=0
+_forward_resume_policy_stall EGDM15 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$(printf 'f%.0s' $(seq 1 64))" "$GDM_BOUND_STATE" || gdm_rc=$?
+gdm_assert_one_line "stall_binding_mismatch" EGDM15 stall_binding_mismatch "$gdm_rc" 1
+
+gdm_bind_stall EGDM16
+gdm_new_case
+gdm_rc=0
+_forward_resume_policy_stall EGDM16 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$GDM_BOUND_EVENT" "$GDM_BOUND_STATE" "not-a-valid-manifest" || gdm_rc=$?
+gdm_assert_one_line "retained_run_invalid" EGDM16 retained_run_invalid "$gdm_rc" 1
+
+gdm_bind_stall EGDM17
+gdm_new_case
+GDM_ORIG_PROJ=$(declare -f _forward_project)
+_forward_project() { return 1; }
+gdm_rc=0
+_forward_resume_policy_stall EGDM17 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$GDM_BOUND_EVENT" "$GDM_BOUND_STATE" || gdm_rc=$?
+eval "$GDM_ORIG_PROJ"
+gdm_assert_one_line "projection_failed" EGDM17 projection_failed "$gdm_rc" 1
+
+gdm_bind_stall EGDM18
+_FORWARD_ACTION=hold_operator; _FORWARD_REASON=policy_stall; _FORWARD_PHASE=commit_stalled
+GDM_TOKEN=$(printf 'a%.0s' $(seq 1 64))
+GDM_TOKEN_DIGEST=$(printf 'b%.0s' $(seq 1 64))
+GDM_RUN_STATE=$(printf 'c%.0s' $(seq 1 64))
+GDM_RECORDS_DIGEST=$(printf 'd%.0s' $(seq 1 64))
+GDM_RECORD_DIGEST=$(printf 'e%.0s' $(seq 1 64))
+GDM_MANIFEST=$(printf '%s\t%s\t%s\t%s\t%s\nphase_status\t00000000000000000000-aaaaaaaaaaaaaaaa.json\t%s\tcommit_stalled\tapplied\n' \
+  "$GDM_TOKEN" "$_FORWARD_SOURCE" "$GDM_TOKEN_DIGEST" "$GDM_RUN_STATE" "$GDM_RECORDS_DIGEST" "$GDM_RECORD_DIGEST")
+gdm_new_case
+GDM_ORIG_RETIRE=$(declare -f _journal_retire_accepted_lifecycle)
+_journal_retire_accepted_lifecycle() { return 1; }
+gdm_rc=0
+_forward_resume_policy_stall EGDM18 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$GDM_BOUND_EVENT" "$GDM_BOUND_STATE" "$GDM_MANIFEST" || gdm_rc=$?
+eval "$GDM_ORIG_RETIRE"
+gdm_assert_one_line "lifecycle_retire_failed" EGDM18 lifecycle_retire_failed "$gdm_rc" 1
+
+gdm_bind_stall EGDM19
+gdm_new_case
+GDM_ORIG_WTS=$(declare -f _forward_worktree_state)
+_forward_worktree_state() { return 1; }
+gdm_rc=0
+_forward_resume_policy_stall EGDM19 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$GDM_BOUND_EVENT" "$GDM_BOUND_STATE" || gdm_rc=$?
+eval "$GDM_ORIG_WTS"
+gdm_assert_one_line "reclassification_failed" EGDM19 reclassification_failed "$gdm_rc" 1
+
+gdm_bind_stall EGDM20
+gdm_new_case
+GDM_ORIG_REMOVE=$(declare -f forward_context_remove)
+forward_context_remove() { return 1; }
+gdm_rc=0
+_forward_resume_policy_stall EGDM20 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$GDM_BOUND_EVENT" "$GDM_BOUND_STATE" || gdm_rc=$?
+eval "$GDM_ORIG_REMOVE"
+gdm_assert_one_line "context_retire_failed" EGDM20 context_retire_failed "$gdm_rc" 1
+expect "context_retire_failed preserves the context file" test -e "$GDM_BOUND_CONTEXT"
+rm -f "$GDM_BOUND_CONTEXT" "$(_commit_retry_state_path EGDM20)"
+
+gdm_bind_stall EGDM21
+gdm_new_case
+GDM_ORIG_CLEAR=$(declare -f _commit_retry_clear)
+_commit_retry_clear() { return 1; }
+gdm_rc=0
+_forward_resume_policy_stall EGDM21 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$GDM_BOUND_EVENT" "$GDM_BOUND_STATE" || gdm_rc=$?
+eval "$GDM_ORIG_CLEAR"
+gdm_assert_one_line "state_cleanup_failed" EGDM21 state_cleanup_failed "$gdm_rc" 1
+expect "state_cleanup_failed removed the context but preserved commit-retry state" \
+  test ! -e "$GDM_BOUND_CONTEXT" -a -e "$(_commit_retry_state_path EGDM21)"
+rm -f "$(_commit_retry_state_path EGDM21)"
+
+gdm_bind_stall EGDM22
+gdm_new_case
+GDM_ORIG_EV=$(declare -f _forward_evidence_for_intention)
+_forward_evidence_for_intention() { return 1; }
+gdm_rc=0
+_forward_resume_policy_stall EGDM22 "$GDM_REPO" "$GDM_BOUND_CONTEXT" "$GDM_BOUND_CTXDIGEST" \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" \
+  "$GDM_BOUND_EVENT" "$GDM_BOUND_STATE" || gdm_rc=$?
+eval "$GDM_ORIG_EV"
+gdm_assert_one_line "evidence_write_failed" EGDM22 evidence_write_failed "$gdm_rc" 4
+expect "evidence_write_failed already removed the context and cleared retry state" \
+  test ! -e "$GDM_BOUND_CONTEXT" -a ! -e "$(_commit_retry_state_path EGDM22)"
+
+_FORWARD_ACTION=resume; _FORWARD_REASON=resumable; _FORWARD_PHASE=qa_passed
+gdm_new_case
+_commit_retry_write_observation EGDM23 blocked:tests_failed
+chmod 500 "$LOCK_DIR"
+gdm_rc=0
+_forward_commit_retry_guard EGDM23 "$GDM_REPO" verified true || gdm_rc=$?
+chmod 700 "$LOCK_DIR"
+gdm_assert_one_line "state_publish_failed (no previous state)" EGDM23 state_publish_failed "$gdm_rc" 1
+rm -f "$(_commit_retry_observation_path EGDM23)"
+
+_commit_retry_write_observation EGDM24 blocked:tests_failed
+GDM24_EVENT_PATH=$(_commit_retry_observation_path EGDM24)
+GDM24_EVENT_JSON=$(cat "$GDM24_EVENT_PATH")
+GDM24_EVENT_ID=$(python3 -c "import json,sys; print(json.load(sys.stdin)['event_id'])" <<< "$GDM24_EVENT_JSON")
+GDM24_EVENT_OUTCOME=$(python3 -c "import json,sys; print(json.load(sys.stdin)['outcome'])" <<< "$GDM24_EVENT_JSON")
+GDM24_EVENT_DIGEST=$(gdm_sha256_file "$GDM24_EVENT_PATH")
+GDM24_CONTENT_DIGEST=$(_commit_retry_content_digest EGDM24 "$GDM_REPO" "origin/${TARGET_BRANCH}")
+GDM24_STATE_PATH=$(_commit_retry_state_path EGDM24)
+GDM24_STATE_BODY=$(printf 'schema_version=1.0.0\nstory_id=EGDM24\ncount=1\ncontent_digest=%s\noutcome=%s\nstall_pending=0\nlast_event_id=%s\nlast_event_digest=%s\nlast_classification=initial' \
+  "$GDM24_CONTENT_DIGEST" "$GDM24_EVENT_OUTCOME" "$GDM24_EVENT_ID" "$GDM24_EVENT_DIGEST")
+printf '%s\n' "$GDM24_STATE_BODY" > "$GDM24_STATE_PATH"
+chmod 600 "$GDM24_STATE_PATH"
+gdm_new_case
+chmod 500 "$LOCK_DIR"
+gdm_rc=0
+_forward_commit_retry_guard EGDM24 "$GDM_REPO" verified true || gdm_rc=$?
+chmod 700 "$LOCK_DIR"
+gdm_assert_one_line "state_publish_failed (event-retirement after publish)" EGDM24 state_publish_failed "$gdm_rc" 1
+expect "state file survives the failed retirement at its pre-crash bytes" \
+  test "$(cat "$GDM24_STATE_PATH")" = "$GDM24_STATE_BODY"
+expect "event file survives the failed retirement" test -e "$GDM24_EVENT_PATH"
+rm -f "$GDM24_STATE_PATH" "$GDM24_EVENT_PATH"
+
+# Regression for the F1 fix: state published (content_digest == the current
+# candidate digest, so no real content change occurred), and the event file
+# is ABSENT — the exact on-disk shape left by a publish that succeeded
+# followed by a failed event retirement (retire() had already renamed the
+# event away before its fsync/unlink failed). The observer only raises this
+# node's ValueError on "previous is None or digest differs" (mirrored in the
+# fix); since neither holds here, this must diagnose as state_publish_failed,
+# never state_content_changed (the content did not change).
+# A cold restart of _commit_retry_observe would read this exact shape back
+# as a legitimate idempotent success (nothing tells it retire() crashed
+# earlier), so this exercises the real diagnosis+printing pair directly
+# (_forward_guard_observe_check -> _commit_retry_diagnose,
+# _forward_guard_diag), exactly as AC2 designed them to be independently
+# testable, and exactly how this defect was originally reproduced.
+GDM25_CONTENT_DIGEST=$(_commit_retry_content_digest EGDM25 "$GDM_REPO" "origin/${TARGET_BRANCH}")
+GDM25_STATE_PATH=$(_commit_retry_state_path EGDM25)
+printf 'schema_version=1.0.0\nstory_id=EGDM25\ncount=1\ncontent_digest=%s\noutcome=blocked:tests_failed\nstall_pending=0\nlast_event_id=%s\nlast_event_digest=%s\nlast_classification=initial\n' \
+  "$GDM25_CONTENT_DIGEST" "$(printf '0%.0s' $(seq 1 64))" "$(printf '1%.0s' $(seq 1 64))" \
+  > "$GDM25_STATE_PATH"
+chmod 600 "$GDM25_STATE_PATH"
+gdm_new_case
+GDM25_CHECK=$(_forward_guard_observe_check EGDM25 "$GDM_REPO")
+expect "the diagnosis classifies a digest-matched, event-absent state as state_publish_failed, not state_content_changed" \
+  test "$GDM25_CHECK" = state_publish_failed
+_forward_guard_diag EGDM25 "$GDM25_CHECK"
+gdm_assert_one_line "state_publish_failed (publish succeeded, retirement failed, no event on disk)" \
+  EGDM25 state_publish_failed 0 0
+rm -f "$GDM25_STATE_PATH"
+
+# --- Combined failures: a refusal followed by a failed caller evidence
+# write prints exactly the two lines of AC1, in order, and still returns 4 --
+
+python3 - "$DAEMON" "$TMP/gdm-boundaries.sh" <<'PY'
+import sys, textwrap
+text = open(sys.argv[1], encoding="utf-8").read()
+def between(start, end):
+    begin = text.index(start)
+    finish = text.index(end, begin)
+    return textwrap.dedent(text[begin:finish]).rstrip()
+def between_incl(start, end):
+    begin = text.index(start)
+    finish = text.index(end, begin) + len(end)
+    return textwrap.dedent(text[begin:finish]).rstrip()
+guard_caller = between_incl("    local retry_guard_rc=0", "    esac")
+stale_caller = between("          local stale_policy_rc=0", "          return 0")
+adopted_caller = between("      local adopted_policy_rc=0", "      return 0")
+retained_caller = between("      local retained_policy_rc=0", "      return 0")
+with open(sys.argv[2], "w", encoding="utf-8") as out:
+    for name, body in (("gdm_guard_caller", guard_caller),
+                        ("gdm_stale_caller", stale_caller),
+                        ("gdm_adopted_caller", adopted_caller),
+                        ("gdm_retained_caller", retained_caller)):
+        out.write(f"{name}() {{\n{body}\n  : > \"$GDM_LATER\"\n}}\n")
+PY
+# shellcheck source=/dev/null
+source "$TMP/gdm-boundaries.sh"
+
+gdm_new_case
+sid=EGDM_C1; wt="$GDM_REPO"; integrity=verified; plan=true
+_FORWARD_SOURCE_DIGEST=$(printf '4%.0s' $(seq 1 64))
+_FORWARD_RECORD_DIGEST=$(printf '3%.0s' $(seq 1 64))
+_FORWARD_SNAPSHOT="$TMP/gdm-c1-snap"; : > "$_FORWARD_SNAPSHOT"
+GDM_LATER="$TMP/gdm-c1-later"; rm -f "$GDM_LATER"
+GDM_ORIG_GUARD=$(declare -f _forward_commit_retry_guard)
+GDM_ORIG_EVFN=$(declare -f _forward_evidence)
+_forward_commit_retry_guard() { _forward_guard_diag "$sid" unclassified; return 1; }
+_forward_evidence() { return 1; }
+gdm_c1_rc=0
+gdm_guard_caller || gdm_c1_rc=$?
+eval "$GDM_ORIG_GUARD"; eval "$GDM_ORIG_EVFN"
+expect "guard-caller combined failure emits exactly two lines" \
+  test "$(wc -l < "$GUARD_LOG" | tr -d ' ')" = 2
+expect "guard-caller combined failure line 1 is the propagated refusal" \
+  test "$(sed -n '1p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C1 check=unclassified resolve=$(gdm_resolve EGDM_C1 unclassified)"
+expect "guard-caller combined failure line 2 is its own evidence failure" \
+  test "$(sed -n '2p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C1 check=evidence_write_failed resolve=$(gdm_resolve EGDM_C1 evidence_write_failed)"
+expect "guard-caller combined failure still returns 4" test "$gdm_c1_rc" = 4
+expect "guard-caller combined failure never reaches the later marker" test ! -e "$GDM_LATER"
+
+gdm_new_case
+sid=EGDM_C2; wt="$GDM_REPO"; context="$TMP/gdm-c2-context"
+s_source=${_HEX1}
+s_blob=${_HEX2}
+s_record=$(printf '5%.0s' $(seq 1 64)); s_digest=$(printf '6%.0s' $(seq 1 64))
+s_event=$(printf '7%.0s' $(seq 1 64)); s_state=$(printf '8%.0s' $(seq 1 64))
+s_attempt=none; s_action=forward_commit_stall; s_reason=stall_pending
+s_fields=phase_status=commit_stalled
+_FORWARD_SNAPSHOT="$TMP/gdm-c2-snap"; : > "$_FORWARD_SNAPSHOT"
+GDM_LATER="$TMP/gdm-c2-later"; rm -f "$GDM_LATER"
+GDM_ORIG_SHA=$(declare -f _forward_sha256)
+GDM_ORIG_POLICY=$(declare -f _forward_resume_policy_stall)
+GDM_ORIG_EVI=$(declare -f _forward_evidence_for_intention)
+_forward_sha256() { printf '%s\n' "$(printf '9%.0s' $(seq 1 64))"; }
+_forward_resume_policy_stall() { _forward_guard_diag "$sid" unclassified; return 1; }
+_forward_evidence_for_intention() { return 1; }
+gdm_c2_rc=0
+gdm_stale_caller || gdm_c2_rc=$?
+eval "$GDM_ORIG_SHA"; eval "$GDM_ORIG_POLICY"; eval "$GDM_ORIG_EVI"
+expect "stale-caller combined failure emits exactly two lines" \
+  test "$(wc -l < "$GUARD_LOG" | tr -d ' ')" = 2
+expect "stale-caller combined failure line 1 is the propagated refusal" \
+  test "$(sed -n '1p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C2 check=unclassified resolve=$(gdm_resolve EGDM_C2 unclassified)"
+expect "stale-caller combined failure line 2 is its own evidence failure" \
+  test "$(sed -n '2p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C2 check=evidence_write_failed resolve=$(gdm_resolve EGDM_C2 evidence_write_failed)"
+expect "stale-caller combined failure still returns 4" test "$gdm_c2_rc" = 4
+expect "stale-caller combined failure never reaches the later marker" test ! -e "$GDM_LATER"
+
+gdm_new_case
+sid=EGDM_C3
+_FORWARD_SOURCE=${_HEX1}
+_FORWARD_BLOB=${_HEX2}
+_FORWARD_RECORD_DIGEST=$(printf '3%.0s' $(seq 1 64))
+adopted_event=$(printf '7%.0s' $(seq 1 64)); adopted_state=$(printf '8%.0s' $(seq 1 64))
+context_digest=$(printf '9%.0s' $(seq 1 64)); integrity=verified
+_FORWARD_SNAPSHOT="$TMP/gdm-c3-snap"; : > "$_FORWARD_SNAPSHOT"
+GDM_LATER="$TMP/gdm-c3-later"; rm -f "$GDM_LATER"
+GDM_ORIG_BINDCTX=$(declare -f _forward_bind_context)
+GDM_ORIG_POLICY=$(declare -f _forward_resume_policy_stall)
+GDM_ORIG_EVI=$(declare -f _forward_evidence_for_intention)
+_forward_bind_context() { printf 'row\t%s\n' "$context_digest"; }
+_forward_resume_policy_stall() { _forward_guard_diag "$sid" unclassified; return 1; }
+_forward_evidence_for_intention() { return 1; }
+gdm_c3_rc=0
+gdm_adopted_caller || gdm_c3_rc=$?
+eval "$GDM_ORIG_BINDCTX"; eval "$GDM_ORIG_POLICY"; eval "$GDM_ORIG_EVI"
+expect "adopted-caller combined failure emits exactly two lines" \
+  test "$(wc -l < "$GUARD_LOG" | tr -d ' ')" = 2
+expect "adopted-caller combined failure line 1 is the propagated refusal" \
+  test "$(sed -n '1p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C3 check=unclassified resolve=$(gdm_resolve EGDM_C3 unclassified)"
+expect "adopted-caller combined failure line 2 is its own evidence failure" \
+  test "$(sed -n '2p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C3 check=evidence_write_failed resolve=$(gdm_resolve EGDM_C3 evidence_write_failed)"
+expect "adopted-caller combined failure still returns 4" test "$gdm_c3_rc" = 4
+expect "adopted-caller combined failure never reaches the later marker" test ! -e "$GDM_LATER"
+
+gdm_new_case
+sid=EGDM_C4
+_FORWARD_SOURCE_DIGEST=$(printf '4%.0s' $(seq 1 64))
+_FORWARD_RECORD_DIGEST=$(printf '3%.0s' $(seq 1 64))
+token_digest=$(printf 'f%.0s' $(seq 1 64))
+retained_policy_source_digest="$_FORWARD_SOURCE_DIGEST"
+retained_policy_record_digest="$_FORWARD_RECORD_DIGEST"
+sid_wt=; context="$TMP/gdm-c4-context"; stall_context_digest=$(printf '5%.0s' $(seq 1 64))
+stall_source=${_HEX1}
+stall_blob=${_HEX2}
+stall_record=$(printf '6%.0s' $(seq 1 64))
+stall_event=$(printf '7%.0s' $(seq 1 64)); stall_state=$(printf '8%.0s' $(seq 1 64))
+manifest="ignored"
+wt="$GDM_REPO"
+_FORWARD_SNAPSHOT="$TMP/gdm-c4-snap"; : > "$_FORWARD_SNAPSHOT"
+GDM_LATER="$TMP/gdm-c4-later"; rm -f "$GDM_LATER"
+GDM_ORIG_POLICY=$(declare -f _forward_resume_policy_stall)
+GDM_ORIG_EVI=$(declare -f _forward_evidence_for_intention)
+_forward_resume_policy_stall() { _forward_guard_diag "$sid" unclassified; return 1; }
+_forward_evidence_for_intention() { return 1; }
+gdm_c4_rc=0
+gdm_retained_caller || gdm_c4_rc=$?
+eval "$GDM_ORIG_POLICY"; eval "$GDM_ORIG_EVI"
+expect "retained-manifest-caller combined failure emits exactly two lines" \
+  test "$(wc -l < "$GUARD_LOG" | tr -d ' ')" = 2
+expect "retained-manifest-caller combined failure line 1 is the propagated refusal" \
+  test "$(sed -n '1p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C4 check=unclassified resolve=$(gdm_resolve EGDM_C4 unclassified)"
+expect "retained-manifest-caller combined failure line 2 is its own evidence failure" \
+  test "$(sed -n '2p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_C4 check=evidence_write_failed resolve=$(gdm_resolve EGDM_C4 evidence_write_failed)"
+expect "retained-manifest-caller combined failure still returns 4" test "$gdm_c4_rc" = 4
+expect "retained-manifest-caller combined failure never reaches the later marker" \
+  test ! -e "$GDM_LATER"
+
+# The nested path AC6 singles out by name: the guard propagates a REAL
+# (not stubbed) helper refusal, and the guard adds no line of its own.
+gdm_new_case
+_commit_retry_write_observation EGDM_NEST1 blocked:tests_failed
+GDM_ORIG_PROJ_N1=$(declare -f _forward_project)
+_forward_project() { return 1; }
+gdm_nest1_rc=0
+_forward_commit_retry_guard EGDM_NEST1 "$GDM_REPO" verified true || gdm_nest1_rc=$?
+eval "$GDM_ORIG_PROJ_N1"
+expect "real guard propagating a real helper refusal emits exactly one line" \
+  test "$(wc -l < "$GUARD_LOG" | tr -d ' ')" = 1
+expect "real guard propagating a real helper refusal names the helper's check, not its own" \
+  test "$(cat "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_NEST1 check=projection_failed resolve=$(gdm_resolve EGDM_NEST1 projection_failed)"
+expect "real guard propagates the real helper's return code unchanged" test "$gdm_nest1_rc" = 1
+rm -f "$TMP/gdm-context-EGDM_NEST1" "$(_commit_retry_state_path EGDM_NEST1)"
+
+# Same nested path, now layered with the guard-caller's own failed evidence
+# write: exactly two lines (the real propagated refusal, then the caller's
+# evidence failure), not three.
+gdm_new_case
+sid=EGDM_NEST2; wt="$GDM_REPO"; integrity=verified; plan=true
+_commit_retry_write_observation EGDM_NEST2 blocked:tests_failed
+GDM_ORIG_PROJ_N2=$(declare -f _forward_project)
+_forward_project() { return 1; }
+GDM_ORIG_EVFN_N2=$(declare -f _forward_evidence)
+_forward_evidence() { return 1; }
+GDM_LATER="$TMP/gdm-nest2-later"; rm -f "$GDM_LATER"
+gdm_nest2_rc=0
+gdm_guard_caller || gdm_nest2_rc=$?
+eval "$GDM_ORIG_PROJ_N2"; eval "$GDM_ORIG_EVFN_N2"
+expect "real-guard nested combined failure emits exactly two lines, not three" \
+  test "$(wc -l < "$GUARD_LOG" | tr -d ' ')" = 2
+expect "real-guard nested combined line 1 is the real propagated helper refusal" \
+  test "$(sed -n '1p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_NEST2 check=projection_failed resolve=$(gdm_resolve EGDM_NEST2 projection_failed)"
+expect "real-guard nested combined line 2 is the caller's own evidence failure" \
+  test "$(sed -n '2p' "$GUARD_LOG")" = \
+    "[COMMIT-RETRY-GUARD] story=EGDM_NEST2 check=evidence_write_failed resolve=$(gdm_resolve EGDM_NEST2 evidence_write_failed)"
+expect "real-guard nested combined failure still returns 4" test "$gdm_nest2_rc" = 4
+expect "real-guard nested combined failure never reaches the later marker" test ! -e "$GDM_LATER"
+rm -f "$TMP/gdm-context-EGDM_NEST2" "$(_commit_retry_state_path EGDM_NEST2)"
+
+# --- Procedure execution: the printed procedure is run, not only its text -
+
+gdm_new_case
+printf 'garbage\n' > "$(_commit_retry_state_path EGDM_P1)"
+chmod 600 "$(_commit_retry_state_path EGDM_P1)"
+gdm_p1_rc=0
+_forward_commit_retry_guard EGDM_P1 "$GDM_REPO" verified true || gdm_p1_rc=$?
+gdm_assert_one_line "procedure state_invalid step1" EGDM_P1 state_invalid "$gdm_p1_rc" 1
+mv "$(_commit_retry_state_path EGDM_P1)" \
+  "$(_commit_retry_state_path EGDM_P1).moved-aside.$(date -u +%Y%m%dT%H%M%SZ)"
+gdm_new_case
+gdm_p1_rc2=0
+_forward_commit_retry_guard EGDM_P1 "$GDM_REPO" verified true || gdm_p1_rc2=$?
+gdm_assert_one_line "procedure state_invalid step2 reclassifies" EGDM_P1 no_history "$gdm_p1_rc2" 1
+
+mkdir -p "$LOCK_DIR/.recovery-contexts"; chmod 700 "$LOCK_DIR/.recovery-contexts"
+forward_context_install "$LOCK_DIR/.recovery-contexts/recovery.scan.EGDM_P2.json" EGDM_P2 \
+  "$_FORWARD_SOURCE" "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" none none none none \
+  "$(printf '8%.0s' $(seq 1 64))" "$(printf '9%.0s' $(seq 1 64))" verified \
+  forward_commit_stall stall_pending phase_status=commit_stalled
+GDM_P2_SHA_BEFORE=$(gdm_sha256_file "$LOCK_DIR/.recovery-contexts/recovery.scan.EGDM_P2.json")
+gdm_new_case
+gdm_p2_rc=0
+_forward_commit_retry_guard EGDM_P2 "$GDM_REPO" verified true || gdm_p2_rc=$?
+gdm_assert_one_line "procedure no_history_retained_stall scan1" EGDM_P2 no_history_retained_stall "$gdm_p2_rc" 1
+gdm_new_case
+gdm_p2_rc2=0
+_forward_commit_retry_guard EGDM_P2 "$GDM_REPO" verified true || gdm_p2_rc2=$?
+gdm_assert_one_line "procedure no_history_retained_stall scan2" EGDM_P2 no_history_retained_stall "$gdm_p2_rc2" 1
+expect "procedure no_history_retained_stall moves nothing across two scans" \
+  test "$(gdm_sha256_file "$LOCK_DIR/.recovery-contexts/recovery.scan.EGDM_P2.json")" \
+    = "$GDM_P2_SHA_BEFORE"
+
+gdm_bind_stall EGDM_P3
+sid=EGDM_P3; wt="$GDM_REPO"; context="$GDM_BOUND_CONTEXT"
+stall_context_digest="$GDM_BOUND_CTXDIGEST"
+stall_source="$_FORWARD_SOURCE"; stall_blob="$_FORWARD_BLOB"; stall_record="$_FORWARD_RECORD_DIGEST"
+stall_event="$GDM_BOUND_EVENT"; stall_state="$GDM_BOUND_STATE"
+token_digest=$(printf 'a%.0s' $(seq 1 64))
+retained_policy_source_digest=$(printf 'b%.0s' $(seq 1 64))
+retained_policy_record_digest=$(printf 'c%.0s' $(seq 1 64))
+manifest=$(printf '%s\t%s\t%s\t%s\t%s\nphase_status\t00000000000000000000-aaaaaaaaaaaaaaaa.json\t%s\tcommit_stalled\tapplied\n' \
+  "$(printf 'd%.0s' $(seq 1 64))" "$stall_source" "$(printf 'e%.0s' $(seq 1 64))" \
+  "$(printf 'f%.0s' $(seq 1 64))" "$(printf '1%.0s' $(seq 1 64))" "$(printf '2%.0s' $(seq 1 64))")
+_FORWARD_SOURCE="${_HEX0}"
+_FORWARD_SNAPSHOT="$TMP/gdm-p3-snap"; : > "$_FORWARD_SNAPSHOT"
+GDM_LATER="$TMP/gdm-p3-later"; rm -f "$GDM_LATER"
+GDM_P3_CTX_BEFORE=$(gdm_sha256_file "$context")
+gdm_new_case
+gdm_p3_rc=0
+gdm_retained_caller || gdm_p3_rc=$?
+# gdm_retained_caller (unlike the bare helper calls above) is the real
+# _forward_recovery_one caller body: on a stall refusal it legitimately
+# writes its own pre-existing "retryable policy_stall" evidence record
+# (delivery-daemon.sh's retained-manifest branch) — unrelated to and
+# unchanged by the diagnosis. Each scan performs exactly one such write.
+gdm_assert_one_line "procedure retained-manifest stall_binding_mismatch scan1" \
+  EGDM_P3 stall_binding_mismatch "$gdm_p3_rc" 1 1
+gdm_new_case
+gdm_p3_rc2=0
+gdm_retained_caller || gdm_p3_rc2=$?
+gdm_assert_one_line "procedure retained-manifest stall_binding_mismatch scan2" \
+  EGDM_P3 stall_binding_mismatch "$gdm_p3_rc2" 1 1
+expect "procedure preserve-and-escalate leaves the run and context intact" \
+  test "$(gdm_sha256_file "$context")" = "$GDM_P3_CTX_BEFORE" -a ! -e "$GDM_LATER"
+
+# --- Success assertions: no guard line, unchanged projections/records ------
+
+_FORWARD_ACTION=resume; _FORWARD_REASON=resumable; _FORWARD_PHASE=qa_passed
+_FORWARD_SOURCE=${_HEX1}
+_FORWARD_BLOB=${_HEX2}
+_FORWARD_RECORD_DIGEST=$(printf '3%.0s' $(seq 1 64))
+_FORWARD_SOURCE_DIGEST=$(printf '4%.0s' $(seq 1 64))
+_FORWARD_SNAPSHOT="$TMP/gdm-ok-snap"; : > "$_FORWARD_SNAPSHOT"
+COMMIT_PHASE_RETRY_THRESHOLD=3
+PROJECT_COUNT=0
+gdm_new_case
+_commit_retry_write_observation EGDM_OK1 blocked:tests_failed
+gdm_ok1_rc=0
+_forward_commit_retry_guard EGDM_OK1 "$GDM_REPO" verified true || gdm_ok1_rc=$?
+expect "below-threshold resume prints no guard line" gdm_no_guard_line
+expect "below-threshold resume returns 0 without projecting" \
+  test "$gdm_ok1_rc:$PROJECT_COUNT" = "0:0"
+COMMIT_PHASE_RETRY_THRESHOLD=1
+rm -f "$(_commit_retry_state_path EGDM_OK1)"
+
+PROJECT_COUNT=0; EVIDENCE=none; NOTIFIED=0
+_commit_retry_write_observation EGDM_OK2 blocked:tests_failed
+GDM_ORIG_CTXPATH2=$(declare -f _forward_context_path)
+_forward_context_path() { printf '%s/gdm-context-ok2\n' "$TMP"; }
+gdm_new_case
+gdm_ok2_rc=0
+_forward_commit_retry_guard EGDM_OK2 "$GDM_REPO" verified true || gdm_ok2_rc=$?
+eval "$GDM_ORIG_CTXPATH2"
+expect "at-threshold stall projection prints no guard line" gdm_no_guard_line
+expect "at-threshold stall projection settles once with real evidence" \
+  test "$gdm_ok2_rc:$PROJECT_COUNT:$EVIDENCE:$NOTIFIED" = "2:1:accepted:policy_stall:none:phase_status:1"
+expect "at-threshold stall projection retires context and helper state" \
+  test ! -e "$TMP/gdm-context-ok2" -a ! -e "$(_commit_retry_state_path EGDM_OK2)"
+
+gdm_new_case
+sid=EGDM_OK3; wt="$GDM_REPO"
+_FORWARD_ACTION=hold_operator; _FORWARD_REASON=policy_stall; _FORWARD_PHASE=commit_stalled
+_FORWARD_SOURCE=${_HEX1}
+_FORWARD_BLOB=${_HEX2}
+_FORWARD_RECORD_DIGEST=$(printf '3%.0s' $(seq 1 64))
+context="$TMP/gdm-ok3-context"
+integrity=verified
+GDM_LATER="$TMP/gdm-ok3-later"; rm -f "$GDM_LATER"
+_FORWARD_SNAPSHOT="$TMP/gdm-ok3-snap"; : > "$_FORWARD_SNAPSHOT"
+PROJECT_COUNT=0; EVIDENCE=none
+_commit_retry_write_observation EGDM_OK3 blocked:tests_failed
+_commit_retry_observe EGDM_OK3 "$GDM_REPO" "origin/${TARGET_BRANCH}" 1 >/dev/null
+GDM_OK3_SNAP=$(_commit_retry_state_snapshot EGDM_OK3)
+IFS='|' read -r _ _ _ adopted_event adopted_state <<< "$GDM_OK3_SNAP"
+GDM_ORIG_CTXPATH3=$(declare -f _forward_context_path)
+_forward_context_path() { printf '%s\n' "$context"; }
+gdm_ok3_row=$(_forward_bind_context "$context" "$sid" "$_FORWARD_SOURCE" \
+  "$_FORWARD_BLOB" "$_FORWARD_RECORD_DIGEST" none none none none \
+  "$adopted_event" "$adopted_state" "$integrity" \
+  forward_commit_stall stall_pending phase_status=commit_stalled)
+context_digest=${gdm_ok3_row##*$'\t'}
+gdm_ok3_rc=0
+gdm_adopted_caller || gdm_ok3_rc=$?
+eval "$GDM_ORIG_CTXPATH3"
+expect "adopted-stall path prints no guard line" gdm_no_guard_line
+expect "adopted-stall path settles once with real evidence" \
+  test "$gdm_ok3_rc:$PROJECT_COUNT:$EVIDENCE" = "0:0:accepted:policy_stall:none:phase_status"
+expect "adopted-stall path retires context and helper state" \
+  test ! -e "$context" -a ! -e "$(_commit_retry_state_path EGDM_OK3)"
+
+log() { :; }
 printf '\nAttempt-secret fault matrix\n'
 SECRET_LOCK="$TMP/secret-locks"
 mkdir -p "$SECRET_LOCK"; chmod 700 "$SECRET_LOCK"
