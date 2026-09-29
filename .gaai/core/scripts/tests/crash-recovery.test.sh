@@ -3504,6 +3504,11 @@ declare -f _check_worktree_integrity | grep -q 'WORKTREE-CHECK' \
   || { echo "REAL_INTEGRITY_ABSENT"; exit 1; }
 # 2. THEN install the ONLY allowed stub.
 eval "$D10_STUB"
+# 3. The network boundary, not a dispatcher stub: the pre-admission merged-PR
+#    lookup gets the answer "no merged PR" instead of reaching GitHub, where an
+#    unauthenticated runner fails it (and correctly stops before admission).
+#    Every other gh call behaves exactly as before.
+gh() { if [[ "${1:-} ${2:-}" == "pr list" ]]; then return 0; fi; command gh "$@"; }
 handle_commit_phase "$sid" trace-d10-row8
 echo "RC=$?"
 for f in pyyaml-runtime.pyz PROVENANCE.json LICENSE; do
