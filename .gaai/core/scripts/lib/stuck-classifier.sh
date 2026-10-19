@@ -217,15 +217,28 @@ except (KeyError, TypeError, UnicodeDecodeError, ValueError, yaml.YAMLError):
     raise SystemExit(1)
 
 if mode == "enumerate":
+    # A manual row is owned by a human or another session, so recovery never
+    # resumes it, on a full scan or on an orphan-lock request for that row.
+    # Each skipped row is reported on stderr for the daemon to log; stdout
+    # keeps carrying only the selected ids.
+    def is_manual(item):
+        pipeline = item.get("delivery_pipeline")
+        return isinstance(pipeline, str) and pipeline.strip() == "manual"
     if only:
         if only not in indexed:
             raise SystemExit(1)
-        selected = [only]
+        candidates = [only]
     else:
-        selected = [
+        candidates = [
             sid for sid, item in indexed.items()
             if item.get("status") == "in_progress"
         ]
+    selected = []
+    for sid in candidates:
+        if is_manual(indexed[sid]):
+            sys.stderr.write("[MANUAL-PIPELINE] story=%s skipped=recovery_scan\n" % sid)
+            continue
+        selected.append(sid)
     sys.stdout.write("\n".join(selected))
     raise SystemExit(0)
 
