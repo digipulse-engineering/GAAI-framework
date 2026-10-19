@@ -349,7 +349,7 @@ def git_content(args):
 
 def load_yaml_source(source, target_story_id):
     # The boundary has already attested and imported the runtime; this resolves
-    # from the retained-descriptor module and can never reach an ambient tree.
+    # from the verified in-memory module and can never reach an ambient tree.
     import yaml
 
     try:

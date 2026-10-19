@@ -67,11 +67,11 @@ _final() {
   # fixture regression that skipped assertions without recording a fail still
   # showed status=pass and CI (which greps status=pass$) stayed green. Raise
   # this number when assertions are added; never lower it to make a run pass.
-  # 156 is the compiler-less interactive minimum; the closed matrix and local
+  # 173 is the compiler-less interactive minimum; the closed matrix and local
   # admission turn every conditional executing-image negative into a FAIL rather
   # than a SKIP, so the floor never masks a vanished negative there (the rebuild
   # proof at 8.a stays gated on GAAI_YAML_TEST_SDIST, per the header).
-  YAML_RUNTIME_PASS_FLOOR=156
+  YAML_RUNTIME_PASS_FLOOR=173
   if [ "$FAIL_COUNT" -eq 0 ] && [ "$ABORTED" -eq 0 ] \
      && [ "$PASS_COUNT" -ge "$YAML_RUNTIME_PASS_FLOOR" ]; then
     status=pass
@@ -1069,12 +1069,13 @@ PY
 fi
 
 # 3.x replacement AFTER the digest and BEFORE the import cannot change the
-# executed bytes: the import runs from the retained descriptor.
+# executed bytes: the import serves the member bytes that were hashed, from
+# memory, and never reopens the file.
 POST_ROOT="$TMP_ROOT/postdigest"
 POST_HELPER="$(make_private_core "$POST_ROOT")" || true
 if [ -n "${POST_HELPER:-}" ]; then
   awk -v repl="$POST_ROOT/vendor/pyyaml/6.0.3/pyyaml-runtime.pyz" '
-    /^archive_fd = verify_archive\(archive_path, manifest\)$/ {
+    /^archive_members = verify_archive\(archive_path, manifest\)$/ {
       print
       print "replacement = " "\"" repl ".replacement\""
       print "open(replacement, \"wb\").write(b\"swapped\")"
@@ -1084,17 +1085,20 @@ if [ -n "${POST_HELPER:-}" ]; then
     }
     { print }
   ' "$POST_HELPER" > "$POST_HELPER.tmp" && mv "$POST_HELPER.tmp" "$POST_HELPER"
+  if ! grep -q 'replacement = ' "$POST_HELPER"; then
+    fail "3.x the replacement hook was not injected, so the case would prove nothing"
+  fi
   printf 'import yaml, sys\nsys.stdout.write(yaml.__version__)\n' > "$TMP_ROOT/ver.py"
   POST_OUT="$(_call "$POST_HELPER" yaml_runtime_run < "$TMP_ROOT/ver.py" 2>"$TMP_ROOT/post.err")"
   if [ "$POST_OUT" = "6.0.3" ]; then
     pass "3.x replacement after digest and before import cannot change the executed bytes"
   else
-    fail "3.x retained-descriptor import did not hold: out=$POST_OUT err=$(cat "$TMP_ROOT/post.err")"
+    fail "3.x verified-bytes import did not hold: out=$POST_OUT err=$(cat "$TMP_ROOT/post.err")"
   fi
 fi
 
 # 3.y replacement AFTER import, driven by a caller program against the
-# production boundary: parsing still succeeds from the retained descriptor.
+# production boundary: parsing still succeeds from the verified bytes in memory.
 POST2_ROOT="$TMP_ROOT/postimport"
 POST2_HELPER="$(make_private_core "$POST2_ROOT")" || true
 if [ -n "${POST2_HELPER:-}" ]; then
@@ -1151,6 +1155,188 @@ if [ "$POSTOPEN_RC" -ne 0 ] && [ -z "$POSTOPEN_OUT" ] && [ ! -s "$TMP_ROOT/posto
 else
   fail "3.z post-open replacement was not rejected cleanly: rc=$POSTOPEN_RC out=$POSTOPEN_OUT"
 fi
+
+# 3.aa-3.ad The runtime is served from the verified bytes, never through a
+# descriptor path. On macOS, stat(2) of /dev/fd/N fails intermittently with
+# EBADF when processes do it concurrently, and the bootstrap used to stat that
+# path and to let zipimport re-open it, so a valid archive was refused (exit 34
+# or 35) whenever several boots overlapped. The fault below is injected into a
+# private copy of the bootstrap: every open, stat or lstat of a descriptor path
+# fails, through an audit hook (which the interpreter's own importers honour
+# for opens) and through the stat and lstat entry points of both the os and the
+# posix modules (importlib stats through posix directly). The control proves the fault is armed inside
+# the process that runs the caller program.
+FD_ROOT="$TMP_ROOT/fdfault"
+FD_HELPER="$(make_private_core "$FD_ROOT")" || true
+if [ -n "${FD_HELPER:-}" ]; then
+  cat > "$TMP_ROOT/fdfault.inject" <<'PY'
+import errno as _errno
+def _deny_fd_path(path):
+    try:
+        text = os.fsdecode(path)
+    except (TypeError, ValueError):
+        return
+    if "/fd/" in text:
+        raise OSError(_errno.EBADF, "Bad file descriptor")
+def _audit(event, args):
+    if event == "open" and args:
+        _deny_fd_path(args[0])
+sys.addaudithook(_audit)
+def _wrap(real):
+    def wrapped(path, *a, **k):
+        _deny_fd_path(path)
+        return real(path, *a, **k)
+    return wrapped
+import posix as _posix
+os.stat = _wrap(os.stat)
+os.lstat = _wrap(os.lstat)
+_posix.stat = _wrap(_posix.stat)
+_posix.lstat = _wrap(_posix.lstat)
+PY
+  awk -v inject="$TMP_ROOT/fdfault.inject" '
+    /^MISSING = 30$/ { while ((getline line < inject) > 0) print line }
+    { print }
+  ' "$FD_HELPER" > "$FD_HELPER.tmp" && mv "$FD_HELPER.tmp" "$FD_HELPER"
+  cat > "$TMP_ROOT/fdfault.py" <<'PY'
+import sys
+try:
+    open("/dev/fd/0", "rb")
+    sys.stdout.write("armed=no ")
+except OSError:
+    sys.stdout.write("armed=yes ")
+import yaml
+sys.stdout.write("parsed=%s" % yaml.safe_load("a: 1")["a"])
+PY
+  FD_OUT="$(_call "$FD_HELPER" yaml_runtime_run < "$TMP_ROOT/fdfault.py" 2>"$TMP_ROOT/fdfault.err")"
+  FD_RC=$?
+  case "$FD_OUT" in
+    "armed=yes "*) pass "3.aa the descriptor-path fault is armed in the process that runs the caller program" ;;
+    *) fail "3.aa the descriptor-path fault was not armed, so 3.ab proves nothing: out=$FD_OUT" ;;
+  esac
+  if [ "$FD_RC" -eq 0 ] && [ "$FD_OUT" = "armed=yes parsed=1" ]; then
+    pass "3.ab the runtime boots and parses although every descriptor-path open and stat fails"
+  else
+    fail "3.ab the boot depended on a descriptor path: rc=$FD_RC out=$FD_OUT err=$(head -c 200 "$TMP_ROOT/fdfault.err")"
+  fi
+fi
+
+# 3.ac Concurrent boots all succeed: the process pattern of the observed
+# failure, eight simultaneous boots repeated, against the production boundary.
+printf 'import sys, yaml\nsys.stdout.write(yaml.__version__)\n' > "$TMP_ROOT/concurrent.py"
+CONC_BAD=0
+CONC_ROUND=0
+while [ "$CONC_ROUND" -lt 5 ]; do
+  CONC_ROUND=$(( CONC_ROUND + 1 ))
+  CONC_I=0
+  while [ "$CONC_I" -lt 8 ]; do
+    CONC_I=$(( CONC_I + 1 ))
+    (
+      yaml_runtime_run < "$TMP_ROOT/concurrent.py" \
+        > "$TMP_ROOT/conc.$CONC_I.out" 2> "$TMP_ROOT/conc.$CONC_I.err"
+      echo "$?" > "$TMP_ROOT/conc.$CONC_I.rc"
+    ) &
+  done
+  wait
+  CONC_I=0
+  while [ "$CONC_I" -lt 8 ]; do
+    CONC_I=$(( CONC_I + 1 ))
+    if [ "$(cat "$TMP_ROOT/conc.$CONC_I.rc" 2>/dev/null)" != "0" ] \
+       || [ "$(cat "$TMP_ROOT/conc.$CONC_I.out" 2>/dev/null)" != "6.0.3" ]; then
+      CONC_BAD=$(( CONC_BAD + 1 ))
+      CONC_LAST="$(head -c 200 "$TMP_ROOT/conc.$CONC_I.err" 2>/dev/null)"
+    fi
+  done
+done
+if [ "$CONC_BAD" -eq 0 ]; then
+  pass "3.ac forty concurrent boots all succeed"
+else
+  fail "3.ac $CONC_BAD of 40 concurrent boots failed: ${CONC_LAST:-}"
+fi
+
+# 3.ad The imported parser has no filesystem location and one provenance: every
+# yaml module comes from the same importer of the verified archive.
+cat > "$TMP_ROOT/provenance.py" <<'PY'
+import sys, yaml
+loaders = {id(m.__spec__.loader) for n, m in sys.modules.items()
+           if n == "yaml" or n.startswith("yaml.")}
+ok = (not hasattr(yaml, "__file__")
+      and yaml.__spec__.origin.startswith("<gaai-yaml-runtime-archive>/")
+      and len(loaders) == 1)
+sys.stdout.write("provenance=%s" % ("one" if ok else "mixed"))
+PY
+PROV_OUT="$(yaml_runtime_run < "$TMP_ROOT/provenance.py" 2>"$TMP_ROOT/provenance.err")"
+if [ "$PROV_OUT" = "provenance=one" ]; then
+  pass "3.ad the parser has no filesystem location and a single verified provenance"
+else
+  fail "3.ad the parser provenance is not the verified archive: $PROV_OUT"
+fi
+
+# 3.ae An in-place write into the archive after the digest cannot change what
+# runs. Replacement (3.x) swaps the file for a new one; this rewrites the same
+# file, which the earlier descriptor-path import would still have read.
+INPLACE_ROOT="$TMP_ROOT/inplace"
+INPLACE_HELPER="$(make_private_core "$INPLACE_ROOT")" || true
+if [ -n "${INPLACE_HELPER:-}" ]; then
+  awk -v archive="$INPLACE_ROOT/vendor/pyyaml/6.0.3/pyyaml-runtime.pyz" '
+    /^archive_[a-z]+ = verify_archive\(archive_path, manifest\)$/ {
+      print
+      print "with open(\"" archive "\", \"r+b\") as _inplace:"
+      print "    _inplace.write(b\"X\" * 4096)"
+      next
+    }
+    { print }
+  ' "$INPLACE_HELPER" > "$INPLACE_HELPER.tmp" && mv "$INPLACE_HELPER.tmp" "$INPLACE_HELPER"
+  if ! grep -q '_inplace' "$INPLACE_HELPER"; then
+    fail "3.ae the in-place write hook was not injected, so the case would prove nothing"
+  fi
+  printf 'import yaml, sys\nsys.stdout.write(yaml.__version__)\n' > "$TMP_ROOT/inplace.py"
+  INPLACE_OUT="$(_call "$INPLACE_HELPER" yaml_runtime_run < "$TMP_ROOT/inplace.py" 2>"$TMP_ROOT/inplace.err")"
+  if [ "$INPLACE_OUT" = "6.0.3" ]; then
+    pass "3.ae an in-place write into the archive after the digest cannot change the executed bytes"
+  else
+    fail "3.ae the executed bytes followed an in-place write: out=$INPLACE_OUT err=$(head -c 200 "$TMP_ROOT/inplace.err")"
+  fi
+fi
+
+# 3.af-3.ak The importer's own failure branches keep their typed codes. Each
+# case injects one condition into a private copy of the bootstrap just before
+# the import: a module that fails to execute, a wrong version, a foreign loader
+# on a yaml module, a member outside the yaml package, two members naming one module, and an
+# unsupported platform.
+printf 'import yaml, sys\nsys.stdout.write(yaml.__version__)\n' > "$TMP_ROOT/ibcase.py"
+importer_branch_case() {
+  # importer_branch_case <label> <expected-exit> <expected-code> <python-lines>
+  local label="$1" want="$2" code="$3" inject="$4"
+  local root="$TMP_ROOT/ib$(printf '%s' "$label" | tr -cd '0-9a-zA-Z')"
+  local helper
+  helper="$(make_private_core "$root")" || return 1
+  printf '%s\n' "$inject" > "$root/inject.py"
+  awk -v inject="$root/inject.py" '
+    /^yaml_module = import_runtime\(archive_members\)$/ { while ((getline line < inject) > 0) print line }
+    { print }
+  ' "$helper" > "$helper.tmp" && mv "$helper.tmp" "$helper"
+  if ! grep -qF -- "$(head -n 1 "$root/inject.py")" "$helper"; then
+    fail "$label — the fault was not injected, so the case would prove nothing"
+    return 1
+  fi
+  _call "$helper" yaml_runtime_run < "$TMP_ROOT/ibcase.py" >/dev/null 2>"$TMP_ROOT/ib.err"
+  local rc=$?
+  expect_code "$label" "$want" "$TMP_ROOT/ib.err" "$rc" "$code"
+  assert_path_free "$label (path-free diagnostic)" "$TMP_ROOT/ib.err"
+}
+importer_branch_case "3.af a runtime module that fails to execute is a typed import failure" 35 yaml_runtime_import_failed \
+  'archive_members["yaml/__init__.py"] = b"raise RuntimeError(1)\n"'
+importer_branch_case "3.ag a runtime with the wrong version is a typed import failure" 35 yaml_runtime_import_failed \
+  'archive_members["yaml/__init__.py"] = archive_members["yaml/__init__.py"].replace(b"__version__ = '"'"'6.0.3'"'"'", b"__version__ = '"'"'0.0.0'"'"'")'
+importer_branch_case "3.ah a yaml module from another loader is a typed import failure" 35 yaml_runtime_import_failed \
+  'import types as _types
+sys.modules["yaml.rogue"] = _types.ModuleType("yaml.rogue")'
+importer_branch_case "3.aj a runtime member outside the yaml package is a typed import failure" 35 yaml_runtime_import_failed \
+  'archive_members["json/__init__.py"] = b"x = 1\n"'
+importer_branch_case "3.ak two archive members naming one module are a typed import failure" 35 yaml_runtime_import_failed \
+  'archive_members["yaml/error/__init__.py"] = b"x = 1\n"'
+importer_branch_case "3.ai an unsupported platform is a typed platform refusal" 34 yaml_runtime_platform_unsupported \
+  'sys.platform = "win32"'
 
 # ══════════════════════════════════════════════════════════════════════════
 # 4. Restrictive-umask normalization (the mode repair) and its narrowness
