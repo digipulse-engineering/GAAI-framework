@@ -223,6 +223,41 @@ for invalid_sid in '../escape' $'ENEW\nLINE' 'bad!'; do
   fi
 done
 
+# A manual in_progress row is never resumed: not by a full scan, not by an
+# orphan-lock request, and not by a recovery that reaches it directly. The
+# target is not written, the skip is logged once, and no scan file is left.
+{
+  printf 'items:\n'
+  printf -- '- id: EMAN\n'
+  printf '  status: in_progress\n'
+  printf '  phase_status: qa_passed\n'
+  printf '  delivery_pipeline: "manual"  # delivered by another session\n'
+  printf '  started_at: "%s"\n' "$started"
+} > "$BACKLOG_FILE"
+git -C "$PROJECT_DIR" add "$BACKLOG_REL"
+git -C "$PROJECT_DIR" commit -m manual >/dev/null
+git -C "$PROJECT_DIR" push -f origin HEAD:staging >/dev/null
+manual_log="$TMP/manual-recovery.log"; : > "$manual_log"
+manual_before=$(git -C "$TMP/origin.git" rev-parse staging)
+manual_rcs=""
+for manual_call in "forward_recovery_scan" "forward_recovery_scan --only-sid EMAN" "_forward_recovery_one EMAN"; do
+  manual_rc=0
+  ( log() { printf '%s\n' "$*" >> "$manual_log"; }; $manual_call ) || manual_rc=$?
+  manual_rcs="${manual_rcs}${manual_rc}"
+done
+manual_after=$(git -C "$TMP/origin.git" rev-parse staging)
+manual_lines=$(grep -c '^\[MANUAL-PIPELINE\] story=EMAN skipped=recovery_scan' "$manual_log")
+manual_left=$(find "$LOCK_DIR" -maxdepth 1 \( -name '.forward-skipped-*' -o -name '.forward-snapshot-*' -o -name '.forward-index-*' \) | wc -l | tr -d ' ')
+manual_evidence=$(find "$LOCK_DIR" -name '*EMAN*' | wc -l | tr -d ' ')
+# Each call runs in its own subshell, so the once-per-process log dedup resets:
+# exactly one line per entry proves the direct recovery re-check fired too.
+if [[ "$manual_rcs" == 000 && "$manual_before" == "$manual_after" && "$manual_left" -eq 0 \
+    && "$manual_lines" -eq 3 && "$manual_evidence" -eq 0 ]]; then
+  pass "a manual in_progress row is left untouched by every recovery entry and the skip is logged"
+else
+  fail "manual recovery: rcs=$manual_rcs target_moved=$([[ "$manual_before" == "$manual_after" ]] && echo no || echo yes) leftovers=$manual_left log_lines=$manual_lines evidence=$manual_evidence"
+fi
+
 python3 - "$BACKLOG_FILE" <<'PY'
 import sys
 path = sys.argv[1]

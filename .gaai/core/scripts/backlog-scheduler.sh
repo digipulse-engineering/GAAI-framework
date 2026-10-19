@@ -888,6 +888,7 @@ for line in content.splitlines():
             "complexity": 1,
             "depends_on": [],
             "epic": "",
+            "delivery_pipeline": "",
         }
         item_indent = indent
         field_indent = indent + 2
@@ -915,6 +916,9 @@ for line in content.splitlines():
             current["complexity"] = int(stripped.split(":", 1)[1].strip())
         except ValueError:
             pass
+        in_depends = False
+    elif stripped.startswith("delivery_pipeline:"):
+        current["delivery_pipeline"] = re.split(r"\s+#", stripped.split(":", 1)[1], maxsplit=1)[0].strip().strip("\"'")
         in_depends = False
     elif stripped.startswith("epic:"):
         # Extracted so is_ready() can detect epic self-references (id == epic)
@@ -955,6 +959,10 @@ def is_ready(item):
     # the retry counter, and eventually spam "exceeded 3 retries. Skipping
     # (restart daemon to reset)" every poll cycle.
     if item.get("id") and item.get("id") == item.get("epic"):
+        return False
+    # A manual row is delivered by a human or another session, never by the
+    # daemon: it is not offered by --next, --ready-ids or --list.
+    if item.get("delivery_pipeline") == "manual":
         return False
     return all(d in done_ids for d in item.get("depends_on", []) if d)
 

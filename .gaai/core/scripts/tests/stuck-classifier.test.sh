@@ -579,6 +579,55 @@ else
   fail "legacy classifier evidence/action remains"
 fi
 
+# A recovery scan never enumerates a manual row, not even on an orphan-lock request.
+MANUAL_SNAP="$SANDBOX/manual-enumerate.yaml"
+{
+  echo 'items:'
+  echo '- id: TST-AUTO'
+  echo '  status: in_progress'
+  echo '  phase_status: qa_passed'
+  echo '  delivery_pipeline: 3phase'
+  echo '- id: TST-MANUAL'
+  echo '  status: in_progress'
+  echo '  phase_status: qa_passed'
+  echo '  delivery_pipeline: manual'
+  echo '- id: TST-LOOKALIKE'
+  echo '  status: in_progress'
+  echo '  phase_status: implemented'
+  echo '  delivery_pipeline: manual-review'
+  echo '- id: TST-NOFIELD'
+  echo '  status: in_progress'
+  echo '  phase_status: planned'
+} > "$MANUAL_SNAP"
+chmod 600 "$MANUAL_SNAP"
+MANUAL_BLOB="$(blob_for "$MANUAL_SNAP")"
+MANUAL_ERR="$SANDBOX/manual-enumerate.err"
+MANUAL_IDS="$(forward_enumerate_snapshot "$MANUAL_SNAP" "$SOURCE_SHA" "$MANUAL_BLOB" 2>"$MANUAL_ERR" | sort | paste -sd, -)"
+if [[ "$MANUAL_IDS" == "TST-AUTO,TST-LOOKALIKE,TST-NOFIELD" ]]; then
+  pass "recovery enumeration omits the manual row and keeps every other pipeline value"
+else
+  fail "recovery enumeration listed '$MANUAL_IDS'"
+fi
+if grep -qx '\[MANUAL-PIPELINE\] story=TST-MANUAL skipped=recovery_scan' "$MANUAL_ERR" \
+    && [[ "$(grep -c '^\[MANUAL-PIPELINE\]' "$MANUAL_ERR")" -eq 1 ]]; then
+  pass "the skipped manual row is reported once, by story and site"
+else
+  fail "no single [MANUAL-PIPELINE] line for the skipped manual row"
+fi
+MANUAL_ONE_ERR="$SANDBOX/manual-only-sid.err"
+MANUAL_ONE="$(forward_enumerate_snapshot "$MANUAL_SNAP" "$SOURCE_SHA" "$MANUAL_BLOB" TST-MANUAL 2>"$MANUAL_ONE_ERR")"; MANUAL_ONE_RC=$?
+if [[ "$MANUAL_ONE_RC" -eq 0 && -z "$MANUAL_ONE" ]] \
+    && grep -qx '\[MANUAL-PIPELINE\] story=TST-MANUAL skipped=recovery_scan' "$MANUAL_ONE_ERR"; then
+  pass "an orphan-lock request for the manual row selects nothing and reports the skip"
+else
+  fail "an orphan-lock request for the manual row returned '$MANUAL_ONE' (rc=$MANUAL_ONE_RC)"
+fi
+if [[ "$(forward_enumerate_snapshot "$MANUAL_SNAP" "$SOURCE_SHA" "$MANUAL_BLOB" TST-AUTO 2>/dev/null)" == TST-AUTO ]]; then
+  pass "an orphan-lock request for a non-manual row is unchanged"
+else
+  fail "an orphan-lock request for a non-manual row no longer returns it"
+fi
+
 echo ""
 echo "Classifier results: $PASS_COUNT passed, $FAIL_COUNT failed"
 [[ "$FAIL_COUNT" -eq 0 ]]

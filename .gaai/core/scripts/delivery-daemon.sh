@@ -3554,6 +3554,16 @@ _forward_recovery_one() {
       "$zero_digest" none || return 4
     return 1
   fi
+  # The row may have been switched to manual after the scan enumerated it:
+  # re-check on the snapshot this recovery acts on, and leave it untouched.
+  local manual_ids manual_rc=0
+  manual_ids=$(forward_enumerate_snapshot "$_FORWARD_SNAPSHOT" "$_FORWARD_SOURCE" \
+    "$_FORWARD_BLOB" "$sid" 2>/dev/null) || manual_rc=$?
+  if [[ "$manual_rc" -eq 0 && -z "$manual_ids" ]]; then
+    _manual_pipeline_skip_log "$sid" recovery_scan
+    rm -f "$_FORWARD_SNAPSHOT"
+    return 0
+  fi
   admitted_source="$_FORWARD_SOURCE"
   admitted_blob="$_FORWARD_BLOB"
   admitted_record="$_FORWARD_RECORD_DIGEST"
@@ -4079,6 +4089,37 @@ _forward_recovery_one() {
   rm -f "$_FORWARD_SNAPSHOT"
 }
 
+# A delivery_pipeline: manual row is owned by a human or another session; the
+# daemon never claims, resumes or settles it. Each skip is logged once per row
+# and site for the life of this daemon process, so a scan that repeats every
+# cycle does not flood the log. Nothing is written to disk.
+_MANUAL_PIPELINE_LOGGED=" "
+_manual_pipeline_skip_log() {
+  local sid="$1" site="$2"
+  case "${_MANUAL_PIPELINE_LOGGED:- }" in
+    *" ${sid}:${site} "*) return 0 ;;
+  esac
+  _MANUAL_PIPELINE_LOGGED="${_MANUAL_PIPELINE_LOGGED:- }${sid}:${site} "
+  log "[MANUAL-PIPELINE] story=${sid} skipped=${site} (owned by a human or another session; any daemon lock is preserved, remove it when the manual owner finishes)"
+}
+
+# Relays the classifier's stderr: [MANUAL-PIPELINE] lines go to the daemon log
+# (once per row), anything else passes through to stderr unchanged.
+_manual_pipeline_relay() {
+  local file="$1" line sid site
+  local re='^\[MANUAL-PIPELINE\] story=([A-Za-z][A-Za-z0-9._-]*) skipped=([a-z_]+)$'
+  [[ -s "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ $re ]]; then
+      sid="${BASH_REMATCH[1]}"; site="${BASH_REMATCH[2]}"
+      _manual_pipeline_skip_log "$sid" "$site"
+    else
+      printf '%s\n' "$line" >&2
+    fi
+  done < "$file"
+  return 0
+}
+
 forward_recovery_scan() {
   local only_sid=""
   if [[ "${1:-}" == --only-sid ]]; then
@@ -4096,14 +4137,17 @@ forward_recovery_scan() {
       || ! git -C "$PROJECT_DIR" show "${source}:${BACKLOG_REL}" > "$index" 2>/dev/null; then
     rm -f "$index"; return 1
   fi
+  local skipped
+  skipped=$(mktemp "$LOCK_DIR/.forward-skipped-XXXXXX" 2>/dev/null) || { rm -f "$index"; return 1; }
   if [[ -n "$only_sid" ]]; then
-    ids=$(forward_enumerate_snapshot "$index" "$source" "$blob" "$only_sid") \
-      || { rm -f "$index"; return 1; }
+    ids=$(forward_enumerate_snapshot "$index" "$source" "$blob" "$only_sid" 2>"$skipped") \
+      || { _manual_pipeline_relay "$skipped"; rm -f "$index" "$skipped"; return 1; }
   else
-    ids=$(forward_enumerate_snapshot "$index" "$source" "$blob") \
-      || { rm -f "$index"; return 1; }
+    ids=$(forward_enumerate_snapshot "$index" "$source" "$blob" 2>"$skipped") \
+      || { _manual_pipeline_relay "$skipped"; rm -f "$index" "$skipped"; return 1; }
   fi
-  rm -f "$index"
+  _manual_pipeline_relay "$skipped"
+  rm -f "$index" "$skipped"
   [[ -z "$ids" ]] && return 0
   while IFS= read -r sid; do
     [[ -n "$sid" ]] || continue
@@ -4526,15 +4570,29 @@ import sys
 content = sys.stdin.read()
 sid = '${_pr_sid}'
 in_story = False
+pr_url = ''
+pipeline = ''
 for line in content.splitlines():
     s = line.strip()
     if s.startswith('- id:'):
+        if in_story:
+            break
         in_story = s.split(':',1)[1].strip() == sid
-    elif in_story and s.startswith('pr_url:'):
-        val = s.split(':',1)[1].strip().strip('\"').strip(\"'\")
-        if val: print(val)
-        break
+    elif in_story and s.startswith('pr_url:') and not pr_url:
+        pr_url = s.split(':',1)[1].strip().strip('\"').strip(\"'\")
+    elif in_story and s.startswith('delivery_pipeline:') and not pipeline:
+        pipeline = s.split(':',1)[1].replace('\t',' ').split(' #',1)[0].strip().strip('\"').strip(\"'\")
+if pipeline == 'manual':
+    print('MANUAL')
+elif pr_url:
+    print(pr_url)
 " 2>/dev/null || true)
+      # A manual row is owned by a human or another session: the daemon never
+      # reconciles or cleans up its pull request.
+      if [[ "$_pr_url" == MANUAL ]]; then
+        _manual_pipeline_skip_log "$_pr_sid" pr_watcher
+        continue
+      fi
       [[ -n "$_pr_url" ]] && story_pr_pairs+="${_pr_sid}|${_pr_url}"$'\n'
     done <<< "$_ip_ids_for_pr"
     story_pr_pairs="${story_pr_pairs%$'\n'}"
@@ -4813,6 +4871,14 @@ remote_sha=\$(git rev-parse "origin/$TARGET_BRANCH" 2>/dev/null) || exit 1
 snapshot=\$(mktemp)
 git show "\${remote_sha}:$BACKLOG_REL" > "\$snapshot" 2>/dev/null || exit 1
 
+# The row may have been switched to manual since the candidate list was read:
+# re-check on the snapshot this reconciliation would write against, before any
+# other outcome. Exit 3 is reserved for this case: the caller leaves the row,
+# its PR and its worktree untouched.
+remote_pipeline=\$(awk -v sid="$sid" '/^- id:/{inb=(\$3==sid); next} inb && /^  delivery_pipeline:/{v=\$0; sub(/^  delivery_pipeline:[ \t]*/,"",v); sub(/[ \t]+#.*/,"",v); print v; exit}' "\$snapshot" 2>/dev/null | tr -d "\"'" | tr -d '[:space:]')
+if [[ "\$remote_pipeline" == "manual" ]]; then
+  exit 3
+fi
 remote_status=\$(backlog_status "$sid" "\$snapshot" 2>/dev/null || true)
 if [[ "\$remote_status" == "done" ]]; then
   exit 0
@@ -4824,9 +4890,9 @@ fi
 
 _merged_pr_is_current_cycle "$sid" "$pr_created_at" "$merged_at" "$pr_number" "\$snapshot" || exit 1
 
-"$SCHEDULER" --set-field "$sid" status done "\$snapshot" >/dev/null
-"$SCHEDULER" --set-field "$sid" phase_status done "\$snapshot" >/dev/null
-"$SCHEDULER" --set-field "$sid" completed_at "$merged_at" "\$snapshot" >/dev/null
+"$SCHEDULER" --set-field "$sid" status done "\$snapshot" >/dev/null || exit 1
+"$SCHEDULER" --set-field "$sid" phase_status done "\$snapshot" >/dev/null || exit 1
+"$SCHEDULER" --set-field "$sid" completed_at "$merged_at" "\$snapshot" >/dev/null || exit 1
 
 index_file=\$(mktemp)
 rm -f "\$index_file"
@@ -4847,6 +4913,11 @@ RECONCILE_EOF
   local rc=0
   with_staging_lock bash "$reconcile_script" 2>>"${LOG_FILE:-/dev/null}" || rc=$?
   rm -f "$reconcile_script" 2>/dev/null || true
+
+  if [[ $rc -eq 3 ]]; then
+    _manual_pipeline_skip_log "$sid" pr_watcher
+    return 0
+  fi
 
   if [[ $rc -ne 0 ]]; then
     # AC3: distinct error class via a surviving channel (this daemon log line +

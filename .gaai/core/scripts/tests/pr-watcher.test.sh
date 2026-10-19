@@ -177,6 +177,7 @@ eval "\$(awk '
   /^_merged_pr_started_at\(\)/{p=1; depth=0}
   /^_merged_pr_is_current_cycle\(\)/{p=1; depth=0}
   /^_reconcile_merged_pr\(\)/{p=1; depth=0}
+  /^_manual_pipeline_skip_log\(\)/{p=1; depth=0}
   p {
     print
     for (i=1; i<=length(\$0); i++) {
@@ -286,6 +287,75 @@ else
   fail "T2: completed_at field missing"
 fi
 rm -f "$T2_HARNESS"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# T2M: the same merged PR on a manual row → untouched, and the skip is logged
+# ═══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "=== T2M: a manual row (quoted value) is never reconciled, even when its PR is merged ==="
+
+T2M_DIR="$FIXTURE_DIR/t2m-project"
+T2M_LOCK="$FIXTURE_DIR/t2m-locks"
+T2M_LOG="$FIXTURE_DIR/t2m.log"
+T2M_MOCK_GH="$FIXTURE_DIR/t2m-mock-gh"
+mkdir -p "$T2M_LOCK"
+touch "$T2M_LOG"
+
+T2M_SID="T2M-STORY-03"
+T2M_YAML="- id: $T2M_SID
+  status: in_progress
+  phase_status: qa_passed
+  pr_url: https://github.com/org/repo/pull/77
+  delivery_pipeline: \"manual\"	# delivered by another session
+  started_at: \"2026-05-11T08:00:00Z\""
+
+setup_git_repo "$T2M_DIR" "$T2M_YAML"
+create_mock_gh "$T2M_MOCK_GH"
+export MOCK_GH_RESPONSE='{"mergedAt":"2026-05-11T10:00:00Z","state":"MERGED","baseRefName":"staging","createdAt":"2026-05-11T09:00:00Z"}'
+export MOCK_GH_EXIT=0
+
+T2M_HARNESS=$(mktemp "$FIXTURE_DIR/t2m-XXXXXX")
+build_harness "$T2M_HARNESS" "$T2M_DIR" "$T2M_LOCK" "$T2M_LOG" "$T2M_MOCK_GH"
+printf 'watch_pr_merge_status\n' >> "$T2M_HARNESS"
+chmod +x "$T2M_HARNESS"
+bash "$T2M_HARNESS" 2>/dev/null
+
+T2M_BACKLOG=$(git -C "$T2M_DIR" show "origin/staging:.gaai/project/contexts/backlog/active.backlog.yaml" 2>/dev/null || true)
+T2M_STATUS=$(printf '%s\n' "$T2M_BACKLOG" | grep "status:" | head -1 | awk '{print $2}')
+T2M_PHASE=$(printf '%s\n' "$T2M_BACKLOG" | grep "phase_status:" | head -1 | awk '{print $2}')
+if [[ "$T2M_STATUS" == "in_progress" && "$T2M_PHASE" == "qa_passed" ]] \
+    && ! printf '%s\n' "$T2M_BACKLOG" | grep -q "completed_at:"; then
+  pass "T2M: the manual row stays in_progress/qa_passed although its PR is merged"
+else
+  fail "T2M: the manual row was reconciled (status='$T2M_STATUS' phase='$T2M_PHASE')"
+fi
+if grep -q "\[MANUAL-PIPELINE\] story=$T2M_SID skipped=pr_watcher" "$T2M_LOG"; then
+  pass "T2M: the skip is logged with the story and the site"
+else
+  fail "T2M: no [MANUAL-PIPELINE] line in the watcher log"
+fi
+rm -f "$T2M_HARNESS"
+
+# T2R: the reconciliation itself re-checks the bound snapshot, so a row switched
+# to manual after the candidate list was read is still left untouched.
+T2R_LOG="$FIXTURE_DIR/t2r.log"; touch "$T2R_LOG"
+T2R_WT="$FIXTURE_DIR/t2r-worktrees/${T2M_SID}-workspace"
+mkdir -p "$T2R_WT" && : > "$T2R_WT/owned-by-the-manual-session"
+T2R_HARNESS=$(mktemp "$FIXTURE_DIR/t2r-XXXXXX")
+build_harness "$T2R_HARNESS" "$T2M_DIR" "$T2M_LOCK" "$T2R_LOG" "$T2M_MOCK_GH"
+printf 'GAAI_WORKTREES_BASE=%q _reconcile_merged_pr %s 2026-05-11T10:00:00Z 77 2026-05-11T09:00:00Z; echo "T2R_RC=$?"\n' "$FIXTURE_DIR/t2r-worktrees" "$T2M_SID" >> "$T2R_HARNESS"
+chmod +x "$T2R_HARNESS"
+T2R_OUT=$(bash "$T2R_HARNESS" 2>/dev/null)
+T2R_BACKLOG=$(git -C "$T2M_DIR" show "origin/staging:.gaai/project/contexts/backlog/active.backlog.yaml" 2>/dev/null || true)
+if [[ "$T2R_OUT" == *"T2R_RC=0"* ]] \
+    && [[ "$(printf '%s\n' "$T2R_BACKLOG" | grep "status:" | head -1 | awk '{print $2}')" == in_progress ]] \
+    && grep -q "\[MANUAL-PIPELINE\] story=$T2M_SID skipped=pr_watcher" "$T2R_LOG" \
+    && [[ -f "$T2R_WT/owned-by-the-manual-session" ]]; then
+  pass "T2R: a direct reconciliation of a manual row writes nothing, keeps its worktree and logs the skip"
+else
+  fail "T2R: the reconciliation of a manual row was not refused ($T2R_OUT)"
+fi
+rm -f "$T2R_HARNESS"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # T3: gh returns state:CLOSED + mergedAt:null → .pr-abandoned.audit + flag, no double-emit
