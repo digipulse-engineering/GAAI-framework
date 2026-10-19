@@ -14,6 +14,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The suite owns its whole environment. A corpus runner or delivery wrapper can
+# hand it a HOME shared with other live processes, git redirection variables and
+# journal knobs; none of them may reach the fixtures or the emitters.
+export HOME="$TEST_ROOT/home"
+mkdir -p "$HOME"
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CEILING_DIRECTORIES GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT \
+  XDG_CONFIG_HOME
+unset GAAI_BACKLOG_JOURNAL_DIR GAAI_BACKLOG_JOURNAL_FAULT GAAI_BACKLOG_JOURNAL_SOURCE_REF \
+  GAAI_BACKLOG_JOURNAL_RUN_TOKEN GAAI_BACKLOG_JOURNAL_WRITER_CONTEXT
+
 pass() {
   set +e
   PASS_COUNT=$((PASS_COUNT + 1))
@@ -521,27 +533,85 @@ set -e
   && pass "journal storage failure is typed" || fail "journal storage failure"
 
 # Concurrent same-writer processes receive a contiguous, unique sequence.
+# Every emitter loads the library, reports ready and blocks; all are released
+# together, so each run exercises real contention instead of whatever overlap
+# the scheduler happens to produce. Both sides wait on observable conditions,
+# never on a fixed sleep: an emitter waits for the release file while this shell
+# lives, and this shell waits until every emitter is ready or one has exited.
+# BACKLOG_JOURNAL_TEST_BARRIER_SECONDS only caps that wait so a wedged emitter
+# cannot hold the corpus; expiry releases the barrier and asserts nothing. Each
+# emitter keeps its exit status, result line and typed diagnostics, and a
+# failure prints them, so the corpus log names the rejection reason.
 export GAAI_BACKLOG_JOURNAL_DIR="$TEST_ROOT/journal-concurrent"
 backlog_journal_begin_run "$BACKLOG" daemon.concurrent
 CONCURRENT_TOKEN="$BACKLOG_JOURNAL_RUN_TOKEN"
+CONCURRENT_DIR="$TEST_ROOT/concurrent"
+CONCURRENT_IDS="01 02 03 04 05 06 07 08"
+mkdir -p "$CONCURRENT_DIR"
 PIDS=""
-for n in 01 02 03 04 05 06 07 08; do
-  /bin/bash -c 'source "$1"; backlog_journal_emit "$2" "$3" pr_status open daemon.concurrent "$4"' \
-    _ "$LIB" "$BACKLOG" "C$n" "$CONCURRENT_TOKEN" \
-    >"$TEST_ROOT/concurrent-$n.out" 2>"$TEST_ROOT/concurrent-$n.err" &
-  PIDS="$PIDS $!"
+for n in $CONCURRENT_IDS; do
+  /bin/bash -c '
+    source "$1" || exit 96
+    : > "$5/ready-$3"
+    while [[ ! -e "$5/go" ]]; do
+      kill -0 "$6" 2>/dev/null || exit 97
+      sleep 0.05
+    done
+    backlog_journal_emit "$2" "C$3" pr_status open daemon.concurrent "$4"' \
+    _ "$LIB" "$BACKLOG" "$n" "$CONCURRENT_TOKEN" "$CONCURRENT_DIR" "$$" \
+    >"$CONCURRENT_DIR/$n.out" 2>"$CONCURRENT_DIR/$n.err" &
+  PIDS="$PIDS $n:$!"
 done
+CONCURRENT_CAP="${BACKLOG_JOURNAL_TEST_BARRIER_SECONDS:-300}"
+if [[ ! "$CONCURRENT_CAP" =~ ^[0-9]+$ ]]; then
+  printf 'BACKLOG_JOURNAL_TEST_BARRIER_SECONDS=%s is not a whole number of seconds; using 300\n' "$CONCURRENT_CAP" >&2
+  CONCURRENT_CAP=300
+fi
+CONCURRENT_DEADLINE=$((SECONDS + CONCURRENT_CAP))
+while :; do
+  CONCURRENT_READY=0 CONCURRENT_ALIVE=0
+  for n in $CONCURRENT_IDS; do [[ -e "$CONCURRENT_DIR/ready-$n" ]] && CONCURRENT_READY=$((CONCURRENT_READY + 1)); done
+  for entry in $PIDS; do kill -0 "${entry#*:}" 2>/dev/null && CONCURRENT_ALIVE=$((CONCURRENT_ALIVE + 1)); done
+  [[ $CONCURRENT_READY -eq 8 || $CONCURRENT_ALIVE -lt 8 || $SECONDS -ge $CONCURRENT_DEADLINE ]] && break
+  sleep 0.05
+done
+: > "$CONCURRENT_DIR/go"
 CONCURRENT_OK=true
-for pid in $PIDS; do wait "$pid" || CONCURRENT_OK=false; done
-$CONCURRENT_OK && pass "concurrent emissions all complete" || fail "concurrent emission process"
-CONCURRENT_RECORDS_DIR="$(find "$GAAI_BACKLOG_JOURNAL_DIR/writers" -type d -name records | head -1)"
+CONCURRENT_STATUS=""
+for entry in $PIDS; do
+  CONCURRENT_RC=0
+  wait "${entry#*:}" || CONCURRENT_RC=$?
+  [[ $CONCURRENT_RC -eq 0 ]] || CONCURRENT_OK=false
+  CONCURRENT_STATUS="$CONCURRENT_STATUS ${entry%%:*}=$CONCURRENT_RC"
+done
+concurrent_evidence() {
+  local n
+  printf 'concurrent evidence: ready_at_release=%s/8 exit=%s\n' "$CONCURRENT_READY" "${CONCURRENT_STATUS# }" >&2
+  for n in $CONCURRENT_IDS; do
+    printf -- '--- emitter %s stdout\n' "$n" >&2; cat "$CONCURRENT_DIR/$n.out" >&2
+    printf -- '--- emitter %s stderr\n' "$n" >&2; cat "$CONCURRENT_DIR/$n.err" >&2
+  done
+}
+$CONCURRENT_OK && pass "concurrent emissions all complete" \
+  || { fail "concurrent emission process"; concurrent_evidence; }
+CONCURRENT_RECORDS_DIR="$(find "$GAAI_BACKLOG_JOURNAL_DIR/writers" -type d -name records 2>/dev/null | head -1)"
 if python3 - "$CONCURRENT_RECORDS_DIR" <<'PY'
 import glob, json, os, sys
+if not sys.argv[1] or not os.path.isdir(sys.argv[1]):
+    print("concurrent evidence: records=0 sequences=[] (records dir absent)", file=sys.stderr)
+    raise SystemExit(1)
 paths = sorted(glob.glob(os.path.join(sys.argv[1], "*.json")))
 seq = sorted(json.load(open(path))["record"]["sequence"] for path in paths)
-raise SystemExit(0 if len(paths) == 8 and seq == list(range(1, 9)) else 1)
+if len(paths) == 8 and seq == list(range(1, 9)):
+    raise SystemExit(0)
+print(f"concurrent evidence: records={len(paths)} sequences={seq}", file=sys.stderr)
+raise SystemExit(1)
 PY
-then pass "concurrent sequence is contiguous and fork-free"; else fail "concurrent sequence integrity"; fi
+then pass "concurrent sequence is contiguous and fork-free"
+else
+  fail "concurrent sequence integrity"
+  $CONCURRENT_OK && concurrent_evidence
+fi
 
 # Historical records retain their original registered-token provenance.
 export GAAI_BACKLOG_JOURNAL_DIR="$TEST_ROOT/journal-historical-token"

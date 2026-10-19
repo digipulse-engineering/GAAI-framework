@@ -4,10 +4,11 @@
 #
 # One selected, attested interpreter runs each YAML operation exactly once. The
 # vendored runtime archive is opened without following links, verified against the
-# manifest that ships beside it, and imported through the descriptor that was
-# verified — never through a pathname that could be re-pointed in between. Nothing
-# here downloads, installs, updates, invokes a package manager, or falls back to an
-# ambient interpreter or an ambient parser.
+# manifest that ships beside it, and imported from those very bytes, held in memory —
+# never through a pathname, and never through a descriptor path, that could be
+# re-pointed or re-read in between. Nothing here downloads, installs, updates,
+# invokes a package manager, or falls back to an ambient interpreter or an ambient
+# parser.
 #
 # Public entries
 #   yaml_runtime_run <argv...>              program on stdin, argv after it
@@ -394,6 +395,8 @@ _yr_require_tuple_present() {
 # ── The single-process bootstrap ─────────────────────────────────────────────
 read -r -d '' _YR_BOOTSTRAP <<'PYEOF' || true
 import hashlib
+import importlib.abc
+import importlib.util
 import io
 import json
 import os
@@ -415,6 +418,7 @@ EXACT_FILE_MODE = 0o644
 MANIFEST_MAX_BYTES = 1 << 20  # 1 MiB; spelled as a shift so no digit run resembles an identifier
 RUNTIME_VERSION = "6.0.3"
 PROGRAM_NAME = "<gaai-yaml-runtime>"
+RUNTIME_ORIGIN = "<gaai-yaml-runtime-archive>"
 
 TOP_KEYS = {
     "schema_version", "upstream", "framework", "licence", "builder", "archive",
@@ -702,38 +706,43 @@ def load_manifest(manifest_path):
 
 
 def verify_archive(archive_path, manifest):
+    """Verify the archive and return its members, keyed by declared path.
+
+    Every returned payload is the one read while its digest was checked, so what
+    is later imported is exactly what was hashed. Nothing reopens the file.
+    """
     output = manifest["output"]
     fd, data = open_verified(archive_path, ASSET, expected_size=output["size_bytes"])
+    os.close(fd)
+    if hashlib.sha256(data).hexdigest() != output["sha256"]:
+        fail(ASSET)
+    # Declared-versus-actual member census: an archive whose contents do not
+    # match the manifest exactly is refused even when its own bytes are
+    # internally consistent.
+    members = {}
     try:
-        if hashlib.sha256(data).hexdigest() != output["sha256"]:
-            fail(ASSET)
-        # Declared-versus-actual member census: an archive whose contents do not
-        # match the manifest exactly is refused even when its own bytes are
-        # internally consistent.
-        try:
-            with zipfile.ZipFile(io.BytesIO(data)) as zf:
-                names = zf.namelist()
-                declared = [member["path"] for member in manifest["archive"]["members"]]
-                if names != declared or len(set(names)) != len(names):
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = zf.namelist()
+            declared = [member["path"] for member in manifest["archive"]["members"]]
+            if names != declared or len(set(names)) != len(names):
+                fail(ASSET)
+            for member in manifest["archive"]["members"]:
+                info = zf.getinfo(member["path"])
+                if info.compress_type != zipfile.ZIP_STORED:
                     fail(ASSET)
-                for member in manifest["archive"]["members"]:
-                    info = zf.getinfo(member["path"])
-                    if info.compress_type != zipfile.ZIP_STORED:
-                        fail(ASSET)
-                    if info.file_size != member["size_bytes"]:
-                        fail(ASSET)
-                    if stat.S_IMODE(info.external_attr >> 16) != EXACT_FILE_MODE:
-                        fail(ASSET)
-                    if hashlib.sha256(zf.read(member["path"])).hexdigest() != member["sha256"]:
-                        fail(ASSET)
-        except SystemExit:
-            raise
-        except Exception:
-            fail(ASSET)
+                if info.file_size != member["size_bytes"]:
+                    fail(ASSET)
+                if stat.S_IMODE(info.external_attr >> 16) != EXACT_FILE_MODE:
+                    fail(ASSET)
+                payload = zf.read(member["path"])
+                if hashlib.sha256(payload).hexdigest() != member["sha256"]:
+                    fail(ASSET)
+                members[member["path"]] = payload
     except SystemExit:
-        os.close(fd)
         raise
-    return fd
+    except Exception:
+        fail(ASSET)
+    return members
 
 
 def verify_licence(manifest_path, manifest):
@@ -747,34 +756,78 @@ def verify_licence(manifest_path, manifest):
         fail(ASSET)
 
 
-def import_runtime(fd):
-    if sys.platform == "darwin":
-        fd_path = "/dev/fd/%d" % fd
-    elif sys.platform.startswith("linux"):
-        fd_path = "/proc/self/fd/%d" % fd
-    else:
-        fail(PLATFORM)
-    try:
-        probe = os.stat(fd_path)
-        if not stat.S_ISREG(probe.st_mode):
-            fail(PLATFORM)
-    except SystemExit:
-        raise
-    except OSError:
+class VerifiedArchiveImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Serve the runtime's modules from the member bytes that were verified.
+
+    The runtime is not imported through a filesystem path or a descriptor path.
+    On macOS, stat(2) on /dev/fd/N intermittently fails with EBADF when several
+    processes do it at once, and both the platform probe and zipimport's own stat
+    of that path hit it, so a valid archive was refused. Serving the hashed bytes
+    directly removes that seam, and also the window between the digest and a
+    re-read: the code that runs is the code that was checked.
+    """
+
+    def __init__(self, members):
+        self._modules = {}
+        for path, payload in members.items():
+            # Only the declared yaml package is served. A member anywhere else
+            # would otherwise become importable ahead of the standard library.
+            if not path.startswith("yaml/"):
+                fail(IMPORT_FAILED)
+            if not path.endswith(".py"):
+                continue
+            parts = path[:-3].split("/")
+            package = parts[-1] == "__init__"
+            if package:
+                parts = parts[:-1]
+            if not parts or not all(part.isidentifier() for part in parts):
+                fail(IMPORT_FAILED)
+            name = ".".join(parts)
+            if name in self._modules:
+                fail(IMPORT_FAILED)
+            self._modules[name] = (payload, package, RUNTIME_ORIGIN + "/" + path)
+
+    def find_spec(self, fullname, path=None, target=None):
+        entry = self._modules.get(fullname)
+        if entry is None:
+            return None
+        return importlib.util.spec_from_loader(
+            fullname, self, origin=entry[2], is_package=entry[1],
+        )
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        payload, _package, origin = self._modules[module.__spec__.name]
+        exec(compile(payload, origin, "exec", dont_inherit=True), module.__dict__)
+
+    def is_package(self, fullname):
+        return self._modules[fullname][1]
+
+    def get_source(self, fullname):
+        return importlib.util.decode_source(self._modules[fullname][0])
+
+
+def import_runtime(members):
+    if not (sys.platform == "darwin" or sys.platform.startswith("linux")):
         fail(PLATFORM)
     cwd = os.getcwd()
     sys.path[:] = [
         entry for entry in sys.path if entry not in ("", ".", cwd)
     ]
-    sys.path.insert(0, fd_path)
+    importer = VerifiedArchiveImporter(members)
+    sys.meta_path.insert(0, importer)
     try:
         import yaml
     except Exception:
         fail(IMPORT_FAILED)
     if getattr(yaml, "__version__", None) != RUNTIME_VERSION:
         fail(IMPORT_FAILED)
-    if not str(getattr(yaml, "__file__", "")).startswith(fd_path):
-        fail(IMPORT_FAILED)
+    for name, module in list(sys.modules.items()):
+        if name == "yaml" or name.startswith("yaml."):
+            if getattr(getattr(module, "__spec__", None), "loader", None) is not importer:
+                fail(IMPORT_FAILED)
     return yaml
 
 
@@ -798,8 +851,8 @@ caller = sys.argv[6:]
 
 attest_interpreter(declared, trust)
 manifest = load_manifest(manifest_path)
-archive_fd = verify_archive(archive_path, manifest)
-yaml_module = import_runtime(archive_fd)
+archive_members = verify_archive(archive_path, manifest)
+yaml_module = import_runtime(archive_members)
 
 if mode == "verify":
     verify_licence(manifest_path, manifest)
@@ -940,7 +993,7 @@ PYEOF
 # ── The dedicated mode-normalization program ─────────────────────────────────
 # It repairs exactly the tuple the bootstrap refuses, so it deliberately runs
 # neither through the bootstrap nor through any YAML entry: it opens no manifest,
-# opens and digests no archive, inserts no retained-descriptor path entry and
+# opens and digests no archive, inserts no descriptor path entry and
 # never imports the parser. Its only imports are standard library.
 read -r -d '' _YR_NORMALIZE <<'PYEOF' || true
 import os
