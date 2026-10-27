@@ -2285,6 +2285,29 @@ check_agent_activity_stale() {
     # Agent healthy: at least one phase log was updated recently
     (( log_age <= AGENT_HANG_THRESHOLD_SEC )) && continue
 
+    # An admission gate is silent by design: the complete corpus writes to none
+    # of the logs tracked above for 24-40 minutes. The gate publishes
+    # .admission-gate-active.<wrapper pid> for as long as it executes and
+    # removes it when it returns, success or failure (_local_admission_gate in
+    # daemon-dispatch.sh). The wrapper is alive (checked above), and a marker
+    # that is not older than its lock was written by this wrapper, not left by an
+    # earlier process whose pid the system has reused. This sits after the
+    # staleness decision, so it logs and applies only when a kill would
+    # otherwise follow. It suspends hang detection for the whole marked window:
+    # the admission commands carry their own timeouts, but the gate's fetch,
+    # resolve and seal steps do not. A hang after the gate is detected as before.
+    local _gate_marker="$LOCK_DIR/.admission-gate-active.${pid}"
+    if [[ -f "$_gate_marker" && ! "$lock" -nt "$_gate_marker" ]]; then
+      case "${_AGENT_HANG_EXEMPT_LOGGED:- }" in
+        *" ${sid}:${pid} "*) ;;
+        *)
+          _AGENT_HANG_EXEMPT_LOGGED="${_AGENT_HANG_EXEMPT_LOGGED:- }${sid}:${pid} "
+          log "[AGENT_HANG_EXEMPT] $sid — admission gate in flight (marker not older than lock)"
+          ;;
+      esac
+      continue
+    fi
+
     # Hang detected — use the most-recent phase log for size telemetry
     local log_size=0
     log_size=$(wc -c < "$_latest_log" 2>/dev/null | tr -d ' ' || echo 0)
