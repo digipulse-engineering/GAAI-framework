@@ -267,22 +267,30 @@ reset_nominal
 expect_outcome "nominal exact current aggregate" hosted_pass
 
 POLICY_UNDER_TEST="$PROJECT_DIR/.gaai/project/ci/premerge-authority.json"
-POLICY_CLOSURE_OK=true
-while IFS= read -r required_path; do
-  jq -e --arg path "$required_path" \
-    '.covered_paths | index($path) != null' "$POLICY_UNDER_TEST" >/dev/null \
-    || POLICY_CLOSURE_OK=false
-done < <(_test_gate_required_controller_paths)
-[[ "$POLICY_CLOSURE_OK" == "true" ]] \
-  && pass "project policy covers the controller execution/source closure" \
-  || fail "project policy omits a required controller execution/source path"
+# The project policy is project state, not part of the public framework tree. The
+# public tree ships .gaai/project as a scaffold without a ci/ directory, so it cannot
+# be asked about the policy. A project checkout has ci/ and still fails loudly when
+# the policy file or a path in it is missing.
+if [[ -d "$PROJECT_DIR/.gaai/project/ci" ]]; then
+  POLICY_CLOSURE_OK=true
+  while IFS= read -r required_path; do
+    jq -e --arg path "$required_path" \
+      '.covered_paths | index($path) != null' "$POLICY_UNDER_TEST" >/dev/null \
+      || POLICY_CLOSURE_OK=false
+  done < <(_test_gate_required_controller_paths)
+  [[ "$POLICY_CLOSURE_OK" == "true" ]] \
+    && pass "project policy covers the controller execution/source closure" \
+    || fail "project policy omits a required controller execution/source path"
 
-JOURNAL_POLICY_PATH=".gaai/core/scripts/lib/backlog-journal.sh"
-if jq -e --arg path "$JOURNAL_POLICY_PATH" \
-    '.covered_paths | index($path) != null' "$POLICY_UNDER_TEST" >/dev/null; then
-  pass "project policy registers the journal policy as a human-only trust surface"
+  JOURNAL_POLICY_PATH=".gaai/core/scripts/lib/backlog-journal.sh"
+  if jq -e --arg path "$JOURNAL_POLICY_PATH" \
+      '.covered_paths | index($path) != null' "$POLICY_UNDER_TEST" >/dev/null; then
+    pass "project policy registers the journal policy as a human-only trust surface"
+  else
+    fail "project policy omits the journal policy trust surface"
+  fi
 else
-  fail "project policy omits the journal policy trust surface"
+  echo "  SKIP: project policy assertions (no .gaai/project/ci in this checkout)"
 fi
 
 # Mechanical drift guard: resolve every statically named shell source in the
