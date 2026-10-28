@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- fix: guard project-policy assertions in the merge-gate test
 - fix: the agent-hang detector spares a wrapper inside its admission gate
 -: import the YAML runtime from the bytes it verified, not through a descriptor path
 -: make the journal concurrency case deterministic and self-explaining
