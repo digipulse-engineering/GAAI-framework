@@ -871,6 +871,38 @@ in_depends = False
 def _line_indent(s):
     return len(s) - len(s.lstrip(' '))
 
+def _read_scalar(raw):
+    # One YAML scalar after "key:". Returns ("null", None), ("str", value) or
+    # ("malformed", raw). Quoted content is kept as written, so a "#" or a quote
+    # inside the quotes never shortens it; anything after the closing quote must
+    # be a comment.
+    raw = raw.strip()
+    if raw[:1] in ('"', "'"):
+        q = raw[0]
+        i, out = 1, []
+        while i < len(raw):
+            c = raw[i]
+            if q == '"' and c == "\\" and i + 1 < len(raw):
+                out.append(raw[i:i + 2])
+                i += 2
+                continue
+            if c == q:
+                if q == "'" and raw[i + 1:i + 2] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                rest = raw[i + 1:]
+                if rest.strip() == "" or re.match(r"\s+#", rest):
+                    return ("str", "".join(out))
+                return ("malformed", raw)
+            out.append(c)
+            i += 1
+        return ("malformed", raw)
+    value = re.split(r"\s+#", raw, maxsplit=1)[0].strip() if not raw.startswith("#") else ""
+    if value in ("null", "~"):
+        return ("null", None)
+    return ("str", value)
+
 for line in content.splitlines():
     if not line.strip() or line.lstrip().startswith("#"):
         continue
@@ -907,6 +939,14 @@ for line in content.splitlines():
         in_depends = False
     elif stripped.startswith("status:"):
         current["status"] = stripped.split(":", 1)[1].strip().strip('"\'')
+        in_depends = False
+    elif re.match(r'["\']?pr_status["\']?\s*:', stripped):
+        # A second key at the same level, or a quoted or spaced key spelling, is
+        # not a value this reader can trust.
+        if "pr_status" in current or not stripped.startswith("pr_status:"):
+            current["pr_status"] = ("malformed", stripped)
+        else:
+            current["pr_status"] = _read_scalar(stripped.split(":", 1)[1])
         in_depends = False
     elif stripped.startswith("priority:"):
         current["priority"] = stripped.split(":", 1)[1].strip()
@@ -945,8 +985,19 @@ if current:
 
 # -- Helpers --
 priority_order = {"critical": -1, "high": 0, "medium": 1, "low": 2}
-done_ids = {i["id"] for i in items if i.get("status") in ("done", "cancelled", "superseded")}
-# Merge archived done IDs (stories moved out of active backlog)
+def _awaiting_merge(item):
+    # A done row whose pull request has not merged must not release its
+    # dependants: the commit phase can project done while the PR still awaits
+    # review, and a dependant claimed then starts from a target without its
+    # parent's code. Only an absent or null pr_status, or exactly "merged",
+    # counts as landed; anything else holds.
+    kind, value = item.get("pr_status", ("null", None))
+    return item.get("status") == "done" and not (kind == "null" or (kind == "str" and value == "merged"))
+
+done_ids = {i["id"] for i in items
+            if i.get("status") in ("done", "cancelled", "superseded") and not _awaiting_merge(i)}
+# Merge archived done IDs (stories moved out of active backlog). Archived rows
+# keep satisfying dependencies whatever their pr_status: history is not reread.
 if archived_done_ids_raw:
     done_ids.update(archived_done_ids_raw.split("\n"))
 
@@ -1027,9 +1078,15 @@ if mode == "graph":
 
         print(f'  {indicator} {item["id"]} [{priority}] \u2014 {title}')
         for dep in deps:
-            dep_status = next((i.get("status","?") for i in items if i["id"] == dep), "unknown")
+            dep_item = next((i for i in items if i["id"] == dep), None)
+            dep_status = dep_item.get("status", "?") if dep_item else "unknown"
             resolved = "\u2713" if dep in done_ids else "\u2717"
-            print(f'       \u2514\u2500 {resolved} depends on {dep} (status: {dep_status})')
+            held = ""
+            if dep_item and dep not in done_ids and _awaiting_merge(dep_item):
+                kind, value = dep_item["pr_status"]
+                shown = (value or '""') if kind == "str" else "<unreadable>"
+                held = f', pr_status: {shown}'
+            print(f'       \u2514\u2500 {resolved} depends on {dep} (status: {dep_status}{held})')
     print()
     print("Legend: \u2705 ready  \U0001f504 in-progress  \U0001f512 blocked  \u23f3 not yet refined/ready")
     sys.exit(0)
