@@ -2,7 +2,9 @@
 # test-allocate-id.sh — test suite for allocate-id.sh
 # Covers AC1 (concurrent uniqueness), AC2 (cross-worktree visibility),
 # AC3 (max over backlog AND ledger), AC4 (TTL + backlog prune),
-# AC5 (remote-ref scan folds in-flight branch IDs into the max + protects them from TTL-prune).
+# AC5 (remote-ref scan folds in-flight branch IDs into the max + protects them from TTL-prune),
+# and (Tests 26-28) archived IDs: the backlog max spans active + blocked + done/*.yaml, and epic/story
+# artefact files count as taken IDs.
 # Exit 0 = ALL TESTS PASSED. Exit 1 = one or more failures.
 
 set -euo pipefail
@@ -30,6 +32,11 @@ _fail() { echo "  FAIL: $1"; FAIL=$(( FAIL + 1 )); }
 # ── Temp workspace (auto-cleaned on exit) ─────────────────────────────────────
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# The allocator also counts epic/story artefact files, by default under the enclosing repository.
+# Point it at an empty location so tests run from inside a real checkout are not seeded by that
+# checkout's artefacts. Tests 20-24 unset it with the other overrides; Test 28 sets its own.
+export GAAI_ARTEFACTS_PATH="${WORK}/no-artefacts"
 
 # ── Fixture helpers ───────────────────────────────────────────────────────────
 _make_backlog() {
@@ -933,11 +940,11 @@ cat > "${T20_WT}/.gaai/project/contexts/backlog/active.backlog.yaml" <<'YAML'
 YAML
 
 ID_20A="$(
-  cd "$T20_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T20_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T20_HOME"; "$ALLOCATOR" epic
 )"
 ID_20B="$(
-  cd "$T20_WT"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T20_WT"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T20_HOME"; "$ALLOCATOR" epic
 )"
 
@@ -968,15 +975,15 @@ _empty_backlog "${T21_WT_B}/.gaai/project/contexts/backlog/active.backlog.yaml"
 
 T21_HOME_SEQ="${WORK}/t21-home-seq"; mkdir -p "$T21_HOME_SEQ"
 ID_21A="$(
-  cd "$T21_WT_A"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T21_WT_A"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T21_HOME_SEQ"; "$ALLOCATOR" epic
 )"
 ID_21B="$(
-  cd "$T21_WT_B"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T21_WT_B"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T21_HOME_SEQ"; "$ALLOCATOR" epic
 )"
 ID_21C="$(
-  cd "$T21_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T21_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T21_HOME_SEQ"; "$ALLOCATOR" epic
 )"
 
@@ -993,12 +1000,12 @@ T21_OUT_A="${WORK}/t21-out-a.txt"
 T21_OUT_B="${WORK}/t21-out-b.txt"
 
 (
-  cd "$T21_WT_A"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T21_WT_A"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T21_HOME_CONC"; "$ALLOCATOR" epic > "$T21_OUT_A" 2>/dev/null
 ) &
 PID_21A=$!
 (
-  cd "$T21_WT_B"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T21_WT_B"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T21_HOME_CONC"; "$ALLOCATOR" epic > "$T21_OUT_B" 2>/dev/null
 ) &
 PID_21B=$!
@@ -1028,11 +1035,11 @@ for r in "$T22_REPO_A" "$T22_REPO_B"; do
 done
 
 ID_22A="$(
-  cd "$T22_REPO_A"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T22_REPO_A"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T22_HOME"; "$ALLOCATOR" epic
 )"
 ID_22B="$(
-  cd "$T22_REPO_B"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T22_REPO_B"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T22_HOME"; "$ALLOCATOR" epic
 )"
 
@@ -1044,7 +1051,7 @@ fi
 
 mkdir -p "${T22_REPO_A}/sub/dir"
 ID_22C="$(
-  cd "${T22_REPO_A}/sub/dir"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "${T22_REPO_A}/sub/dir"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T22_HOME"; "$ALLOCATOR" epic
 )"
 
@@ -1090,7 +1097,7 @@ printf 'E40\tepic\t%s\n' "$NOW_T23" >> "$T23_LEGACY_LEDGER"
 # Run from the MAIN checkout (not the worktree whose legacy ledger was seeded) — proves
 # migration is driven by the repo's worktree list, not "which worktree ran the command".
 ID_23A="$(
-  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T23_HOME"; "$ALLOCATOR" epic
 )"
 
@@ -1109,7 +1116,7 @@ fi
 
 # Idempotency: run again — migrated row is not re-added (still exactly one copy).
 ID_23B="$(
-  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T23_HOME"; "$ALLOCATOR" epic
 )"
 T23_E40_COUNT="$(awk -F'\t' '$1=="E40"{c++} END{print c+0}' "$T23_NEW_LEDGER" 2>/dev/null)"
@@ -1139,7 +1146,7 @@ else
 fi
 
 ID_23C="$(
-  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T23_HOME"; "$ALLOCATOR" epic
 )"
 if [[ "$ID_23C" == "E81" ]]; then
@@ -1162,7 +1169,7 @@ printf 'E95\tepic\t%s\n' "$NOW_T23" >> "$T23_GONE_LEGACY_LEDGER"
 ( cd "$T23_REPO" && git worktree remove --force "$T23_WT_GONE" ) >/dev/null 2>&1
 
 ID_23D="$(
-  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+  cd "$T23_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T23_HOME"; "$ALLOCATOR" epic
 )"
 if [[ "$ID_23D" == "E82" ]]; then
@@ -1193,7 +1200,7 @@ chmod +x "${T24_SHIM1}/git"
 
 T24_STDERR1="${WORK}/t24-stderr1.txt"
 set +e
-( cd "$T24_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+( cd "$T24_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T24_HOME1"; PATH="${T24_SHIM1}:${PATH}" "$ALLOCATOR" epic ) >/dev/null 2>"$T24_STDERR1"
 T24_RC1=$?
 set -e
@@ -1229,7 +1236,7 @@ chmod +x "${T24_SHIM2}/git"
 
 T24_STDERR2="${WORK}/t24-stderr2.txt"
 set +e
-( cd "$T24_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+( cd "$T24_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T24_HOME2"; PATH="${T24_SHIM2}:${PATH}" "$ALLOCATOR" epic ) >/dev/null 2>"$T24_STDERR2"
 T24_RC2=$?
 set -e
@@ -1265,7 +1272,7 @@ chmod +x "${T24_SHIM3}/git"
 
 T24_STDERR3="${WORK}/t24-stderr3.txt"
 set +e
-( cd "$T24_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH
+( cd "$T24_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
   export HOME="$T24_HOME3"; PATH="${T24_SHIM3}:${PATH}" "$ALLOCATOR" epic ) >/dev/null 2>"$T24_STDERR3"
 T24_RC3=$?
 set -e
@@ -1305,6 +1312,145 @@ if grep -qi "migrat" "$ALLOCATOR" 2>/dev/null; then
   _pass "Header documents the migration of legacy per-worktree-keyed reservations"
 else
   _fail "Header does not mention migration of legacy reservations"
+fi
+
+# ── Test 26: archived story IDs are never re-issued ──────────────────────────
+# Regression: the story max used to read active.backlog.yaml alone, so once every story of an epic
+# was archived to done/*.yaml the allocator handed out that epic's first story ID again.
+echo "Test 26: archived-only story IDs are skipped (active + blocked + done/*.yaml)"
+
+T26="${WORK}/t26 backlog dir"            # space in the path: each backlog file must stay one argument
+mkdir -p "${T26}/done"
+T26_EPIC="E77"                           # built from variables: no literal story-ID pattern in source
+T26_OTHER="E3"
+T26_ACTIVE="${T26}/active.backlog.yaml"
+
+# _story_rows <epic> <status> <nn>... — print one backlog row per story number.
+_story_rows() {
+  local epic="$1" status="$2"; shift 2
+  local nn
+  for nn in "$@"; do
+    printf -- '- id: %sS%s\n  epic: %s\n  status: %s\n' "$epic" "$nn" "$epic" "$status"
+  done
+}
+
+# Active backlog holds another epic's row only; the target epic's done stories S01-S04 are archived.
+_story_rows "$T26_OTHER" refined 01 > "$T26_ACTIVE"
+_story_rows "$T26_EPIC" done 01 02 03 04 > "${T26}/done/archived-2000-01-01.yaml"
+
+R26A="$(GAAI_BACKLOG_PATH="$T26_ACTIVE" GAAI_RESERVATION_LEDGER="${WORK}/t26a.tsv" "$ALLOCATOR" story "$T26_EPIC")"
+if [[ "$R26A" == "${T26_EPIC}S05" ]]; then
+  _pass "Archived ${T26_EPIC}S01-S04 skipped (active has none of them) → ${R26A}"
+else
+  _fail "Expected ${T26_EPIC}S05 (S01-S04 archived in done/), got: ${R26A}"
+fi
+
+# A row parked in blocked.backlog.yaml is taken too.
+_story_rows "$T26_EPIC" blocked 06 > "${T26}/blocked.backlog.yaml"
+R26B="$(GAAI_BACKLOG_PATH="$T26_ACTIVE" GAAI_RESERVATION_LEDGER="${WORK}/t26b.tsv" "$ALLOCATOR" story "$T26_EPIC")"
+if [[ "$R26B" == "${T26_EPIC}S07" ]]; then
+  _pass "blocked.backlog.yaml row ${T26_EPIC}S06 counted → ${R26B}"
+else
+  _fail "Expected ${T26_EPIC}S07 (S06 in blocked.backlog.yaml), got: ${R26B}"
+fi
+
+# Every archive file is read, not only the first one the glob returns.
+_story_rows "$T26_EPIC" done 09 > "${T26}/done/archived-2000-02-01.yaml"
+R26C="$(GAAI_BACKLOG_PATH="$T26_ACTIVE" GAAI_RESERVATION_LEDGER="${WORK}/t26c.tsv" "$ALLOCATOR" story "$T26_EPIC")"
+if [[ "$R26C" == "${T26_EPIC}S10" ]]; then
+  _pass "Max taken across all done/*.yaml archives (S09 in the second) → ${R26C}"
+else
+  _fail "Expected ${T26_EPIC}S10 (S09 in a second archive), got: ${R26C}"
+fi
+
+# ── Test 27: archived epic IDs are never re-issued ───────────────────────────
+echo "Test 27: archived-only epic IDs are skipped (active + blocked + done/*.yaml)"
+
+T27="${WORK}/t27"; mkdir -p "${T27}/done"
+T27_ACTIVE="${T27}/active.backlog.yaml"
+_story_rows E10 refined 01 > "$T27_ACTIVE"
+_story_rows E40 done 01 02 > "${T27}/done/archived-2000-01-01.yaml"
+
+R27A="$(GAAI_BACKLOG_PATH="$T27_ACTIVE" GAAI_RESERVATION_LEDGER="${WORK}/t27a.tsv" "$ALLOCATOR" epic)"
+if [[ "$R27A" == "E41" ]]; then
+  _pass "Archived epic E40 outranks active E10 → ${R27A}"
+else
+  _fail "Expected E41 (E40 archived in done/, active max E10), got: ${R27A}"
+fi
+
+_story_rows E45 blocked 01 > "${T27}/blocked.backlog.yaml"
+R27B="$(GAAI_BACKLOG_PATH="$T27_ACTIVE" GAAI_RESERVATION_LEDGER="${WORK}/t27b.tsv" "$ALLOCATOR" epic)"
+if [[ "$R27B" == "E46" ]]; then
+  _pass "blocked.backlog.yaml epic E45 counted → ${R27B}"
+else
+  _fail "Expected E46 (E45 in blocked.backlog.yaml), got: ${R27B}"
+fi
+
+# ── Test 28: epic/story artefact files count as taken IDs ────────────────────
+echo "Test 28: epic/story artefact files count as taken IDs (no backlog row anywhere)"
+
+T28="${WORK}/t28"; mkdir -p "$T28"
+T28_EMPTY="${T28}/active.backlog.yaml"; _empty_backlog "$T28_EMPTY"
+T28_EPIC="E60"
+
+T28_ART="${T28}/artefacts"
+mkdir -p "${T28_ART}/epics" "${T28_ART}/stories"
+touch "${T28_ART}/stories/${T28_EPIC}S03.story.md" \
+      "${T28_ART}/stories/${T28_EPIC}S05a.story.md" \
+      "${T28_ART}/stories/${T28_EPIC}1S09.story.md" \
+      "${T28_ART}/stories/_template.story.md" \
+      "${T28_ART}/epics/_template.epic.md"
+
+# Story: the suffixed S05a file counts as S05; the S09 file belongs to a longer epic number sharing
+# the prefix digits and must not count.
+R28A="$(GAAI_BACKLOG_PATH="$T28_EMPTY" GAAI_ARTEFACTS_PATH="$T28_ART" \
+  GAAI_RESERVATION_LEDGER="${WORK}/t28a.tsv" "$ALLOCATOR" story "$T28_EPIC")"
+if [[ "$R28A" == "${T28_EPIC}S06" ]]; then
+  _pass "Story artefact files counted (suffixed S05a = S05, longer-epic S09 ignored) → ${R28A}"
+else
+  _fail "Expected ${T28_EPIC}S06 (story files S03 and S05a), got: ${R28A}"
+fi
+
+# Epic: a story file proves its epic exists, so the longer epic number's story file sets the max.
+R28B="$(GAAI_BACKLOG_PATH="$T28_EMPTY" GAAI_ARTEFACTS_PATH="$T28_ART" \
+  GAAI_RESERVATION_LEDGER="${WORK}/t28b.tsv" "$ALLOCATOR" epic)"
+if [[ "$R28B" == "E602" ]]; then
+  _pass "A story artefact file raises the epic max to its epic → ${R28B}"
+else
+  _fail "Expected E602 (story file under epic E601), got: ${R28B}"
+fi
+
+# Epic files, plain and suffixed (E70b, E12-name), count; templates do not.
+T28_ART2="${T28}/artefacts-epics"; mkdir -p "${T28_ART2}/epics"
+touch "${T28_ART2}/epics/E12-named-epic.epic.md" "${T28_ART2}/epics/E70b.epic.md" \
+      "${T28_ART2}/epics/_template.epic.md"
+R28C="$(GAAI_BACKLOG_PATH="$T28_EMPTY" GAAI_ARTEFACTS_PATH="$T28_ART2" \
+  GAAI_RESERVATION_LEDGER="${WORK}/t28c.tsv" "$ALLOCATOR" epic)"
+if [[ "$R28C" == "E71" ]]; then
+  _pass "Epic artefact files counted, suffixed E70b included → ${R28C}"
+else
+  _fail "Expected E71 (epic files E12-named-epic and E70b), got: ${R28C}"
+fi
+
+# Default resolution: with every override unset, the archive and artefacts of the repository the
+# allocator runs in are found under its standard layout.
+T28_REPO="${WORK}/t28-repo"; T28_HOME="${WORK}/t28-home"; mkdir -p "$T28_HOME"
+git init -q "$T28_REPO"
+( cd "$T28_REPO"; git config user.email t@example.test; git config user.name tester; git commit -q --allow-empty -m init )
+T28_CTX="${T28_REPO}/.gaai/project/contexts"
+mkdir -p "${T28_CTX}/backlog/done" "${T28_CTX}/artefacts/stories"
+_empty_backlog "${T28_CTX}/backlog/active.backlog.yaml"
+_story_rows "$T28_EPIC" done 02 > "${T28_CTX}/backlog/done/archived-2000-01-01.yaml"
+touch "${T28_CTX}/artefacts/stories/${T28_EPIC}S04.story.md"
+
+R28D="$(
+  cd "$T28_REPO"; unset GAAI_RESERVATION_LEDGER GAAI_BACKLOG_PATH GAAI_DECISIONS_PATH GAAI_ARTEFACTS_PATH
+  export HOME="$T28_HOME"; "$ALLOCATOR" story "$T28_EPIC"
+)"
+if [[ "$R28D" == "${T28_EPIC}S05" ]]; then
+  _pass "Default paths: repo archive (S02) and story file (S04) both found → ${R28D}"
+else
+  _fail "Expected ${T28_EPIC}S05 from the default archive + artefacts paths, got: ${R28D}"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
