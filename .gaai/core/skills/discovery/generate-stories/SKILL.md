@@ -48,8 +48,9 @@ Stories are the **contract between Discovery and Delivery**. They must be the ma
    - **a)** Obtain the next Story ID by invoking
      `.gaai/core/scripts/lib/allocate-id.sh story <epic_prefix>` (where `<epic_prefix>` is
      the parent Epic's ID, e.g. `E220`). This script serialises allocation under an exclusive
-     `flock`, accounts for IDs in both `active.backlog.yaml` and the host-stable reservation
-     ledger, and writes a reservation before returning. **Never compute the next story number
+     `flock`, accounts for IDs in every backlog file (`active.backlog.yaml`,
+     `blocked.backlog.yaml`, archived `done/*.yaml`), existing story artefact files and the
+     host-stable reservation ledger, and writes a reservation before returning. **Never compute the next story number
      by scanning the backlog manually** — the allocator is the single authority. If the
      allocator script is absent (fresh install), fall back to the scan-and-verify pattern as a
      degraded mode with a stderr warning.

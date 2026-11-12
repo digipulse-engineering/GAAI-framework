@@ -9,7 +9,10 @@
 #   allocate-id.sh --help                Show help
 #
 # Env vars (all optional):
-#   GAAI_BACKLOG_PATH        path to active.backlog.yaml (default: auto-detect from git root)
+#   GAAI_BACKLOG_PATH        path to active.backlog.yaml (default: auto-detect from git root);
+#                            blocked.backlog.yaml and done/*.yaml are read from the same directory
+#   GAAI_ARTEFACTS_PATH      path to the artefacts directory holding epics/ and stories/
+#                            (default: auto-detect from git root)
 #   GAAI_DECISIONS_PATH      path to decisions directory (default: auto-detect from git root)
 #   GAAI_RESERVATION_LEDGER  ledger file path (default: ~/.gaai/reservations/<repo_id>.tsv)
 #   GAAI_RESERVATION_TTL_H   abandoned-reservation TTL in hours (default: 72)
@@ -19,8 +22,14 @@
 #   GAAI_RESERVATION_BACKEND reservation backend (default: git-cas; valid: git-cas)
 #
 # The allocator serialises under an exclusive flock (Linux) or mkdir-spin (macOS) and computes
-# next = max(backlog/decisions-dir, ledger, remote-refs, CAS-reservation-ref) + 1, writes a
-# reservation row before returning, and prunes stale/landed entries on each run.
+# next = max(backlog/artefacts/decisions-dir, ledger, remote-refs, CAS-reservation-ref) + 1,
+# writes a reservation row before returning, and prunes stale/landed entries on each run.
+#
+# Landed epic/story IDs: an ID stays taken after its row is archived. The backlog source is the
+# whole backlog family — active.backlog.yaml plus blocked.backlog.yaml and every done/*.yaml
+# archive beside it, the same set the framework's backlog archiving rules resolve an ID across —
+# and the epic/story artefact files (epics/E<n>*.epic.md, stories/E<n>S<nn>*.story.md), which
+# outlive a deleted or never-merged backlog row.
 #
 # Cross-worktree visibility: the ledger lives under ~/.gaai/reservations/ (outside any git
 # worktree) and is keyed by a 12-char hash of the repository's absolute, symlink-resolved
@@ -73,7 +82,10 @@ Usage:
   allocate-id.sh --help                Show this help
 
 Env vars (all optional):
-  GAAI_BACKLOG_PATH        Path to active.backlog.yaml (default: auto-detect from git root)
+  GAAI_BACKLOG_PATH        Path to active.backlog.yaml (default: auto-detect from git root);
+                           blocked.backlog.yaml and done/*.yaml are read from the same directory
+  GAAI_ARTEFACTS_PATH      Path to the artefacts directory holding epics/ and stories/
+                           (default: auto-detect from git root)
   GAAI_DECISIONS_PATH      Path to decisions directory (default: auto-detect from git root)
   GAAI_RESERVATION_LEDGER  Ledger file (default: ~/.gaai/reservations/<repo_id>.tsv)
   GAAI_RESERVATION_TTL_H   Abandoned-reservation TTL in hours (default: 72)
@@ -88,13 +100,17 @@ Ledger format (TSV):
   {EPIC}S{NN} story   <epoch_secs>
   DEC-166     dec     <epoch_secs>
 
-The allocator computes next = max(highest-in-backlog/decisions-dir, highest-in-ledger,
+The allocator computes next = max(highest-in-backlog/artefacts/decisions-dir, highest-in-ledger,
 highest-on-remote, highest-in-CAS-ref) + 1, writes the new reservation to the ledger,
 performs a compare-and-swap push to refs/gaai/reservations on origin (git-cas backend),
 then prints the ID on stdout.
 The remote branch source serialises against IDs on pushed-but-unmerged branches on other hosts;
 the CAS ref serialises against IDs reserved but not yet pushed as branches on other hosts;
 the ledger serialises local (not-yet-pushed) concurrent sessions on this host.
+
+epic/story mode: the backlog source is active.backlog.yaml plus blocked.backlog.yaml and every
+done/*.yaml archive in the same directory, so an archived ID is never re-issued. Epic and story
+artefact files under GAAI_ARTEFACTS_PATH (epics/, stories/) count as taken IDs too.
 
 dec mode: DEC-<N>.md file presence in the decisions directory is the landed-signal (replaces
 backlog grep for epic/story). Remote-branch scan for dec-<N> tokens is best-effort; the CAS
@@ -176,6 +192,11 @@ REPO_ID="$(_hash12 "$REPO_COMMON_DIR")"
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DEFAULT_BACKLOG="${REPO_ROOT}/.gaai/project/contexts/backlog/active.backlog.yaml"
 BACKLOG_PATH="${GAAI_BACKLOG_PATH:-$DEFAULT_BACKLOG}"
+# blocked.backlog.yaml and done/*.yaml sit beside the active backlog, so they follow an override.
+BACKLOG_DIR="$(dirname "$BACKLOG_PATH")"
+
+DEFAULT_ARTEFACTS="${REPO_ROOT}/.gaai/project/contexts/artefacts"
+ARTEFACTS_PATH="${GAAI_ARTEFACTS_PATH:-$DEFAULT_ARTEFACTS}"
 
 DEFAULT_DECISIONS="${REPO_ROOT}/.gaai/project/contexts/memory/decisions"
 DECISIONS_PATH="${GAAI_DECISIONS_PATH:-$DEFAULT_DECISIONS}"
@@ -549,10 +570,23 @@ fi
 
 # ── Max-extraction helpers ────────────────────────────────────────────────────
 
+# Every backlog file an epic/story ID can live in: the active backlog, the blocked backlog and each
+# archive under done/. Archiving moves a row out of the active backlog without freeing its ID, so
+# scanning the active file alone would re-issue every archived ID. Missing files are skipped. Kept
+# as an array (not a word-split string) so a path containing spaces stays one argument.
+BACKLOG_FILES=()
+if [[ -f "$BACKLOG_PATH" ]]; then BACKLOG_FILES+=("$BACKLOG_PATH"); fi
+if [[ -f "${BACKLOG_DIR}/blocked.backlog.yaml" ]]; then
+  BACKLOG_FILES+=("${BACKLOG_DIR}/blocked.backlog.yaml")
+fi
+for _archive in "${BACKLOG_DIR}"/done/*.yaml; do
+  if [[ -f "$_archive" ]]; then BACKLOG_FILES+=("$_archive"); fi
+done
+
 _backlog_max_epic() {
-  [[ -f "$BACKLOG_PATH" ]] || { echo 0; return; }
+  (( ${#BACKLOG_FILES[@]} > 0 )) || { echo 0; return; }
   local result
-  result="$(grep -oE 'E[0-9]+' "$BACKLOG_PATH" 2>/dev/null \
+  result="$(grep -ohE 'E[0-9]+' "${BACKLOG_FILES[@]}" 2>/dev/null \
     | sed 's/^E//' \
     | sort -n | tail -1)" || true
   # Force base-10 so a leading-zero value never octal-parses in a caller's $(( )).
@@ -561,13 +595,43 @@ _backlog_max_epic() {
 
 _backlog_max_story() {
   local prefix="$1"
-  [[ -f "$BACKLOG_PATH" ]] || { echo 0; return; }
+  (( ${#BACKLOG_FILES[@]} > 0 )) || { echo 0; return; }
   local result
-  result="$(grep -oE "${prefix}S[0-9]+" "$BACKLOG_PATH" 2>/dev/null \
+  result="$(grep -ohE "${prefix}S[0-9]+" "${BACKLOG_FILES[@]}" 2>/dev/null \
     | grep -oE '[0-9]+$' \
     | sort -n | tail -1)" || true
   # Force base-10: story numbers are zero-padded (S08/S09 → "08"/"09"), which
   # bash arithmetic would otherwise reject as invalid octal.
+  echo "$(( 10#${result:-0} ))"
+}
+
+# Basenames of the epic and story artefact files. A glob that matches nothing stays literal
+# ("*.epic.md"), which the callers' anchored patterns reject, so a missing directory yields nothing.
+_artefact_names() {
+  local f
+  for f in "${ARTEFACTS_PATH}"/epics/*.epic.md "${ARTEFACTS_PATH}"/stories/*.story.md; do
+    printf '%s\n' "${f##*/}"
+  done
+}
+
+# Highest epic number named by an artefact file: E<n>[suffix].epic.md, or E<n>S<nn>[suffix].story.md
+# (a story file proves its epic exists). The digit run is closed by a non-digit, so E12 never reads
+# as E1 and suffixed names (E<n>a, E<n>-name, E<n>S<nn>b) still count.
+_artefacts_max_epic() {
+  local result
+  result="$(_artefact_names \
+    | sed -nE 's/^E([0-9]+)([^0-9].*)?\.(epic|story)\.md$/\1/p' \
+    | sort -n | tail -1)" || true
+  echo "$(( 10#${result:-0} ))"
+}
+
+# Highest story number for <prefix> named by a story artefact file: <prefix>S<nn>[suffix].story.md.
+_artefacts_max_story() {
+  local prefix="$1"
+  local result
+  result="$(_artefact_names \
+    | sed -nE "s/^${prefix}S([0-9]+)([^0-9].*)?\\.story\\.md\$/\\1/p" \
+    | sort -n | tail -1)" || true
   echo "$(( 10#${result:-0} ))"
 }
 
@@ -664,24 +728,28 @@ _remote_max_dec() {
 # ── Compute next ID ───────────────────────────────────────────────────────────
 if [[ "$MODE" == "epic" ]]; then
   MAX_BACKLOG="$(_backlog_max_epic)"
+  MAX_ARTEFACTS="$(_artefacts_max_epic)"
   MAX_LEDGER="$(_ledger_max_epic)"
   MAX_REMOTE="$(_remote_max_epic)"
   MAX_CAS="$(_cas_max_epic)"
-  MAX_BACKLOG="${MAX_BACKLOG:-0}"; MAX_LEDGER="${MAX_LEDGER:-0}"
+  MAX_BACKLOG="${MAX_BACKLOG:-0}"; MAX_ARTEFACTS="${MAX_ARTEFACTS:-0}"; MAX_LEDGER="${MAX_LEDGER:-0}"
   MAX_REMOTE="${MAX_REMOTE:-0}"; MAX_CAS="${MAX_CAS:-0}"
   MAX=$(( MAX_BACKLOG > MAX_LEDGER ? MAX_BACKLOG : MAX_LEDGER ))
+  MAX=$(( MAX > MAX_ARTEFACTS ? MAX : MAX_ARTEFACTS ))
   MAX=$(( MAX > MAX_REMOTE ? MAX : MAX_REMOTE ))
   MAX=$(( MAX > MAX_CAS ? MAX : MAX_CAS ))
   NEXT_NUM=$(( MAX + 1 ))
   NEW_ID="E${NEXT_NUM}"
 elif [[ "$MODE" == "story" ]]; then
   MAX_BACKLOG="$(_backlog_max_story "$EPIC_PREFIX")"
+  MAX_ARTEFACTS="$(_artefacts_max_story "$EPIC_PREFIX")"
   MAX_LEDGER="$(_ledger_max_story "$EPIC_PREFIX")"
   MAX_REMOTE="$(_remote_max_story "$EPIC_PREFIX")"
   MAX_CAS="$(_cas_max_story "$EPIC_PREFIX")"
-  MAX_BACKLOG="${MAX_BACKLOG:-0}"; MAX_LEDGER="${MAX_LEDGER:-0}"
+  MAX_BACKLOG="${MAX_BACKLOG:-0}"; MAX_ARTEFACTS="${MAX_ARTEFACTS:-0}"; MAX_LEDGER="${MAX_LEDGER:-0}"
   MAX_REMOTE="${MAX_REMOTE:-0}"; MAX_CAS="${MAX_CAS:-0}"
   MAX=$(( MAX_BACKLOG > MAX_LEDGER ? MAX_BACKLOG : MAX_LEDGER ))
+  MAX=$(( MAX > MAX_ARTEFACTS ? MAX : MAX_ARTEFACTS ))
   MAX=$(( MAX > MAX_REMOTE ? MAX : MAX_REMOTE ))
   MAX=$(( MAX > MAX_CAS ? MAX : MAX_CAS ))
   NEXT_NUM=$(( MAX + 1 ))

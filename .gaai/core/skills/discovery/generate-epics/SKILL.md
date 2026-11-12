@@ -38,8 +38,10 @@ Works with or without a PRD.
    **CRITICAL — ID Collision Guard (MUST execute before assigning any Epic ID):**
    - **a)** Obtain the next Epic ID by invoking `.gaai/core/scripts/lib/allocate-id.sh epic`
      (path relative to the repository root). This script serialises allocation under an
-     exclusive `flock`, cross-references both `active.backlog.yaml` and the host-stable
-     reservation ledger (shared across all local worktrees before any branch merges), and
+     exclusive `flock`, cross-references every backlog file (`active.backlog.yaml`,
+     `blocked.backlog.yaml`, archived `done/*.yaml`), existing epic and story artefact files and
+     the host-stable reservation ledger (shared across all local worktrees before any branch
+     merges), and
      writes a reservation before returning. **Never compute `max+1` manually** — the allocator
      is the single authority for ID assignment. If the script is absent (bootstrapping a fresh
      install before this allocator was delivered), fall back to the original scan-max pattern
