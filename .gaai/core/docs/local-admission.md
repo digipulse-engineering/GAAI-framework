@@ -10,6 +10,36 @@ the base during that same invocation. This is one forward reconciliation, with u
 HEAD and a clean worktree. A new attempt, a different Story or the final boundary after pre-QA always
 executes its own checks; no persisted receipt is an execution cache.
 
+## Optional selector suffix filters
+
+A selector in the policy normally matches a changed path by `exact_paths` or `path_prefixes`. It may
+also carry two optional keys, applied only after that match:
+
+```json
+{ "id": "source", "path_prefixes": ["src"], "exact_paths": [],
+  "exclude_path_suffixes": [".contract.mjs"], "command_ids": ["unit"] }
+{ "id": "source-contract", "path_prefixes": ["src"], "exact_paths": [],
+  "path_suffixes": [".contract.mjs"], "command_ids": ["contract"] }
+```
+
+- `path_suffixes`: the selector matches only when the path's basename ends with one listed suffix.
+- `exclude_path_suffixes`: the selector never matches when the basename ends with one listed suffix.
+
+Each key is a non-empty, unique array of literal suffixes: a dot followed by letters, digits, dots,
+underscores or hyphens. Separators, wildcards, regular expressions and empty entries are rejected,
+as is a suffix listed in both keys. A selector without these keys behaves, and digests, exactly as
+before. An excluded path is not selected by that selector; if no other selector, broadening rule or
+non-executable prefix claims it, it fails closed like any other unknown surface. Declare the
+carve-out as a second selector, as above, rather than relying on a fall-through.
+
+### Staged rollout
+
+A reader that predates these keys rejects any selector carrying them as `policy_malformed`, so adoption
+is two steps. First ship the optional parser support (this resolver and the delivery runner) with no
+policy using the keys. Then, in a later change, let the project policy declare `path_suffixes` or
+`exclude_path_suffixes` only once every deployed reader, including the base-held resolver that reads the
+policy, supports them. A policy that uses the keys must not land before that.
+
 ## Project opt-in
 
 Create `.gaai/project/ci/local-admission-applicability.json` through the project's human-reviewed

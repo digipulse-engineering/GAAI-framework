@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- ci: enroll standalone CLI in trusted admission
+- test: synchronize monitor lifecycle assertions
+- ci: accept optional admission selector suffixes
 - fix: never re-issue archived epic/story IDs
 - fix: guard project-policy assertions in the merge-gate test
 - fix: the agent-hang detector spares a wrapper inside its admission gate
