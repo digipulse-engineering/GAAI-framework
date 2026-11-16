@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -129,6 +130,70 @@ test('unknown and non-executable-only surfaces are non-authorizing', async t => 
   assert.equal(resolve(unknown).reason, 'unknown_executable_surface');
   const docs = await fixture(t, { candidate: repo => put(repo, 'docs/readme.md', '# Changed\n') });
   assert.equal(resolve(docs).reason, 'empty_executable_selection');
+});
+
+const narrowSource = ({ carveOut = true } = {}) => value => {
+  value.selectors[0] = { ...value.selectors[0], exclude_path_suffixes: ['.contract.mjs'] };
+  if (carveOut) {
+    value.selectors.push({ id: 'source-contract', path_prefixes: ['src'], exact_paths: [],
+      path_suffixes: ['.contract.mjs'], command_ids: ['contract'] });
+  }
+};
+
+test('optional literal suffix filters narrow a selector only after its path match', async t => {
+  const plain = await fixture(t, { alterPolicy: narrowSource() });
+  assert.deepEqual(resolve(plain).summary.selected_command_ids, ['unit']);
+  assert.deepEqual(resolve(plain).summary.selected_surface_ids, ['source']);
+  const carved = await fixture(t, { alterPolicy: narrowSource(),
+    candidate: repo => put(repo, 'src/extra.contract.mjs', 'export const extra = 1;\n') });
+  const carvedResult = resolve(carved);
+  assert.deepEqual(carvedResult.summary.selected_command_ids, ['contract']);
+  assert.deepEqual(carvedResult.summary.selected_surface_ids, ['source-contract']);
+  const both = await fixture(t, { alterPolicy: narrowSource(), candidate: async repo => {
+    await put(repo, 'src/old.mjs', 'export const value = 2;\n');
+    await put(repo, 'src/extra.contract.mjs', 'export const extra = 1;\n');
+  } });
+  assert.deepEqual(resolve(both).summary.selected_command_ids, ['unit', 'contract']);
+  assert.deepEqual(resolve(both).summary.selected_surface_ids, ['source', 'source-contract']);
+});
+
+test('a suffix-excluded or suffix-unmatched path never falls through to a selection', async t => {
+  const candidate = repo => put(repo, 'src/extra.contract.mjs', 'export const extra = 1;\n');
+  const noCarveOut = await fixture(t, { alterPolicy: narrowSource({ carveOut: false }), candidate });
+  assert.equal(resolve(noCarveOut).reason, 'unknown_executable_surface');
+  const outsidePrefix = await fixture(t, { alterPolicy: narrowSource(),
+    candidate: repo => put(repo, 'lib/extra.contract.mjs', 'export const extra = 1;\n') });
+  assert.equal(resolve(outsidePrefix).reason, 'unknown_executable_surface');
+});
+
+test('malformed, glob-like or conflicting suffix filters fail closed', async t => {
+  for (const bad of [
+    { path_suffixes: [] }, { exclude_path_suffixes: [] }, { path_suffixes: '.mjs' },
+    { path_suffixes: ['*.mjs'] }, { path_suffixes: ['.[jt]s'] }, { path_suffixes: ['.a.mjs', '.a.mjs'] },
+    { path_suffixes: ['.sub/mjs'] }, { path_suffixes: ['contract.mjs'] }, { exclude_path_suffixes: ['.'] },
+    { path_suffixes: [7] }, { path_suffixes: ['.mjs'], exclude_path_suffixes: ['.mjs'] },
+    { path_suffixes: ['.mjs'], unexpected_filter: ['.mjs'] },
+  ]) {
+    const fx = await fixture(t, { alterPolicy: value => { Object.assign(value.selectors[0], bad); } });
+    assert.equal(resolve(fx).reason, 'policy_malformed', JSON.stringify(bad));
+  }
+});
+
+test('a policy that declares no suffix filter keeps its legacy policy and selector digests', async t => {
+  const canon = value => {
+    if (Array.isArray(value)) return `[${value.map(canon).join(',')}]`;
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canon(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+  };
+  const sha = value => createHash('sha256').update(value).digest('hex');
+  const fx = await fixture(t);
+  const committed = JSON.parse(await readFile(join(fx.repo, POLICY_PATH), 'utf8'));
+  const { binding } = resolve(fx);
+  assert.equal(binding.policy_digest, sha(canon(committed)));
+  assert.equal(binding.selector_digest, sha(canon({ selectors: committed.selectors,
+    exhaustive: committed.exhaustive_command_ids, broadening_patterns: committed.broadening_patterns })));
 });
 
 test('risk input shape is complete, closed and boolean', async t => {
