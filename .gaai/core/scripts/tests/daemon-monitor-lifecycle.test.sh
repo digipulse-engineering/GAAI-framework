@@ -323,19 +323,45 @@ seed_residue_wrapper_log() {
   printf '[00:00:01] %s phase=qa starting\n' "$RESID_ID" > "$TAIL_LOG_DIR/$RESID_ID.wrapper.log"
 }
 
-# tail_frame_mon <label> [remain] — the shipped tail pane run ON $MON_SOCK,
-# reproducing the exact $TMUX-inheritance condition that caused cause (f):
-# a pane created on the presentation server, whose bare `tmux` would
-# otherwise see the monitor's own sessions instead of the delivery server's.
+# frame_has_all <frame> <string>... — success only when EVERY fixed string is
+# present. A here-string, not a pipe, so `pipefail` cannot turn grep -q's early
+# exit into a false negative.
+frame_has_all() {
+  local _frame="$1" _needle
+  shift
+  for _needle in "$@"; do
+    grep -qF -- "$_needle" <<< "$_frame" || return 1
+  done
+  return 0
+}
+
+# tail_frame_mon <label> [remain] [required-string...] — the shipped tail pane
+# run ON $MON_SOCK, reproducing the exact $TMUX-inheritance condition that
+# caused cause (f): a pane created on the presentation server, whose bare
+# `tmux` would otherwise see the monitor's own sessions instead of the delivery
+# server's.
+# The pane paints incrementally after `clear` — heading first, rows afterwards,
+# and it has no completion line — so a caller whose assertions need rendered
+# rows names those rows, and capture stops only once EVERY one is on screen.
+# With none named the historical predicate applies (the live fixture id or the
+# heading, whichever is painted first). A predicate never satisfied within the
+# unchanged 25s budget returns the last frame as-is, so the caller's own
+# assertions fail on what was actually rendered.
 tail_frame_mon() {
   local _label="$1" _remain="${2:-}"
+  shift
+  if [[ "$#" -gt 0 ]]; then shift; fi
   tmux -f "$PROBE_CONF" -S "$MON_SOCK" new-session -d -s "$_label" -x 200 -y 50 \
     "/usr/bin/env -i PATH=$ROOT/fakebin:$ENTRY_PATH HOME=$ROOT/opshome TERM=xterm-256color LC_ALL=C LANG=C GAAI_DELIVERY_TMUX_SOCKET=$DELIVERY_SOCK '$TAIL' '$TAIL_LOG_DIR' '$PROJ'" 2>/dev/null
   [[ -n "$_remain" ]] && tmux -f /dev/null -S "$MON_SOCK" set-option -w -t "$_label" remain-on-exit on 2>/dev/null
   local _i=0 _frame=""
   while [[ "$_i" -lt 25 ]]; do
     _frame="$(tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -t "$_label" 2>/dev/null)"
-    echo "$_frame" | grep -qE "$SURV_ID|Active Deliveries" && break
+    if [[ "$#" -gt 0 ]]; then
+      frame_has_all "$_frame" "$@" && break
+    else
+      echo "$_frame" | grep -qE "$SURV_ID|Active Deliveries" && break
+    fi
     sleep 1; _i=$(( _i + 1 ))
   done
   tmux -f /dev/null -S "$MON_SOCK" kill-session -t "=$_label" 2>/dev/null || true
@@ -352,6 +378,51 @@ extract_fn() {
     p && /^}/ { exit }
   ' "$1"
 }
+
+# Readiness of the REAL presentation panes (the -mon session a launch creates).
+# `mon_alive` proves only that `new-session` ran; a pane binds to an attempt
+# only after ITS OWN refresh has returned RUNNING or STARTING, and the bind is
+# then unconditional at the end of that same iteration. A pane that has not yet
+# painted such a frame has bound nothing, and correctly stays open (D-1).
+#
+# Addresses are the ones the shipped wiring creates: window 0, top = pane 0
+# (`new-session`), tail = pane 1 (`split-window -v` below it). The headless
+# pane is only 24 rows, shorter than a frame, so the banner/heading scrolls
+# into history: `-S -` reads all of it. Every frame a pane has painted is a
+# frame it has observed, so any one active frame in that history suffices.
+mon_pane_history() {
+  tmux -f /dev/null -S "$MON_SOCK" capture-pane -p -S - -t "=${MON_SESS}:0.$1" 2>/dev/null
+}
+
+# Top pane: its banner is the first line of every frame and is printed whole by
+# the refresh that decides binding. Anchoring on the complete state word rules
+# out a half-written line; STOPPED and AMBIGUOUS never match.
+mon_top_observed_active() {
+  local _h
+  _h="$(mon_pane_history 0)"
+  grep -qE '^[[:space:]]*DAEMON (RUNNING|STARTING)([[:space:]]|$)' <<< "$_h"
+}
+
+# Tail pane: RUNNING carries NO lifecycle qualifier on the heading, so an
+# unqualified heading is the RUNNING signal and `[DAEMON STARTING]` the other
+# bindable one; STOPPED/AMBIGUOUS qualifiers never match. The heading is the
+# first thing painted and the rows follow, so a non-blank line after it is also
+# required: that rules out an early partial frame, and every frame has one
+# ("No active deliveries" at the least).
+mon_tail_observed_active() {
+  local _h
+  _h="$(mon_pane_history 1)"
+  awk '
+    /Active Deliveries/ {
+      if ($0 !~ /\[DAEMON / || $0 ~ /\[DAEMON STARTING\]/) active = 1
+      next
+    }
+    active && NF { body = 1 }
+    END { exit !(active && body) }
+  ' <<< "$_h"
+}
+
+mon_panes_observed_active() { mon_top_observed_active && mon_tail_observed_active; }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # One-time setup, then capture the stable per-repository namespace
@@ -990,7 +1061,9 @@ scenario_reset
 gaai_run "$ROOT" "$START" >/dev/null 2>&1
 _state="$(status_field state)"
 [[ "$_state" == "running" ]] && pass "TS5-0: sandbox daemon is running for this baseline" || fail "TS5-0: unexpected state: $_state"
-_frame="$(tail_frame_mon TS5)"
+# TS5-2/-3/-4 assert both fixture rows and the admission-gate line, so capture
+# waits for all three: the heading alone is painted well before any of them.
+_frame="$(tail_frame_mon TS5 "" "$SURV_ID" "$RESID_ID" "admission gate running")"
 _first_line="$(printf '%s\n' "$_frame" | grep -m1 'Active Deliveries')"
 case "$_first_line" in
   *"[DAEMON"*) fail "TS5-1: header carries an unexpected lifecycle qualifier under RUNNING: $_first_line" ;;
@@ -1167,26 +1240,40 @@ echo "=== TS17: the real -mon server ends on its own (daemon settles without --s
 scenario_reset
 pty_run ts17 "$START" >/dev/null
 if mon_alive; then
-  rm -f "$OWNER_FILE" 2>/dev/null
-  tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
-  poll_until 15 bash -c '! ( tmux -f /dev/null -S "$0" has-session -t "=$1" 2>/dev/null )' "$MON_SOCK" "$MON_SESS"
-  if tmux -f /dev/null -S "$MON_SOCK" has-session -t "=$MON_SESS" 2>/dev/null; then
-    fail "TS17-1: the -mon session survives an ended daemon lifecycle (no --stop)"
+  # AC2's first clause applies to a monitor that has rendered RUNNING/STARTING.
+  # Session creation does not make that so: settling before a pane's first
+  # refresh leaves a pane that never saw an active attempt, which D-1 rightly
+  # keeps open. Settle only after BOTH real panes have painted an active frame.
+  # 25s is this suite's existing first-frame bound for a pane (tail_frame_mon).
+  if [[ "$(mon_panes)" == "2" ]] && poll_until 25 mon_panes_observed_active; then
+    pass "TS17-0: both real panes (top 0.0, tail 0.1) rendered a live-or-starting frame before settlement"
+    rm -f "$OWNER_FILE" 2>/dev/null
+    tmux -f /dev/null -S "$DSOCK" kill-server 2>/dev/null || true
+    poll_until 15 bash -c '! ( tmux -f /dev/null -S "$0" has-session -t "=$1" 2>/dev/null )' "$MON_SOCK" "$MON_SESS"
+    if tmux -f /dev/null -S "$MON_SOCK" has-session -t "=$MON_SESS" 2>/dev/null; then
+      fail "TS17-1: the -mon session survives an ended daemon lifecycle (no --stop)"
+    else
+      pass "TS17-1: the -mon session ended on its own after the daemon settled"
+    fi
+    # AC2 requires the session AND SERVER to terminate on their own — not that
+    # the socket pathname itself is unlinked. Empirically on this host, tmux's
+    # own exit-empty shutdown ends the server process but does not always
+    # unlink its socket file (the same stale-inode behaviour as most unix
+    # daemons that do not explicitly unlink on exit); `_monitor_teardown`'s
+    # own explicit "guarded unlink" (Part 2's B1-4/B2-5/B3-5, --stop only) is
+    # the one path that removes the file, and it is out of scope here since
+    # this scenario deliberately never calls --stop. The server PROCESS ending
+    # is the evidence this row asserts.
+    _ts17_srv_gone() { [[ -z "$(mon_srv_pid)" ]]; }
+    poll_until 15 _ts17_srv_gone
+    [[ -z "$(mon_srv_pid)" ]] && pass "TS17-2: the -mon server process is gone" || fail "TS17-2: the -mon server process survives"
   else
-    pass "TS17-1: the -mon session ended on its own after the daemon settled"
+    # Nothing was settled, so TS17-1/-2 are not evaluated; the next scenario's
+    # scenario_reset (and the EXIT trap) reap the still-live -mon server.
+    fail "TS17-0: precondition unmet — the real panes never both rendered a live-or-starting frame within 25s (panes=$(mon_panes) top=$(mon_top_observed_active && echo seen || echo none) tail=$(mon_tail_observed_active && echo seen || echo none)); settlement not attempted, TS17-1/-2 not evaluated"
+    echo "  top pane history (last 10 lines): $(mon_pane_history 0 | tail -n 10)"
+    echo "  tail pane history (last 10 lines): $(mon_pane_history 1 | tail -n 10)"
   fi
-  # AC2 requires the session AND SERVER to terminate on their own — not that
-  # the socket pathname itself is unlinked. Empirically on this host, tmux's
-  # own exit-empty shutdown ends the server process but does not always
-  # unlink its socket file (the same stale-inode behaviour as most unix
-  # daemons that do not explicitly unlink on exit); `_monitor_teardown`'s
-  # own explicit "guarded unlink" (Part 2's B1-4/B2-5/B3-5, --stop only) is
-  # the one path that removes the file, and it is out of scope here since
-  # this scenario deliberately never calls --stop. The server PROCESS ending
-  # is the evidence this row asserts.
-  _ts17_srv_gone() { [[ -z "$(mon_srv_pid)" ]]; }
-  poll_until 15 _ts17_srv_gone
-  [[ -z "$(mon_srv_pid)" ]] && pass "TS17-2: the -mon server process is gone" || fail "TS17-2: the -mon server process survives"
 else
   fail "TS17: no presentation UI to observe"
 fi
