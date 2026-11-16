@@ -15,6 +15,8 @@ const LIMIT_KEYS = ['max_policy_bytes', 'max_diff_bytes', 'max_changed_paths', '
   'max_receipt_bytes', 'max_result_bytes'];
 const COMMAND_KEYS = ['id', 'argv', 'timeout_seconds', 'output_limit_bytes', 'config_paths'];
 const SELECTOR_KEYS = ['id', 'path_prefixes', 'exact_paths', 'command_ids'];
+// Optional literal basename-suffix filters, applied after an exact/prefix match.
+const SELECTOR_SUFFIX_KEYS = ['path_suffixes', 'exclude_path_suffixes'];
 const ENVIRONMENT_KEYS = ['node_version', 'platform', 'arch', 'path_digest'];
 const DERIVED_RISK_KEYS = ['cross_cutting', 'dependency_changed'];
 
@@ -40,6 +42,15 @@ const safePath = value => text(value) && !value.startsWith('/')
   && value.split('/').every(part => part && part !== '.' && part !== '..');
 const boundedId = (value, limit) => text(value) && Buffer.byteLength(value, 'utf8') <= limit;
 const hasPrefix = (path, prefix) => path === prefix || path.startsWith(`${prefix}/`);
+// A suffix is a literal tail of the basename: a dot, then letters, digits, dots,
+// underscores or hyphens. No separator, glob, regex or whitespace can be expressed.
+const validSuffixes = (value, limit) => Array.isArray(value) && value.length > 0 && unique(value)
+  && value.every(suffix => boundedId(suffix, limit) && /^\.[A-Za-z0-9][A-Za-z0-9._-]*$/.test(suffix));
+const hasSuffix = (path, suffixes) => suffixes.some(suffix => path.split('/').at(-1).endsWith(suffix));
+const selectorMatches = (selector, path) => (selector.exact_paths.includes(path)
+    || selector.path_prefixes.some(prefix => hasPrefix(path, prefix)))
+  && (!Object.hasOwn(selector, 'path_suffixes') || hasSuffix(path, selector.path_suffixes))
+  && !(Object.hasOwn(selector, 'exclude_path_suffixes') && hasSuffix(path, selector.exclude_path_suffixes));
 const safeDetail = value => ({ detail_digest: digest(String(value)) });
 
 function runGit(repo, args, maxBuffer, reason = 'repository_unresolvable') {
@@ -96,7 +107,11 @@ function validatePolicy(policy, policyBytes, baseRef) {
       || !policy.exhaustive_command_ids.every(id => commandIds.has(id))) fail('command_unresolved');
   const selectorIds = new Set();
   for (const selector of policy.selectors) {
-    if (!exactKeys(selector, SELECTOR_KEYS) || !boundedId(selector.id, idLimit)
+    const suffixKeys = object(selector) ? SELECTOR_SUFFIX_KEYS.filter(key => Object.hasOwn(selector, key)) : [];
+    if (!exactKeys(selector, [...SELECTOR_KEYS, ...suffixKeys]) || !boundedId(selector.id, idLimit)
+        || !suffixKeys.every(key => validSuffixes(selector[key], idLimit))
+        || (suffixKeys.length === 2
+          && selector.path_suffixes.some(suffix => selector.exclude_path_suffixes.includes(suffix)))
         || selectorIds.has(selector.id) || !Array.isArray(selector.path_prefixes)
         || !selector.path_prefixes.every(safePath) || !Array.isArray(selector.exact_paths)
         || !selector.exact_paths.every(safePath)
@@ -268,8 +283,7 @@ function calculateAdmissionInputs({ repo, baseRef, baseSha, headSha, policyPath,
       if (policy.dependency_inputs.includes(path)) {
         matched = true; broadening = true; dependencyChanged = true; surfaces.add('dependency');
       }
-      for (const selector of policy.selectors) if (selector.exact_paths.includes(path)
-          || selector.path_prefixes.some(prefix => hasPrefix(path, prefix))) {
+      for (const selector of policy.selectors) if (selectorMatches(selector, path)) {
         matched = true;
         surfaces.add(selector.id);
         selector.command_ids.forEach(id => selected.add(id));
