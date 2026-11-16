@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- test: run the Worker test pool on the maintained Cloudflare Vitest plugin
 - fix: never re-issue archived epic/story IDs
 - fix: guard project-policy assertions in the merge-gate test
 - fix: the agent-hang detector spares a wrapper inside its admission gate
