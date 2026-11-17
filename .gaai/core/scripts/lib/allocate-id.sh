@@ -6,6 +6,8 @@
 #   allocate-id.sh epic                   Return next Epic ID (e.g., E221)
 #   allocate-id.sh story <epic_prefix>   Return next Story ID (e.g., {EPIC}S{NN})
 #   allocate-id.sh dec                   Return next Decision ID (e.g., DEC-166)
+#   allocate-id.sh reserve <id>          Claim one exact Epic/Story id on the shared record
+#   allocate-id.sh holder                Print this host's reservation holder token
 #   allocate-id.sh --help                Show help
 #
 # Env vars (all optional):
@@ -20,6 +22,14 @@
 #   GAAI_REMOTE              remote name to scan (default: origin)
 #   GAAI_REMOTE_TIMEOUT      seconds to bound the remote scan before falling back (default: 5)
 #   GAAI_RESERVATION_BACKEND reservation backend (default: git-cas; valid: git-cas)
+#   GAAI_RESERVATION_HOLDER  holder token written on shared reservation rows (default: the token
+#                            stored in ~/.gaai/reservation-holder, created on first use)
+#
+# Holder: each shared reservation row carries a fourth column naming who reserved it. The default
+# holder is one random token per host user, kept in ~/.gaai/reservation-holder, so every clone and
+# worktree on a host shares it and another host (a second machine, a cloud container) never does.
+# The publication guard (id-reservation-guard.sh) refuses to publish a new id whose reservation
+# names another holder. Rows written before holders existed have three columns and stay valid.
 #
 # The allocator serialises under an exclusive flock (Linux) or mkdir-spin (macOS) and computes
 # next = max(backlog/artefacts/decisions-dir, ledger, remote-refs, CAS-reservation-ref) + 1,
@@ -79,6 +89,9 @@ Usage:
   allocate-id.sh epic                   Return next Epic ID (e.g., E221)
   allocate-id.sh story <epic_prefix>   Return next Story ID (e.g., {EPIC}S{NN})
   allocate-id.sh dec                   Return next Decision ID (e.g., DEC-166)
+  allocate-id.sh reserve <id>          Claim one exact Epic/Story id on the shared record
+                                       (prints it; refused when any row for it exists)
+  allocate-id.sh holder                Print this host's reservation holder token
   allocate-id.sh --help                Show this help
 
 Env vars (all optional):
@@ -93,12 +106,24 @@ Env vars (all optional):
   GAAI_REMOTE              Remote name (default: origin)
   GAAI_REMOTE_TIMEOUT      Seconds to bound remote operations before fallback (default: 5)
   GAAI_RESERVATION_BACKEND Reservation backend (default: git-cas; valid: git-cas)
+  GAAI_RESERVATION_HOLDER  Holder token for shared reservation rows (default: the token in
+                           ~/.gaai/reservation-holder, one per host user, created on first use)
 
 Ledger format (TSV):
   # GAAI ID reservation ledger — do not edit manually
   E221        epic    <epoch_secs>
   {EPIC}S{NN} story   <epoch_secs>
   DEC-166     dec     <epoch_secs>
+
+Shared reservation record (refs/gaai/reservations:reservations.tsv) rows carry a fourth column,
+the holder token: <id> <kind> <epoch_secs> <holder>. Rows written before holders existed have
+three columns. id-reservation-guard.sh refuses to publish a new id reserved by another holder.
+
+reserve mode: for an id chosen before it was reserved (work numbered on a branch, a
+letter-suffixed split). It writes nothing locally and succeeds only through a compare-and-swap
+push of the shared record checked to hold no row for the id; a row by this holder is confirmed,
+any other row (including one without holder) is refused. It does not check whether the id is
+already defined on the integration branch.
 
 The allocator computes next = max(highest-in-backlog/artefacts/decisions-dir, highest-in-ledger,
 highest-on-remote, highest-in-CAS-ref) + 1, writes the new reservation to the ledger,
@@ -116,6 +141,51 @@ dec mode: DEC-<N>.md file presence in the decisions directory is the landed-sign
 backlog grep for epic/story). Remote-branch scan for dec-<N> tokens is best-effort; the CAS
 ref is the authoritative cross-host serialiser for dec IDs.
 EOF
+  exit 0
+fi
+
+# ── Reservation holder ────────────────────────────────────────────────────────
+# Prints the holder token written on shared reservation rows. GAAI_RESERVATION_HOLDER wins when
+# set; otherwise the token stored in ~/.gaai/reservation-holder, created once with a random value.
+# Creation publishes a fully written temp file with `ln`, which fails when the target exists, so
+# two first runs racing on one host converge on a single token. Returns non-zero (and prints
+# nothing) when no valid token can be read or created.
+HOLDER_RE='^[A-Za-z0-9._:-]{1,64}$'
+
+_reservation_holder() {
+  if [[ -n "${GAAI_RESERVATION_HOLDER:-}" ]]; then
+    if [[ "$GAAI_RESERVATION_HOLDER" =~ $HOLDER_RE ]]; then
+      printf '%s\n' "$GAAI_RESERVATION_HOLDER"
+      return 0
+    fi
+    echo "allocate-id.sh: GAAI_RESERVATION_HOLDER must match ${HOLDER_RE}" >&2
+    return 1
+  fi
+
+  local holder_file="${HOME}/.gaai/reservation-holder" token tmp
+  if [[ ! -s "$holder_file" ]]; then
+    mkdir -p "${HOME}/.gaai" 2>/dev/null || return 1
+    token="h-$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    [[ "$token" =~ ^h-[0-9a-f]{16}$ ]] || return 1
+    tmp="${holder_file}.tmp.$$"
+    printf '%s\n' "$token" > "$tmp" 2>/dev/null || return 1
+    if ! ln "$tmp" "$holder_file" 2>/dev/null && [[ ! -s "$holder_file" ]]; then
+      mv -f "$tmp" "$holder_file" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+
+  # Strip only the line ending: a damaged file must fail validation, not be repaired into a token.
+  token="$(head -n 1 "$holder_file" 2>/dev/null | tr -d '\r\n')"
+  [[ "$token" =~ $HOLDER_RE ]] || return 1
+  printf '%s\n' "$token"
+}
+
+if [[ "${1:-}" == "holder" ]]; then
+  _reservation_holder || {
+    echo "allocate-id.sh: cannot read or create the reservation holder token (~/.gaai/reservation-holder)" >&2
+    exit 1
+  }
   exit 0
 fi
 
@@ -137,8 +207,16 @@ elif [[ "$MODE" == "story" ]]; then
   fi
 elif [[ "$MODE" == "dec" ]]; then
   : # ok — no extra argument; dec IDs are plain integers (DEC-N, no zero-padding)
+elif [[ "$MODE" == "reserve" ]]; then
+  RESERVE_ID="${2:-}"
+  # Bounded numerals: a reserved number feeds every host's next allocation and is never removed,
+  # so an overflowing or typo-sized value must not reach the shared record.
+  if [[ ! "$RESERVE_ID" =~ ^E[1-9][0-9]{0,5}[A-Za-z]?(S[0-9]{1,4}[A-Za-z0-9]{0,4})?$ ]]; then
+    echo "allocate-id.sh: 'reserve' needs an Epic or Story id (E<n>, E<n>S<nn>, optionally letter-suffixed, at most six epic and four story digits); got '${RESERVE_ID:-<empty>}'" >&2
+    exit 1
+  fi
 else
-  echo "allocate-id.sh: unknown mode '${MODE:-<empty>}'. Use 'epic', 'story <prefix>', or 'dec'." >&2
+  echo "allocate-id.sh: unknown mode '${MODE:-<empty>}'. Use 'epic', 'story <prefix>', 'dec', 'reserve <id>' or 'holder'." >&2
   exit 1
 fi
 
@@ -463,7 +541,9 @@ LOCK_TYPE="none"
 
 _release_lock() {
   case "$LOCK_TYPE" in
-    flock) exec 9>&- 2>/dev/null || true ;;
+    # No redirection on this exec: `exec` applies it to the whole script, and a former
+    # `2>/dev/null` here silenced every later message (the unconfirmed-reservation warning too).
+    flock) exec 9>&- ;;
     mkdir) rmdir "$LOCK_DIR" 2>/dev/null || true ;;
   esac
   LOCK_TYPE="none"
@@ -725,6 +805,136 @@ _remote_max_dec() {
   echo "$(( 10#${result:-0} ))"
 }
 
+# ── reserve mode: claim one exact id on the shared record, without allocating ────────────────
+# For an id chosen before reserving (work numbered in a branch, a letter-suffixed split). The
+# shared record stays the single serialisation point: the claim is a compare-and-swap push of a
+# commit whose parent is the record it was checked against, so it succeeds only if no row for
+# the id existed on the remote at that moment. An id already reserved by this holder is
+# confirmed (idempotent); one reserved by anyone else — or by a row without holder — is refused.
+# The host ledger is not involved: allocations read the shared record, which now holds the id.
+if [[ "$MODE" == "reserve" ]]; then
+  # Runs after the local max helpers are defined; the local lock is not needed (the shared
+  # record is the serialisation point) and must not be held across remote I/O.
+  _release_lock
+  if [[ "$GAAI_RESERVATION_BACKEND" != "git-cas" || "$SCAN_REMOTE" != "true" ]] || \
+      ! git remote get-url "$GAAI_REMOTE" >/dev/null 2>&1; then
+    echo "allocate-id.sh: reserve needs the shared reservation record (git-cas backend, GAAI_SCAN_REMOTE on, remote '${GAAI_REMOTE}' configured)" >&2
+    exit 1
+  fi
+  RESERVE_HOLDER="$(_reservation_holder)" || {
+    echo "allocate-id.sh: reserve needs a reservation holder token (~/.gaai/reservation-holder or GAAI_RESERVATION_HOLDER)" >&2
+    exit 1
+  }
+  RESERVE_KIND="epic"
+  [[ "$RESERVE_ID" =~ ^E[0-9]+[A-Za-z]?S[0-9] ]] && RESERVE_KIND="story"
+  RESERVE_EPOCH="$(date +%s)"
+  _reserve_record="$(mktemp "${TMPDIR:-/tmp}/gaai_reserve.XXXXXX" 2>/dev/null)" || {
+    echo "allocate-id.sh: cannot create a temp file — ${RESERVE_ID} not reserved" >&2
+    exit 1
+  }
+
+  _reserve_attempt=0
+  while (( _reserve_attempt < 3 )); do
+    _reserve_attempt=$(( _reserve_attempt + 1 ))
+    if (( _reserve_attempt > 1 )); then
+      _fetch_cas_ref || true
+    fi
+
+    # Check and build on one fixed parent, never on the moving local ref. Its content is read
+    # once into a file: a failed read must stop the claim, never rewrite the record from empty.
+    _reserve_parent="$(git rev-parse --verify --quiet "${GIT_CAS_REF}^{commit}" 2>/dev/null || true)"
+    if [[ -n "$_reserve_parent" ]]; then
+      if ! git show "${_reserve_parent}:${GIT_CAS_FILE}" > "$_reserve_record" 2>/dev/null; then
+        rm -f "$_reserve_record"
+        echo "allocate-id.sh: cannot read ${GIT_CAS_FILE} from ${GIT_CAS_REF} — ${RESERVE_ID} not reserved" >&2
+        exit 1
+      fi
+      # Keep the appended row on a line of its own.
+      if [[ -s "$_reserve_record" && -n "$(tail -c 1 "$_reserve_record")" ]]; then
+        printf '\n' >> "$_reserve_record"
+      fi
+    else
+      : > "$_reserve_record"
+    fi
+
+    # Read the whole file (no early exit) and report the first row's holder; status 0 = a row exists.
+    if _reserve_existing_holder="$(awk -F'\t' -v id="$RESERVE_ID" \
+        '$1 == id && !found { print $4; found = 1 } END { exit !found }' "$_reserve_record")"; then
+      rm -f "$_reserve_record"
+      if [[ -n "$_reserve_existing_holder" && "$_reserve_existing_holder" == "$RESERVE_HOLDER" ]]; then
+        printf '%s\n' "$RESERVE_ID"
+        exit 0
+      fi
+      if [[ -z "$_reserve_existing_holder" ]]; then
+        echo "allocate-id.sh: ${RESERVE_ID} already has a reservation row without holder — it cannot be re-claimed; if that row is yours the push guard accepts it as is, otherwise allocate a fresh id" >&2
+      else
+        echo "allocate-id.sh: ${RESERVE_ID} is already reserved by another holder (${_reserve_existing_holder}) — it is not yours to use; allocate a fresh id instead" >&2
+      fi
+      exit 1
+    fi
+
+    # A numeral far above every known number is almost certainly a typo, and it would jump every
+    # host's numbering for good. Known = the shared record, the backlog family and the artefact
+    # files; GAAI_RESERVE_MAX_GAP (default 100) bounds the jump. The epic numeral is always
+    # checked; the story numeral too when the id is a plain story of a plain epic.
+    if [[ "$RESERVE_ID" =~ ^E([0-9]+)[A-Za-z]?(S([0-9]+))? ]]; then
+      _reserve_epic="E${BASH_REMATCH[1]}"
+      _reserve_epic_num=$(( 10#${BASH_REMATCH[1]} ))
+      _reserve_story_num="${BASH_REMATCH[3]:-}"
+      _reserve_gap="${GAAI_RESERVE_MAX_GAP:-100}"
+      [[ "$_reserve_gap" =~ ^[0-9]+$ ]] || _reserve_gap=100
+      CAS_CONTENT="$(cat "$_reserve_record")"
+      _reserve_max=0
+      for _v in "$(_cas_max_epic)" "$(_backlog_max_epic)" "$(_artefacts_max_epic)"; do
+        (( ${_v:-0} > _reserve_max )) && _reserve_max=${_v:-0}
+      done
+      _reserve_what="epic number"; _reserve_num=$_reserve_epic_num
+      if (( _reserve_num <= _reserve_max + _reserve_gap )) && [[ -n "$_reserve_story_num" && "$RESERVE_ID" =~ ^E[0-9]+S ]]; then
+        _reserve_max=0
+        for _v in "$(_cas_max_story "$_reserve_epic")" "$(_backlog_max_story "$_reserve_epic")" "$(_artefacts_max_story "$_reserve_epic")"; do
+          (( ${_v:-0} > _reserve_max )) && _reserve_max=${_v:-0}
+        done
+        _reserve_what="story number"; _reserve_num=$(( 10#$_reserve_story_num ))
+      fi
+      if (( _reserve_num > _reserve_max + _reserve_gap )); then
+        rm -f "$_reserve_record"
+        echo "allocate-id.sh: ${RESERVE_ID}: ${_reserve_what} ${_reserve_num} is more than ${_reserve_gap} above the highest known (${_reserve_max}) — refused as a likely typo (GAAI_RESERVE_MAX_GAP raises the bound)" >&2
+        exit 1
+      fi
+    fi
+
+    _reserve_blob="$({
+      cat "$_reserve_record"
+      printf '%s\t%s\t%s\t%s\n' "$RESERVE_ID" "$RESERVE_KIND" "$RESERVE_EPOCH" "$RESERVE_HOLDER"
+    } | git hash-object -w --stdin 2>/dev/null)" || continue
+    _reserve_tree="$(printf '100644 blob %s\t%s\n' "$_reserve_blob" "$GIT_CAS_FILE" | git mktree 2>/dev/null)" || continue
+    _reserve_parent_args=()
+    [[ -n "$_reserve_parent" ]] && _reserve_parent_args=(-p "$_reserve_parent")
+    _reserve_commit="$(
+      GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-gaai}" \
+      GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-gaai@localhost}" \
+      GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-gaai}" \
+      GIT_COMMITTER_EMAIL="${GIT_COMMITTER_EMAIL:-gaai@localhost}" \
+      GIT_AUTHOR_DATE="${RESERVE_EPOCH} +0000" \
+      GIT_COMMITTER_DATE="${RESERVE_EPOCH} +0000" \
+      git commit-tree -m "reserve ${RESERVE_ID}" ${_reserve_parent_args[@]+"${_reserve_parent_args[@]}"} "$_reserve_tree" 2>/dev/null
+    )" || continue
+
+    # Plain non-force push of the exact commit: rejected unless the remote record still equals
+    # the parent checked above.
+    if git push "$GAAI_REMOTE" "${_reserve_commit}:${GIT_CAS_REF}" >/dev/null 2>&1; then
+      git update-ref "$GIT_CAS_REF" "$_reserve_commit" 2>/dev/null || true
+      rm -f "$_reserve_record"
+      printf '%s\n' "$RESERVE_ID"
+      exit 0
+    fi
+  done
+
+  rm -f "$_reserve_record"
+  echo "allocate-id.sh: could not record the reservation of ${RESERVE_ID} on ${GIT_CAS_REF} (remote unreachable or contended) — not reserved" >&2
+  exit 1
+fi
+
 # ── Compute next ID ───────────────────────────────────────────────────────────
 if [[ "$MODE" == "epic" ]]; then
   MAX_BACKLOG="$(_backlog_max_epic)"
@@ -797,13 +1007,25 @@ CAS_MAX_RETRIES=3
 if [[ "$GAAI_RESERVATION_BACKEND" == "git-cas" && "$SCAN_REMOTE" == "true" ]] && \
     git remote get-url "$GAAI_REMOTE" >/dev/null 2>&1; then
 
+  # The holder column lets the publication guard tell this host's reservations from another
+  # host's. Without a token the row is still written, in the three-column form, so a broken home
+  # directory never blocks an allocation; the guard then cannot attribute that row.
+  CAS_HOLDER="$(_reservation_holder 2>/dev/null)" || CAS_HOLDER=""
+  if [[ -z "$CAS_HOLDER" ]]; then
+    echo "allocate-id.sh: WARNING: no reservation holder token (~/.gaai/reservation-holder or GAAI_RESERVATION_HOLDER) — the shared reservation row is written without a holder" >&2
+  fi
+
   while (( CAS_ATTEMPT < CAS_MAX_RETRIES )); do
 
     # Build blob: existing CAS content (piped directly to preserve newlines) + new row.
     # Using a process substitution pipe avoids the $() trailing-newline stripping issue.
     _cas_new_blob="$({
       git show "${GIT_CAS_REF}:${GIT_CAS_FILE}" 2>/dev/null || true
-      printf '%s\t%s\t%s\n' "$NEW_ID" "$MODE" "$NOW_EPOCH"
+      if [[ -n "$CAS_HOLDER" ]]; then
+        printf '%s\t%s\t%s\t%s\n' "$NEW_ID" "$MODE" "$NOW_EPOCH" "$CAS_HOLDER"
+      else
+        printf '%s\t%s\t%s\n' "$NEW_ID" "$MODE" "$NOW_EPOCH"
+      fi
     } | git hash-object -w --stdin 2>/dev/null)" || {
       CAS_ATTEMPT=$(( CAS_ATTEMPT + 1 ))
       continue

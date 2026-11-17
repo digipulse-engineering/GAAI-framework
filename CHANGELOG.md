@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Refuse to publish Epic/Story ids not reserved through allocate-id.sh
 - test: run the Worker test pool on the maintained Cloudflare Vitest plugin
 - fix: never re-issue archived epic/story IDs
 - fix: guard project-policy assertions in the merge-gate test
