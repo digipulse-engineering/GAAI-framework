@@ -159,6 +159,11 @@ The following are explicitly forbidden in all contexts — structured flows and 
   from this allocator whenever running more than one Discovery session locally.
   (Exception: allocator script absent on a fresh install — fall back to scan-verify with a
   stderr warning, then install the allocator at the next available opportunity.)
+  Enforced at publication wherever the remote carries the shared reservation record
+  (`refs/gaai/reservations`): the pre-push hook `18-id-reservation-guard.sh` refuses a push that
+  adds an Epic or Story id with no reservation there, or one reserved by another host's holder.
+  An id chosen before reserving is claimed with `allocate-id.sh reserve <id>`, which fails if
+  anyone already holds it; a letter-suffixed split follows its numeric anchor.
 
 For additional flow-specific forbidden patterns (Delivery memory ingestion, direct human→Delivery interaction), see `orchestration.rules.md` § Forbidden Patterns.
 
