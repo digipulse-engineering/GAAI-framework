@@ -54,6 +54,10 @@ Stories are the **contract between Discovery and Delivery**. They must be the ma
      by scanning the backlog manually** — the allocator is the single authority. If the
      allocator script is absent (fresh install), fall back to the scan-and-verify pattern as a
      degraded mode with a stderr warning.
+     **Check the exit status and keep stderr visible** (never `2>/dev/null`): exit 3 means the
+     id could not be recorded on the shared reservation record and nothing was allocated. That
+     is not the "script absent" case, so do not fall back to scan-max. Follow
+     `base.rules.md` § Forbidden Patterns (allocator) instead.
    - **b)** For each story file to be created, **check if the file already exists** on disk at
      `contexts/artefacts/stories/{id}.story.md`. If the file exists and its `id` frontmatter
      matches a **different** epic or title, **STOP immediately** — this means an ID collision

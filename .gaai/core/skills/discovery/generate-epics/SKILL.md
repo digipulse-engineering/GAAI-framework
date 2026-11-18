@@ -46,6 +46,10 @@ Works with or without a PRD.
      is the single authority for ID assignment. If the script is absent (bootstrapping a fresh
      install before this allocator was delivered), fall back to the original scan-max pattern
      as a degraded mode with a stderr warning.
+     **Check the exit status and keep stderr visible** (never `2>/dev/null`): exit 3 means the
+     id could not be recorded on the shared reservation record and nothing was allocated. That
+     is not the "script absent" case, so do not fall back to scan-max. Follow
+     `base.rules.md` § Forbidden Patterns (allocator) instead.
    - **b)** For each Epic file to be created, **check if the file already exists** at
      `contexts/artefacts/epics/{id}.epic.md`. If it exists with different content,
      **STOP immediately** — surface the conflict to the human.

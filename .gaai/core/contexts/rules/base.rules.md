@@ -164,6 +164,15 @@ The following are explicitly forbidden in all contexts — structured flows and 
   adds an Epic or Story id with no reservation there, or one reserved by another host's holder.
   An id chosen before reserving is claimed with `allocate-id.sh reserve <id>`, which fails if
   anyone already holds it; a letter-suffixed split follows its numeric anchor.
+  **An id is reserved only when the allocator exits 0.** Never discard its stderr
+  (`2>/dev/null`) or ignore its exit status. Exit 3 means the shared record could not be
+  updated and NO id was allocated. This is typical of a host that may not push
+  `refs/gaai/reservations`, for example an agent session whose credentials push only its own
+  branches. Do not fall back to scan-max, and do not get past it with `GAAI_ALLOW_UNCONFIRMED`,
+  `GAAI_SCAN_REMOTE=0`, a fake `GAAI_REMOTE` or ledger edits: an id that only one host can see
+  is the id another host will reuse. Reserve from a host
+  that can push the ref, or through the project's CI relay (`allocate-id.sh --help`), or stop
+  and tell the human.
 
 For additional flow-specific forbidden patterns (Delivery memory ingestion, direct human→Delivery interaction), see `orchestration.rules.md` § Forbidden Patterns.
 
