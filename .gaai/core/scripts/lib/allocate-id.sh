@@ -63,10 +63,19 @@
 # When GAAI_RESERVATION_BACKEND=git-cas (the default), reservations are additionally written to
 # refs/gaai/reservations on origin via a compare-and-swap push (plain non-force push; the
 # non-fast-forward rejection IS the lease), closing the residual cross-host/unpushed-branch gap.
-# A CAS-pushed reservation is confirmed; an offline reservation is unconfirmed (explicit stderr
-# warning) and is reconciled at the next successful push. Remote I/O is bounded by
-# GAAI_REMOTE_TIMEOUT and performed outside the local flock so a slow remote never stalls local
-# sessions.
+# A CAS-pushed reservation is confirmed. When the push cannot be confirmed (the remote refuses
+# the ref, for example a host whose credentials may only push some branches, or is unreachable,
+# or the race is lost three times) the allocator FAILS CLOSED: it prints nothing on stdout and
+# exits 3, because an id that only this host can see is exactly the id another host will reuse.
+# GAAI_ALLOW_UNCONFIRMED=1 restores the permissive behaviour (warning, id printed, exit 0) for a
+# deliberately offline single-host setup. A host that cannot push the shared ref reserves through
+# a host or CI job that can, running this script with GAAI_RESERVATION_HOLDER set. The ref fetch
+# is bounded by GAAI_REMOTE_TIMEOUT; all remote I/O runs outside the local flock so a slow remote
+# never stalls local sessions.
+#
+# Exit status: 0 = id printed and, unless GAAI_SCAN_REMOTE is off (then a warning says so) or the
+# repository has no remote, recorded on the shared ref; 1 = usage or reservation error; 3 = id NOT recorded on the shared ref (nothing
+# printed). Callers must check the status and must not discard stderr, which carries the reason.
 #
 # Graceful degradation: if flock/mkdir both fail, allocation proceeds with a stderr warning. If
 # the ledger directory is unwritable, proceeds with backlog-only max and warns. If the remote
@@ -108,6 +117,18 @@ Env vars (all optional):
   GAAI_RESERVATION_BACKEND Reservation backend (default: git-cas; valid: git-cas)
   GAAI_RESERVATION_HOLDER  Holder token for shared reservation rows (default: the token in
                            ~/.gaai/reservation-holder, one per host user, created on first use)
+  GAAI_ALLOW_UNCONFIRMED   1 = when the shared record cannot be updated, warn and still print the
+                           id with exit 0 (default: off — fail closed with exit 3). Only for a
+                           deliberately offline single-host setup: no other host sees that id.
+
+Exit status:
+  0  id printed; with a configured remote and the git-cas backend it is on the shared record
+  1  usage error, or reserve refused
+  3  the shared record could not be updated — NOTHING printed, the id is not reserved.
+     Never hide stderr (no 2>/dev/null): it says why. If this host may not push
+     refs/gaai/reservations (an agent session restricted to its own branches, for example),
+     reserve from a host that can, or through a CI relay that runs this script there with
+     GAAI_RESERVATION_HOLDER set to this host's token (allocate-id.sh holder).
 
 Ledger format (TSV):
   # GAAI ID reservation ledger — do not edit manually
@@ -303,6 +324,30 @@ esac
 
 GIT_CAS_REF="refs/gaai/reservations"
 GIT_CAS_FILE="reservations.tsv"
+
+# Push one refspec to the shared record and classify the outcome:
+#   0 = pushed;
+#   1 = lost the compare-and-swap (non-fast-forward, or the remote saw the ref move under it):
+#       another host reserved first — refetch, recompute and retry;
+#   2 = any other failure (permission or policy refusal, remote unreachable, …): retrying the
+#       same push cannot succeed, so the caller stops and fails closed.
+# The tail of git's error output is left in CAS_PUSH_ERROR for the caller's message.
+CAS_PUSH_ERROR=""
+_cas_push() {
+  local out rc=0
+  out="$(LC_ALL=C git push --porcelain "$GAAI_REMOTE" "$1" 2>&1)" || rc=$?
+  (( rc == 0 )) && return 0
+  CAS_PUSH_ERROR="$(printf '%s\n' "$out" | grep -E '^remote:|rejected|error|fatal|denied|HTTP [0-9]{3}' \
+    | grep -vE '^remote: *$' | tail -n 4 | tr -s '\t\n ' '   ' | sed 's/ *$//' || true)"
+  [[ -n "$CAS_PUSH_ERROR" ]] || CAS_PUSH_ERROR="git push exited ${rc}"
+  if printf '%s\n' "$out" | grep -qE '\[rejected\] \((non-fast-forward|fetch first|stale info)\)|\[remote rejected\] \((cannot lock ref|failed to update ref|incorrect old value)'; then
+    return 1
+  fi
+  return 2
+}
+
+# One line, shared by allocation and reserve: how to reserve when this host cannot push the ref.
+CAS_RELAY_HINT="if this host may not push ${GIT_CAS_REF} (for example an agent session limited to its own branches), reserve from a host that can, or through a CI relay that runs allocate-id.sh with GAAI_RESERVATION_HOLDER=<your token from 'allocate-id.sh holder'>"
 
 # ── Remote-scan configuration ─────────────────────────────────────────────────
 GAAI_REMOTE="${GAAI_REMOTE:-origin}"
@@ -921,17 +966,22 @@ if [[ "$MODE" == "reserve" ]]; then
     )" || continue
 
     # Plain non-force push of the exact commit: rejected unless the remote record still equals
-    # the parent checked above.
-    if git push "$GAAI_REMOTE" "${_reserve_commit}:${GIT_CAS_REF}" >/dev/null 2>&1; then
+    # the parent checked above. Only a lost race is retried; a refusal or an unreachable remote
+    # stops at once.
+    _reserve_push_rc=0
+    _cas_push "${_reserve_commit}:${GIT_CAS_REF}" || _reserve_push_rc=$?
+    if (( _reserve_push_rc == 0 )); then
       git update-ref "$GIT_CAS_REF" "$_reserve_commit" 2>/dev/null || true
       rm -f "$_reserve_record"
       printf '%s\n' "$RESERVE_ID"
       exit 0
     fi
+    (( _reserve_push_rc == 1 )) || break
   done
 
   rm -f "$_reserve_record"
-  echo "allocate-id.sh: could not record the reservation of ${RESERVE_ID} on ${GIT_CAS_REF} (remote unreachable or contended) — not reserved" >&2
+  echo "allocate-id.sh: could not record the reservation of ${RESERVE_ID} on ${GIT_CAS_REF} on '${GAAI_REMOTE}' — not reserved. git: ${CAS_PUSH_ERROR:-no push attempted}" >&2
+  echo "allocate-id.sh: ${CAS_RELAY_HINT}" >&2
   exit 1
 fi
 
@@ -1001,11 +1051,18 @@ _release_lock
 # Confirmed = CAS push succeeded. Unconfirmed = all retries exhausted (warns + reconciles at
 # next successful push). No --force-with-lease: the plain push IS the CAS.
 CAS_CONFIRMED=false
+CAS_ATTEMPTED=false
+CAS_PRELOOP_REF="-"
+CAS_LAST_ATTEMPTED_ID=""
 CAS_ATTEMPT=0
 CAS_MAX_RETRIES=3
 
 if [[ "$GAAI_RESERVATION_BACKEND" == "git-cas" && "$SCAN_REMOTE" == "true" ]] && \
     git remote get-url "$GAAI_REMOTE" >/dev/null 2>&1; then
+  CAS_ATTEMPTED=true
+  # Local ref as it was before this run touched it ("" = it did not exist): restored on any exit
+  # without confirmation, so no unpublished reservation commit stays in the local record.
+  CAS_PRELOOP_REF="$(git rev-parse --verify --quiet "$GIT_CAS_REF" 2>/dev/null || true)"
 
   # The holder column lets the publication guard tell this host's reservations from another
   # host's. Without a token the row is still written, in the three-column form, so a broken home
@@ -1071,9 +1128,16 @@ if [[ "$GAAI_RESERVATION_BACKEND" == "git-cas" && "$SCAN_REMOTE" == "true" ]] &&
       continue
     }
 
-    # Plain non-force push: NFF rejection = another session won the race → retry.
-    if git push "$GAAI_REMOTE" "$GIT_CAS_REF" 2>/dev/null; then
+    # Plain non-force push: NFF rejection = another session won the race → retry. Any other
+    # failure (refused, unreachable) cannot be fixed by retrying: stop and fail closed below.
+    CAS_PUSH_RC=0
+    CAS_LAST_ATTEMPTED_ID="$NEW_ID"
+    _cas_push "$GIT_CAS_REF" || CAS_PUSH_RC=$?
+    if (( CAS_PUSH_RC == 0 )); then
       CAS_CONFIRMED=true
+      break
+    fi
+    if (( CAS_PUSH_RC != 1 )); then
       break
     fi
 
@@ -1113,9 +1177,36 @@ if [[ "$GAAI_RESERVATION_BACKEND" == "git-cas" && "$SCAN_REMOTE" == "true" ]] &&
     CAS_ATTEMPT=$(( CAS_ATTEMPT + 1 ))
   done
 
-  if [[ "$CAS_CONFIRMED" == "false" ]]; then
-    echo "allocate-id.sh: WARNING: git-CAS reservation UNCONFIRMED — ID ${NEW_ID} may collide with a concurrent unmerged reservation on another host. Reconciliation (re-allocation on detected collision) will occur at the next successful push." >&2
-  fi
+fi
+
+if [[ "$CAS_ATTEMPTED" == "true" && "$CAS_CONFIRMED" == "false" ]]; then
+  case "${GAAI_ALLOW_UNCONFIRMED:-0}" in
+    1|true|yes|on|TRUE|YES|ON)
+      echo "allocate-id.sh: WARNING: ${CAS_LAST_ATTEMPTED_ID:-${NEW_ID}} is NOT on the shared reservation record (${GIT_CAS_REF} on '${GAAI_REMOTE}': ${CAS_PUSH_ERROR:-not pushed}). Only this host knows it; another host may allocate the same id. Printed anyway because GAAI_ALLOW_UNCONFIRMED is set." >&2
+      ;;
+    *)
+      # Nothing was handed out, so take the unpublished row off this host's copy of the record:
+      # a later push from here must not publish a reservation nobody holds. The host ledger row
+      # stays (the number is skipped locally until the TTL prunes it), which is harmless.
+      if [[ "$CAS_PRELOOP_REF" != "-" ]]; then
+        if [[ -n "$CAS_PRELOOP_REF" ]]; then
+          git update-ref "$GIT_CAS_REF" "$CAS_PRELOOP_REF" 2>/dev/null || true
+        else
+          git update-ref -d "$GIT_CAS_REF" 2>/dev/null || true
+        fi
+      fi
+      echo "allocate-id.sh: ERROR: could not record ${CAS_LAST_ATTEMPTED_ID:-${NEW_ID}} on the shared reservation record (${GIT_CAS_REF} on '${GAAI_REMOTE}') — NO id allocated (exit 3). git: ${CAS_PUSH_ERROR:-not pushed}" >&2
+      echo "allocate-id.sh: ${CAS_RELAY_HINT}; GAAI_ALLOW_UNCONFIRMED=1 prints an unshared id anyway (single offline host only)" >&2
+      exit 3
+      ;;
+  esac
+fi
+
+# A configured remote that the shared record is switched off for (GAAI_SCAN_REMOTE=0) or a git-cas
+# backend with no usable remote hands out an id only this host knows. Never silent.
+if [[ "$CAS_ATTEMPTED" != "true" && "$GAAI_RESERVATION_BACKEND" == "git-cas" ]] && \
+    git remote get-url "$GAAI_REMOTE" >/dev/null 2>&1; then
+  echo "allocate-id.sh: WARNING: ${NEW_ID} was NOT recorded on the shared reservation record (GAAI_SCAN_REMOTE is off). Only this host knows it; another host may allocate the same id." >&2
 fi
 
 # ── Output ────────────────────────────────────────────────────────────────────

@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- test: synchronize monitor lifecycle assertions
+- ci: accept optional admission selector suffixes
+- fix: fail closed when a reservation cannot reach the shared record
 - Refuse to publish Epic/Story ids not reserved through allocate-id.sh
 - test: run the Worker test pool on the maintained Cloudflare Vitest plugin
 - fix: never re-issue archived epic/story IDs
